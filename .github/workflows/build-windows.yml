@@ -26,12 +26,12 @@ jobs:
       uses: actions/upload-artifact@v6
       with:
         name: nand-flash-viewer-windows
-        path: target/release/nand_flash_viewer.exe
+        path: target/release/nand-flash-viewer.exe
     
     - name: Create Release
       if: startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v2
       with:
-        files: target/release/nand_flash_viewer.exe
+        files: target/release/nand-flash-viewer.exe
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
