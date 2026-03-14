@@ -329,7 +329,7 @@ impl TileGenerator {
             ))?;
         
         // Draw "EMPTY" text with coordinates
-        let font_data: &[u8] = include_bytes!("../assets/DejaVuSansMono.ttf");
+        let font_data: &[u8] = include_bytes!("../assets/ChakraPetchMono-Medium.otf");
         if let Some(font) = Font::try_from_bytes(font_data) {
             let scale = Scale::uniform(20.0);
             

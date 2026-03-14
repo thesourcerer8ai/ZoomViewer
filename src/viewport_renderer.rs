@@ -176,7 +176,7 @@ impl ViewportRenderer {
             use rusttype::{Font, Scale};
             
             // Use DejaVu Sans Mono font (embedded)
-            let font_data: &[u8] = include_bytes!("../assets/DejaVuSansMono.ttf");
+            let font_data: &[u8] = include_bytes!("../assets/ChakraPetchMono-Medium.otf");
             if let Some(font) = Font::try_from_bytes(font_data) {
                 let scale = Scale::uniform(14.0);
                 let text = format!("L{}:({},{})", coord.level, coord.x, coord.y);
