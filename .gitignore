@@ -1,0 +1,11 @@
+/.cache
+/nano.dump
+/sandisk.dump
+*.dump
+target/debug
+target/release/build
+target/release/deps
+target/*/debug
+target/*/release/build
+target/*/release/deps
+target/*/release/.fingerprint
