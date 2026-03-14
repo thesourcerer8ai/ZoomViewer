@@ -120,9 +120,16 @@ impl PyramidTileGenerator {
         for (i, tile_data) in tiles.iter().enumerate() {
             let buffer = if tile_data.len() >= 4 && &tile_data[0..4] == b"qoif" {
                 // QOI format (level 1-3 tiles)
+                // Validate QOI has minimum size (header + end marker)
+                if tile_data.len() < 14 {
+                    return Err(Error::TileGenerationFailed(
+                        format!("Invalid QOI tile {}: file too small ({} bytes)", i, tile_data.len())
+                    ));
+                }
+                
                 Self::decode_qoi(tile_data)
                     .map_err(|e| Error::TileGenerationFailed(
-                        format!("Failed to decode QOI tile {}: {}", i, e)
+                        format!("Failed to decode QOI tile {}: {} (size: {} bytes)", i, e, tile_data.len())
                     ))?
             } else {
                 // Raw RGB format (level 4+ tiles)
@@ -151,7 +158,8 @@ impl PyramidTileGenerator {
         for (i, buf) in buffers.iter().enumerate() {
             if buf.width() as usize != width || buf.height() as usize != height {
                 return Err(Error::TileGenerationFailed(
-                    format!("Tile {} has mismatched dimensions", i)
+                    format!("Tile {} has mismatched dimensions: {}x{} vs {}x{}", 
+                        i, buf.width(), buf.height(), width, height)
                 ));
             }
         }

@@ -89,9 +89,10 @@ impl CacheManager {
         Ok(data)
     }
     
-    /// Save a QOI tile to cache
+    /// Save a QOI tile to cache with atomic writes
     ///
-    /// Creates intermediate directories as needed.
+    /// Uses atomic writes (write to temp file, then rename) to prevent
+    /// incomplete/corrupted tiles from being cached.
     ///
     /// # Requirements
     /// - Saves QOI to cache (Requirement 8.1, 8.2)
@@ -105,9 +106,15 @@ impl CacheManager {
                 .map_err(|e| Error::CacheError(format!("Failed to create cache directories: {}", e)))?;
         }
         
-        // Write the QOI file
-        fs::write(&path, qoi_data)
-            .map_err(|e| Error::CacheError(format!("Failed to write tile to cache: {}", e)))?;
+        // Write to a temporary file first
+        let temp_path = path.with_extension("tmp");
+        fs::write(&temp_path, qoi_data)
+            .map_err(|e| Error::CacheError(format!("Failed to write temporary tile file: {}", e)))?;
+        
+        // Atomically rename temp file to final location
+        // This ensures we never have incomplete/corrupted tiles in the cache
+        fs::rename(&temp_path, &path)
+            .map_err(|e| Error::CacheError(format!("Failed to finalize tile cache: {}", e)))?;
         
         Ok(())
     }
