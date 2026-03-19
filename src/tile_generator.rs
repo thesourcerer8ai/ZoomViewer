@@ -910,7 +910,7 @@ mod tests {
     #[test]
     fn test_qoi_decoding_roundtrip() {
         use tempfile::NamedTempFile;
-        use std::io::{Write, Seek, Cursor};
+        use std::io::{Write, Seek};
 
         let mut temp_file = NamedTempFile::new().unwrap();
         // Use a distinctive pattern
@@ -1015,7 +1015,7 @@ mod tests {
     #[test]
     fn test_rendering_bit_patterns() {
         use tempfile::NamedTempFile;
-        use std::io::{Write, Seek, Cursor};
+        use std::io::{Write, Seek};
 
         let mut temp_file = NamedTempFile::new().unwrap();
         // Create specific bit patterns to test rendering

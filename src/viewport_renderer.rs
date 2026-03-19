@@ -202,8 +202,6 @@ impl ViewportRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::FileMetadata;
-    use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn create_test_cache() -> (TempDir, Arc<CacheManager>) {
