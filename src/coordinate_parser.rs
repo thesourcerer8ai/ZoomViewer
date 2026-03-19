@@ -304,11 +304,11 @@ mod tests {
 
     #[test]
     fn test_boundary_maximum_page_length() {
-        // Test with maximum page length (20000 bytes)
+        // Test with maximum page length (100000 bytes)
         let metadata = FileMetadata::new(
             "test.bin".to_string(),
             100_000_000_000, // 100 GB
-            20000,
+            100000,
             128,
         );
         
@@ -435,7 +435,7 @@ mod tests {
     #[test]
     fn test_round_trip_with_various_page_sizes() {
         // Test round-trip conversion with different page sizes
-        let page_sizes = vec![500, 1024, 2048, 4096, 8192, 20000];
+        let page_sizes = vec![500, 1024, 2048, 4096, 8192, 20000, 100000];
         
         for page_length in page_sizes {
             let metadata = FileMetadata::new(

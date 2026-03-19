@@ -340,9 +340,8 @@ mod tests {
         let mut display = AddressDisplay::new();
         let metadata = create_test_metadata();
         
-        // Calculate position at block boundary
-        // Block height = page_length * block_size = 512 * 64 = 32768 bytes
-        let block_height_pixels = 512 * 64;
+        // Block height
+        let block_height_pixels = crate::block_arranger::BlockArranger::calculate_block_height(64, 512);
         
         let viewport = Viewport::new(
             0,

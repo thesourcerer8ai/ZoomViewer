@@ -122,33 +122,29 @@ impl WorkerPool {
     /// # Requirements
     /// - Display placeholder after max retries (Requirement 16.3)
     fn generate_placeholder_tile(coord: &TileCoord) -> crate::error::Result<Vec<u8>> {
-        use image::{ImageBuffer, Rgb};
-        
+
         const TILE_SIZE: u32 = 512;
         
         // Create a gray background with red X pattern
-        let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(TILE_SIZE, TILE_SIZE, |x, y| {
-            // Draw red X pattern
-            let is_diagonal1 = (x as i32 - y as i32).abs() < 3;
-            let is_diagonal2 = ((TILE_SIZE - 1 - x) as i32 - y as i32).abs() < 3;
-            
-            if is_diagonal1 || is_diagonal2 {
-                Rgb([255u8, 0u8, 0u8]) // Red
-            } else {
-                Rgb([200u8, 200u8, 200u8]) // Light gray
+        // Build continuous RGBA vector
+        let mut rgba_data = Vec::with_capacity((TILE_SIZE * TILE_SIZE * 4) as usize);
+        for y in 0..TILE_SIZE {
+            for x in 0..TILE_SIZE {
+                let is_diagonal1 = (x as i32 - y as i32).abs() < 3;
+                let is_diagonal2 = ((TILE_SIZE - 1 - x) as i32 - y as i32).abs() < 3;
+                if is_diagonal1 || is_diagonal2 {
+                    rgba_data.extend_from_slice(&[255, 0, 0, 255]); // Red
+                } else {
+                    rgba_data.extend_from_slice(&[200, 200, 200, 255]); // Light gray
+                }
             }
-        });
+        }
         
-        // Encode as PNG
-        let mut png_bytes = Vec::new();
-        img.write_to(
-            &mut std::io::Cursor::new(&mut png_bytes),
-            image::ImageFormat::Png,
-        )
-        .map_err(|e| crate::error::Error::PngError(format!("Failed to encode placeholder: {}", e)))?;
+        let qoi_bytes = qoi::encode_to_vec(&rgba_data, TILE_SIZE, TILE_SIZE)
+            .map_err(|e| crate::error::Error::TileGenerationFailed(format!("Failed to encode placeholder: {:?}", e)))?;
         
         log::debug!("Generated placeholder tile for {:?}", coord);
-        Ok(png_bytes)
+        Ok(qoi_bytes)
     }
 
     /// Worker thread function
@@ -642,8 +638,7 @@ mod tests {
 
         // Pre-cache a tile
         let coord = TileCoord::new(0, 0, 0);
-        let mut png_data = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-        png_data.extend_from_slice(&[0x00, 0x00, 0x00, 0x0D]);
+        let png_data = vec![0x71, 0x6f, 0x69, 0x66, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x00];
         cache.save_tile(&coord, &png_data).unwrap();
 
         // Enqueue task for the same tile
@@ -686,9 +681,9 @@ mod tests {
         assert!(result.is_ok());
         let png_bytes = result.unwrap();
         
-        // Verify it's a valid PNG (starts with PNG signature)
-        assert!(png_bytes.len() > 8);
-        assert_eq!(&png_bytes[0..8], &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+        // Verify it's a valid QOI (starts with qoif signature)
+        assert!(png_bytes.len() > 14);
+        assert_eq!(&png_bytes[0..4], &[0x71, 0x6f, 0x69, 0x66]);
     }
 
     #[test]

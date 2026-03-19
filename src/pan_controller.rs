@@ -276,8 +276,8 @@ mod tests {
     fn test_pan_boundary_enforcement_left() {
         let mut controller = create_test_controller();
         
-        // Pan far to the left (should be clamped)
-        controller.pan(-100000.0, 0.0);
+        // Pan far to the left (should be clamped by moving camera left / dragging right)
+        controller.pan(100000.0, 0.0);
         
         let center = {
             let manager = controller.viewport_manager.lock().unwrap();
@@ -295,8 +295,8 @@ mod tests {
     fn test_pan_boundary_enforcement_right() {
         let mut controller = create_test_controller();
         
-        // Pan far to the right (should be clamped)
-        controller.pan(100000.0, 0.0);
+        // Pan far to the right (should be clamped by moving camera right / dragging left)
+        controller.pan(-100000.0, 0.0);
         
         let center = {
             let manager = controller.viewport_manager.lock().unwrap();
@@ -314,8 +314,8 @@ mod tests {
     fn test_pan_boundary_enforcement_top() {
         let mut controller = create_test_controller();
         
-        // Pan far up (should be clamped)
-        controller.pan(0.0, -100000.0);
+        // Pan far up (should be clamped by moving camera up / dragging down)
+        controller.pan(0.0, 100000.0);
         
         let center = {
             let manager = controller.viewport_manager.lock().unwrap();

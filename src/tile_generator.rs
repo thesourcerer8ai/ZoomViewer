@@ -212,6 +212,7 @@ impl TileGenerator {
         canvas: &mut PixelBuffer,
     ) -> Result<()> {
         // Log first few bytes for debugging
+        /*
         if tile_data.len() >= 16 {
             log::debug!(
                 "Tile L{}:({},{}) first 16 bytes: {:02x?}",
@@ -219,7 +220,7 @@ impl TileGenerator {
                 &tile_data[0..16]
             );
         }
-        
+        */
         // Pre-compute pixel patterns for all 256 byte values
         // Each byte maps to 8 pixels (one per bit)
         // This is a one-time cost that enables very fast rendering

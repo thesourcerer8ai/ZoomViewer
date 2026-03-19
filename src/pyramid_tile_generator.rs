@@ -858,7 +858,7 @@ mod tests {
         assert!(dequeued.is_some());
         
         let task = dequeued.unwrap();
-        assert_eq!(task.priority, Priority::High);
+        assert_eq!(task.priority, Priority::Normal);
         assert_eq!(task.coord.level, 0); // Child tile at level 0
     }
 

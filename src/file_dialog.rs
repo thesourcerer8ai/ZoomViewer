@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 /// Valid block size values (pages per block)
 /// Requirement 1.3, 15.2, 15.6
-const VALID_BLOCK_SIZES: &[u32] = &[64, 128, 256, 512, 768, 1024];
+const VALID_BLOCK_SIZES: &[u32] = &[64, 128, 256, 384, 512, 768, 1024];
 
 /// Minimum page length in bytes
 /// Requirement 1.2, 15.1, 15.5
@@ -21,7 +21,7 @@ const MIN_PAGE_LENGTH: u32 = 500;
 
 /// Maximum page length in bytes
 /// Requirement 1.2, 15.1, 15.5
-const MAX_PAGE_LENGTH: u32 = 20000;
+const MAX_PAGE_LENGTH: u32 = 100000;
 
 
 
@@ -59,7 +59,7 @@ impl FileDialog {
     ///
     /// # Requirements
     /// - 1.1: Accept files from 50 GB to 500 GB
-    /// - 1.2: Require page length (500-20000 bytes)
+    /// - 1.2: Require page length (500-100000 bytes)
     /// - 1.3: Require block size (64, 128, 256, 512, 1024 pages)
     /// - 15.1, 15.2: Accept user-provided parameters
     /// - 15.3, 15.4: Validate parameters and display errors
@@ -146,7 +146,7 @@ impl FileDialog {
     /// Task 18.2: Implement parameter input form
     /// Task 18.3: Implement parameter validation
     ///
-    /// Requirement 1.2, 15.1: Prompt for page length (500-20000 bytes)
+    /// Requirement 1.2, 15.1: Prompt for page length (500-100000 bytes)
     /// Requirement 15.3, 15.4: Validate and display error messages
     fn prompt_page_length(&self) -> Result<u32> {
         loop {
@@ -190,7 +190,7 @@ impl FileDialog {
     fn prompt_block_size(&self) -> Result<u32> {
         loop {
             let input = self.read_user_input(&format!(
-                "Enter block size in pages (64, 128, 256, 512, 768, 1024) [default: 64]: "
+                "Enter block size in pages (64, 128, 256, 384, 512, 768, 1024) [default: 64]: "
             ))?;
 
             let input = input.trim();
@@ -206,7 +206,7 @@ impl FileDialog {
                         // Task 18.3: Display error message for invalid input
                         // Requirement 15.3, 15.4
                         eprintln!(
-                            "Error: Block size must be one of: 64, 128, 256, 512, 768, 1024 pages"
+                            "Error: Block size must be one of: 64, 128, 256, 384, 512, 768, 1024 pages"
                         );
                     }
                 }
@@ -293,7 +293,7 @@ mod tests {
         let dialog = FileDialog::new(temp_dir.path());
 
         assert!(!dialog.validate_page_length(499));
-        assert!(!dialog.validate_page_length(20001));
+        assert!(!dialog.validate_page_length(100001));
         assert!(!dialog.validate_page_length(0));
     }
 
@@ -363,14 +363,14 @@ mod tests {
     #[test]
     fn test_valid_block_sizes_constant() {
         // Verify the valid block sizes match requirements
-        assert_eq!(VALID_BLOCK_SIZES, &[64, 128, 256, 512, 768, 1024]);
+        assert_eq!(VALID_BLOCK_SIZES, &[64, 128, 256, 384, 512, 768, 1024]);
     }
 
     #[test]
     fn test_page_length_bounds() {
         // Verify page length bounds match requirements
         assert_eq!(MIN_PAGE_LENGTH, 500);
-        assert_eq!(MAX_PAGE_LENGTH, 20000);
+        assert_eq!(MAX_PAGE_LENGTH, 100000);
     }
 
     // ========================================================================
@@ -415,7 +415,7 @@ mod tests {
 
         // Test invalid page lengths
         assert!(!dialog.validate_page_length(499));
-        assert!(!dialog.validate_page_length(20001));
+        assert!(!dialog.validate_page_length(100001));
         assert!(!dialog.validate_page_length(0));
     }
 

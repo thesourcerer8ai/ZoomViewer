@@ -97,17 +97,18 @@ impl ZoomController {
     pub fn zoom_in(&mut self, center_x: f64, center_y: f64) {
         log::debug!("zoom_in called: current zoom_factor={}", self.zoom_factor);
         
+        let old_zoom = self.zoom_factor;
+        
         // Find the next level boundary (more zoomed in)
-        if self.zoom_factor < 1.0 {
+        if self.zoom_factor < MAX_ZOOM_FACTOR {
             // Go to next level (double the current)
             let next = self.zoom_factor * 2.0;
-            self.zoom_factor = next.min(1.0);
+            self.zoom_factor = next.min(MAX_ZOOM_FACTOR);
             self.target_zoom_factor = self.zoom_factor;
         }
-        // If already at 1.0, stay there (can't zoom in further at level 0)
         
         log::debug!("zoom_in: new zoom set to {}", self.zoom_factor);
-        self.update_viewport_after_zoom(center_x, center_y);
+        self.update_viewport_after_zoom(center_x, center_y, old_zoom);
     }
     
     /// Zoom out (decrease zoom level, fewer pixels per bit)
@@ -120,7 +121,9 @@ impl ZoomController {
     pub fn zoom_out(&mut self, center_x: f64, center_y: f64) {
         log::debug!("zoom_out called: current zoom_factor={}, target={}", self.zoom_factor, self.target_zoom_factor);
         
-        // Find the next level boundary (more zoomed out)
+        let old_zoom = self.zoom_factor;
+        
+        // Find the previous level boundary (more zoomed out)
         if self.zoom_factor >= 1.0 {
             // From level 0, go to level 1
             self.zoom_factor = 0.5;
@@ -133,7 +136,7 @@ impl ZoomController {
         }
         
         log::debug!("zoom_out: new zoom set to {}", self.zoom_factor);
-        self.update_viewport_after_zoom(center_x, center_y);
+        self.update_viewport_after_zoom(center_x, center_y, old_zoom);
     }
     
     /// Update animation - call this regularly (e.g., in a timer)
@@ -150,16 +153,18 @@ impl ZoomController {
             if self.zoom_factor != self.target_zoom_factor {
                 // Snap to target
                 log::debug!("Animation complete: snapping from {} to {}", self.zoom_factor, self.target_zoom_factor);
+                let old_zoom = self.zoom_factor;
                 self.zoom_factor = self.target_zoom_factor;
-                self.update_viewport_after_zoom(center_x, center_y);
+                self.update_viewport_after_zoom(center_x, center_y, old_zoom);
             }
             return false; // Animation complete
         }
         
         // Interpolate towards target
+        let old_zoom = self.zoom_factor;
         self.zoom_factor += (self.target_zoom_factor - self.zoom_factor) * ANIMATION_SPEED;
         log::trace!("Animation step: zoom_factor={}, target={}", self.zoom_factor, self.target_zoom_factor);
-        self.update_viewport_after_zoom(center_x, center_y);
+        self.update_viewport_after_zoom(center_x, center_y, old_zoom);
         
         true // Animation in progress
     }
@@ -179,6 +184,8 @@ impl ZoomController {
     /// * `center_x` - Current viewport center X in screen coordinates
     /// * `center_y` - Current viewport center Y in screen coordinates
     pub fn zoom_by_factor(&mut self, factor: f64, center_x: f64, center_y: f64) {
+        let old_zoom = self.zoom_factor;
+
         // Calculate new zoom factor
         let new_zoom_factor = self.zoom_factor * factor;
         
@@ -195,7 +202,7 @@ impl ZoomController {
         self.zoom_factor = constrained_zoom;
         
         // Update viewport with new zoom level
-        self.update_viewport_after_zoom(center_x, center_y);
+        self.update_viewport_after_zoom(center_x, center_y, old_zoom);
     }
     
     /// Set zoom to a specific factor
@@ -207,6 +214,7 @@ impl ZoomController {
     /// * `center_x` - Current viewport center X in screen coordinates
     /// * `center_y` - Current viewport center Y in screen coordinates
     pub fn set_zoom(&mut self, zoom_factor: f64, center_x: f64, center_y: f64) {
+        let old_zoom = self.zoom_factor;
         // Apply zoom constraints
         let constrained_zoom = zoom_factor
             .max(self.min_zoom_factor)
@@ -215,7 +223,7 @@ impl ZoomController {
         self.zoom_factor = constrained_zoom;
         
         // Update viewport with new zoom level
-        self.update_viewport_after_zoom(center_x, center_y);
+        self.update_viewport_after_zoom(center_x, center_y, old_zoom);
     }
     
     /// Update viewport after zoom change
@@ -227,7 +235,8 @@ impl ZoomController {
     /// # Arguments
     /// * `mouse_screen_x` - Mouse X position in screen coordinates
     /// * `mouse_screen_y` - Mouse Y position in screen coordinates
-    fn update_viewport_after_zoom(&self, mouse_screen_x: f64, mouse_screen_y: f64) {
+    /// * `old_zoom_factor` - The zoom factor before the change
+    fn update_viewport_after_zoom(&self, mouse_screen_x: f64, mouse_screen_y: f64, old_zoom_factor: f64) {
         // Get current viewport to access current center
         let current_viewport = {
             let manager = self.viewport_manager.lock().unwrap();
@@ -253,27 +262,22 @@ impl ZoomController {
         let offset_x = mouse_screen_x - screen_center_x;
         let offset_y = mouse_screen_y - screen_center_y;
         
-        // Calculate the scale factor between the old and new levels
-        // Each level is 2x the scale of the previous level
-        // Level 0: scale = 1.0
-        // Level 1: scale = 0.5 (half resolution)
-        // Level 2: scale = 0.25 (quarter resolution)
-        // Scale factor = 2^(old_level - new_level)
-        let old_level = current_viewport.level;
-        let level_diff = old_level as i32 - new_level as i32;
-        let scale_factor = 2.0_f64.powi(level_diff);
-        
-        // The offset needs to be scaled because the coordinate system changes
-        // When zooming out (level increases), coordinates get smaller, so offset gets smaller
-        // When zooming in (level decreases), coordinates get larger, so offset gets larger
-        let scaled_offset_x = offset_x * scale_factor;
-        let scaled_offset_y = offset_y * scale_factor;
-        
-        // The new viewport center should be moved towards the mouse position
-        // by the scaled offset amount. This keeps the mouse at the same world position
-        // while zooming in/out, accounting for the different coordinate systems at each level.
-        let mut new_center_x = current_viewport.center_x + scaled_offset_x;
-        let mut new_center_y = current_viewport.center_y + scaled_offset_y;
+        // Calculate new viewport center to keep the point under the mouse cursor fixed in world coordinates.
+        // The formula is: C1 = C0 * 2^(L0-L1) + (Os / 2^L1)(1/Z0 - 1/Z1)
+        // Where:
+        // C0 = old viewport center (world coordinates at old level)
+        // L0 = old pyramid level
+        // L1 = new pyramid level
+        // Os = screen offset from center to mouse (screen coordinates)
+        // Z0 = old zoom factor
+        // Z1 = new zoom factor
+        // C1 = new viewport center (world coordinates at new level)
+
+        let level_diff_pow = 2.0_f64.powi(current_viewport.level as i32 - new_level as i32);
+        let level_scale_new = 2.0_f64.powi(new_level as i32);
+
+        let mut new_center_x = current_viewport.center_x * level_diff_pow + (offset_x / level_scale_new) * (1.0 / old_zoom_factor - 1.0 / self.zoom_factor);
+        let mut new_center_y = current_viewport.center_y * level_diff_pow + (offset_y / level_scale_new) * (1.0 / old_zoom_factor - 1.0 / self.zoom_factor);
         
         // Clamp viewport center to stay within image bounds
         // Calculate total pixels at the new level
@@ -586,7 +590,25 @@ mod tests {
 
     #[test]
     fn test_zoom_center_point() {
-        let mut controller = create_test_controller();
+        // Create an explicitly huge virtual file so bounds clamping does not intercept our test point tracking.
+        let metadata = crate::types::FileMetadata::new(
+            "test_large.bin".to_string(),
+            1_000_000_000, // 1GB gives a huge pixel canvas roughly 2 Million x 4000
+            4096,
+            64,
+        );
+        
+        let task_queue = std::sync::Arc::new(crate::task_queue::TaskQueue::new());
+        let viewport_manager = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::viewport_manager::ViewportManager::new(metadata.clone(), task_queue)
+        ));
+        
+        let mut controller = ZoomController::new(metadata, viewport_manager, 1920, 1080);
+        
+        // Pan to a safe position far away from edges
+        if let Ok(mut manager) = controller.viewport_manager.lock() {
+            manager.update_viewport(0, 4000.0, 2000.0, 1920, 1080);
+        }
         
         // Get initial viewport
         let initial_viewport = {
@@ -594,41 +616,39 @@ mod tests {
             manager.get_viewport().clone()
         };
         
-        // Zoom in at a point that's NOT the center of the screen
+        // Zoom out at a point that's NOT the center of the screen
         // Screen center is at (960, 540) for 1920x1080
         // We'll zoom at (1200, 700) - offset from center
         let zoom_point_x = 1200.0;
         let zoom_point_y = 700.0;
         
-        controller.zoom_in(zoom_point_x, zoom_point_y);
-        
-        // Get viewport after zoom
-        let zoomed_viewport = {
-            let manager = controller.viewport_manager.lock().unwrap();
-            manager.get_viewport().clone()
-        };
-        
-        // The zoom should have changed the level
-        assert_ne!(initial_viewport.level, zoomed_viewport.level);
-        
-        // The viewport center should have moved towards the mouse position
-        // Mouse offset from screen center: (1200 - 960, 700 - 540) = (240, 160)
-        // Scale factor accounts for level change: 2^(old_level - new_level)
         let screen_center_x = 960.0;
         let screen_center_y = 540.0;
         let offset_x = zoom_point_x - screen_center_x;
         let offset_y = zoom_point_y - screen_center_y;
         
-        let level_diff = initial_viewport.level as i32 - zoomed_viewport.level as i32;
-        let scale_factor = 2.0_f64.powi(level_diff);
+        let initial_zoom = controller.get_zoom_factor(); // Before zoom
         
-        let scaled_offset_x = offset_x * scale_factor;
-        let scaled_offset_y = offset_y * scale_factor;
+        controller.zoom_out(zoom_point_x, zoom_point_y);
         
-        let expected_center_x = initial_viewport.center_x + scaled_offset_x;
-        let expected_center_y = initial_viewport.center_y + scaled_offset_y;
+        let zoomed_viewport = {
+            let manager = controller.viewport_manager.lock().unwrap();
+            manager.get_viewport().clone()
+        };
+        let final_zoom = controller.get_zoom_factor();
         
-        assert!((zoomed_viewport.center_x - expected_center_x).abs() < 1.0);
-        assert!((zoomed_viewport.center_y - expected_center_y).abs() < 1.0);
+        assert_ne!(initial_viewport.level, zoomed_viewport.level);
+        
+        // Compare world coordinates
+        // World position W = C_L * 2^L + offset / Z
+        let orig_world_x = initial_viewport.center_x * 2.0_f64.powi(initial_viewport.level as i32) + offset_x / initial_zoom;
+        let orig_world_y = initial_viewport.center_y * 2.0_f64.powi(initial_viewport.level as i32) + offset_y / initial_zoom;
+        
+        let new_world_x = zoomed_viewport.center_x * 2.0_f64.powi(zoomed_viewport.level as i32) + offset_x / final_zoom;
+        let new_world_y = zoomed_viewport.center_y * 2.0_f64.powi(zoomed_viewport.level as i32) + offset_y / final_zoom;
+        
+        // They should match since zooming preserves the point under cursor
+        assert!((new_world_x - orig_world_x).abs() < 2.0, "Drifted X by {}", new_world_x - orig_world_x);
+        assert!((new_world_y - orig_world_y).abs() < 2.0, "Drifted Y by {}", new_world_y - orig_world_y);
     }
 }

@@ -19,7 +19,7 @@ impl FileLoader {
     ///
     /// # Arguments
     /// * `path` - Path to the dump file
-    /// * `page_length` - Bytes per page (500-20000)
+    /// * `page_length` - Bytes per page (500-100000)
     /// * `block_size` - Pages per block (64, 128, 256, 512, or 1024)
     ///
     /// # Returns
@@ -47,18 +47,18 @@ impl FileLoader {
             .map_err(|e| Error::IoError(e))?
             .len();
         
-        // Validate page length (500-20000 bytes)
-        if page_length < 500 || page_length > 20000 {
+        // Validate page length (500-100000 bytes)
+        if page_length < 500 || page_length > 100000 {
             return Err(Error::InvalidMetadata(
-                format!("Page length {} is outside valid range (500-20000)", page_length)
+                format!("Page length {} is outside valid range (500-100000)", page_length)
             ));
         }
         
-        // Validate block size (64, 128, 256, 512, 768, or 1024 pages per block)
-        let valid_block_sizes = [64, 128, 256, 512, 768, 1024];
+        // Validate block size (64, 128, 256, 384, 512, 768, or 1024 pages per block)
+        let valid_block_sizes = [64, 128, 256, 384, 512, 768, 1024];
         if !valid_block_sizes.contains(&block_size) {
             return Err(Error::InvalidMetadata(
-                format!("Block size {} is not one of: 64, 128, 256, 512, 768, 1024", block_size)
+                format!("Block size {} is not one of: 64, 128, 256, 384, 512, 768, 1024", block_size)
             ));
         }
         

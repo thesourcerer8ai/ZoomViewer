@@ -201,8 +201,15 @@ impl TaskQueue {
     /// This is useful when the viewport changes (pan, zoom, resize) to discard
     /// tiles that are no longer needed and make room for new high-priority tiles
     pub fn clear_high_priority(&self) {
-        self.high_queue.write().clear();
-        log::debug!("High priority queue cleared");
+        let mut high = self.high_queue.write();
+        let mut normal = self.normal_queue.write();
+        
+        for mut task in high.drain(..) {
+            task.priority = Priority::Normal;
+            normal.push_back(task);
+        }
+        
+        log::debug!("High priority queue downgraded to normal to preserve dependencies");
     }
 
     /// Register that a parent tile is waiting for child tiles to complete

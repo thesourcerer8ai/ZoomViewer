@@ -476,7 +476,7 @@ mod property_tests {
             width_pixels in 512u32..2048,
             height_pixels in 512u32..2048,
             page_length in 512u32..2048,
-            block_size in prop::sample::select(vec![64u32, 128, 256, 512, 768, 1024]),
+            block_size in prop::sample::select(vec![64u32, 128, 256, 384, 512, 768, 1024]),
         )| {
             let metadata = FileMetadata::new(
                 "test.bin".to_string(),

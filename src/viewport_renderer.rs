@@ -102,25 +102,33 @@ impl ViewportRenderer {
             // Load and decode tile
             match self.cache.load_tile(&coord) {
                 Ok(tile_data) => {
-                    // Decode QOI/PNG
-                    match image::load_from_memory(&tile_data) {
-                        Ok(tile_img) => {
-                            let decoded = Arc::new(tile_img.to_rgba8());
-                            
-                            // Cache the decoded tile
-                            {
-                                let mut cache = self.decoded_tile_cache.lock().unwrap();
-                                cache.insert(coord, decoded.clone());
+                    // Decode Raw RGB or QOI/PNG
+                    let decoded = if tile_data.len() == 256 * 256 * 3 {
+                        let mut img = image::RgbaImage::new(256, 256);
+                        for (i, chunk) in tile_data.chunks_exact(3).enumerate() {
+                            let x = (i as u32) % 256;
+                            let y = (i as u32) / 256;
+                            img.put_pixel(x, y, image::Rgba([chunk[0], chunk[1], chunk[2], 255]));
+                        }
+                        Arc::new(img)
+                    } else {
+                        match image::load_from_memory(&tile_data) {
+                            Ok(tile_img) => Arc::new(tile_img.to_rgba8()),
+                            Err(_) => {
+                                // Failed to decode, show placeholder
+                                self.draw_placeholder(image, screen_x, screen_y, screen_width, screen_height, coord);
+                                return;
                             }
-                            
-                            decoded
                         }
-                        Err(_) => {
-                            // Failed to decode, show placeholder
-                            self.draw_placeholder(image, screen_x, screen_y, screen_width, screen_height, coord);
-                            return;
-                        }
+                    };
+                    
+                    // Cache the decoded tile
+                    {
+                        let mut cache = self.decoded_tile_cache.lock().unwrap();
+                        cache.insert(coord, decoded.clone());
                     }
+                    
+                    decoded
                 }
                 Err(_) => {
                     // Tile not in cache, show placeholder
