@@ -83,6 +83,10 @@ impl CacheManager {
         // QOI files start with magic bytes: "qoif" (0x71 0x6F 0x69 0x66)
         const QOI_SIGNATURE: &[u8] = b"qoif";
         if &data[0..4] != QOI_SIGNATURE {
+            // Allow uncompressed Raw RGB blobs for Level 4+ tiles
+            if data.len() == 256 * 256 * 3 {
+                return Ok(data);
+            }
             return Err(Error::CacheError("Invalid QOI: incorrect signature".to_string()));
         }
         
@@ -363,10 +367,10 @@ mod tests {
         let manager = CacheManager::new(&cache_path, "test.bin".to_string()).unwrap();
         
         // Create valid QOI data
-        let mut qoi_data1 = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        let mut qoi_data1 = create_test_qoi_data();
         qoi_data1.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
         
-        let mut qoi_data2 = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        let mut qoi_data2 = create_test_qoi_data();
         qoi_data2.extend_from_slice(&[0x05, 0x06, 0x07, 0x08]);
         
         let coord1 = TileCoord::new(0, 1, 2);
