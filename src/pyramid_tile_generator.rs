@@ -9,6 +9,7 @@ use crate::types::{FileMetadata, TileCoord, PyramidLevel, Priority, TileTask};
 use crate::bit_renderer::{Pixel, PixelBuffer};
 use crate::cache_manager::CacheManager;
 use crate::task_queue::TaskQueue;
+use crate::tile_generator::TileGenerator;
 
 /// Tile dimensions in pixels (consistent across all levels)
 pub const TILE_WIDTH: u32 = 512;
@@ -24,7 +25,12 @@ impl PyramidTileGenerator {
     /// The pyramid terminates when the entire dump fits in a single tile.
     ///
     /// **Validates: Requirements 5.1, 5.2, 5.3, 5.4**
-    pub fn calculate_pyramid_level(level: u32, metadata: &FileMetadata) -> Result<PyramidLevel> {
+    pub fn calculate_pyramid_level(level: i32, metadata: &FileMetadata) -> Result<PyramidLevel> {
+        if level < 0 {
+            return Err(Error::InvalidCoordinates(
+                "calculate_pyramid_level does not support negative levels".to_string(),
+            ));
+        }
         if level == 0 {
             // Level 0: highest resolution, tiles are TILE_WIDTH x TILE_HEIGHT pixels
             // Each pixel represents one bit
@@ -81,8 +87,8 @@ impl PyramidTileGenerator {
     /// Find the maximum pyramid level (where entire dump fits in one tile)
     ///
     /// **Validates: Requirements 5.4**
-    pub fn find_max_level(metadata: &FileMetadata) -> Result<u32> {
-        let mut level = 0;
+    pub fn find_max_level(metadata: &FileMetadata) -> Result<i32> {
+        let mut level = 0i32;
         loop {
             let pyr_level = Self::calculate_pyramid_level(level, metadata)?;
             if pyr_level.tiles_wide == 1 && pyr_level.tiles_tall == 1 {
@@ -299,16 +305,26 @@ impl PyramidTileGenerator {
         metadata: &FileMetadata,
         task_queue: &TaskQueue,
         cache: &CacheManager,
+        file_loader: &mut crate::file_loader::FileLoader,
         priority: Priority,
     ) -> Result<Vec<u8>> {
-        // Ensure this is not a level 0 tile
-        if coord.level == 0 {
+        // Ensure this is not a level 0 or negative level tile
+        if coord.level <= 0 {
             return Err(Error::InvalidCoordinates(
                 "generatePyramidTile only supports level > 0 tiles".to_string(),
             ));
         }
         
-        // Step 1: Identify 4 child tiles at level-1
+        // Special case for Level 1: generate from 512x512 region loaded directly from dump
+        if coord.level == 1 {
+            let double_buffer = TileGenerator::generate_double_tile_buffer(coord, metadata, file_loader)?;
+            let downscaled = Self::downscale(&double_buffer)?;
+            let cached_bytes = Self::encode_qoi(&downscaled)?;
+            cache.save_tile(&coord, &cached_bytes)?;
+            return Ok(cached_bytes);
+        }
+
+        // For Level 2+: load 4 tiles from Level L-1
         let child_level = coord.level - 1;
         let child_coords = [
             TileCoord::new(child_level, coord.x * 2, coord.y * 2),
@@ -320,21 +336,20 @@ impl PyramidTileGenerator {
         // Calculate max tiles at child level to check bounds
         let pixels_wide_l0 = (metadata.page_length as u64 * 8) * metadata.grid_width as u64;
         let pixels_tall_l0 = metadata.block_size as u64 * metadata.grid_height as u64;
-        let scale_factor = 2u64.pow(child_level);
+        let scale_factor = 2u64.pow(child_level as u32);
         let pixels_wide = pixels_wide_l0 / scale_factor;
         let pixels_tall = pixels_tall_l0 / scale_factor;
         const TILE_SIZE: u64 = 256;
         let max_tiles_x = ((pixels_wide + TILE_SIZE - 1) / TILE_SIZE) as u32;
         let max_tiles_y = ((pixels_tall + TILE_SIZE - 1) / TILE_SIZE) as u32;
         
-        // Step 2: Load or request children, use empty tiles for out-of-bounds
+        // Load or request children, use empty tiles for out-of-bounds
         let mut child_tiles = Vec::new();
         let mut missing_tiles = Vec::new();
         
         for child_coord in &child_coords {
             // Check if child tile is within bounds
             if child_coord.x >= max_tiles_x || child_coord.y >= max_tiles_y {
-                // Out of bounds - use empty tile
                 log::trace!(
                     "Child tile {:?} is out of bounds (max: {}x{}), using empty tile",
                     child_coord, max_tiles_x, max_tiles_y
@@ -346,7 +361,6 @@ impl PyramidTileGenerator {
                         child_tiles.push(tile_data);
                     }
                     Err(_) => {
-                        // Child tile not cached, request it with same priority as parent
                         missing_tiles.push(*child_coord);
                     }
                 }
@@ -355,13 +369,8 @@ impl PyramidTileGenerator {
         
         // If any in-bounds tiles are missing, register dependency and return error
         if !missing_tiles.is_empty() {
-            // Register this parent tile as waiting for the missing children
-            // This allows it to be re-enqueued when children complete
             task_queue.register_waiting_parent(coord, priority, &missing_tiles);
             
-            // Enqueue missing child tiles with same priority as parent
-            // LIFO ordering within each priority level ensures children are processed before parent
-            // For low-priority tiles, only enqueue if queue isn't too large to prevent explosion
             let should_enqueue = match priority {
                 Priority::High | Priority::Normal => true,
                 Priority::Low => task_queue.size() < 200,
@@ -378,7 +387,6 @@ impl PyramidTileGenerator {
                     task_queue.size(),
                     coord
                 );
-                // Return error so parent will be re-enqueued and retry later
             }
             
             return Err(Error::TileGenerationFailed(
@@ -386,7 +394,7 @@ impl PyramidTileGenerator {
             ));
         }
         
-        // Step 3: Composite 4 tiles into 2x2 grid
+        // Composite 4 tiles into 2x2 grid
         let composite_buffer = Self::composite_tiles([
             child_tiles[0].clone(),
             child_tiles[1].clone(),
@@ -394,19 +402,11 @@ impl PyramidTileGenerator {
             child_tiles[3].clone(),
         ])?;
         
-        // Step 4: Downscale to half resolution
+        // Downscale to half resolution
         let downscaled = Self::downscale(&composite_buffer)?;
         
-        // Step 5: Cache using tiered strategy based on level
-        // Level 1-3: Use QOI compression (good compression ratio)
-        // Level 4+: Use raw RGB (minimal overhead, fast decode)
-        let cached_bytes = if coord.level <= 3 {
-            // Compress with QOI for levels 1-3
-            Self::encode_qoi(&downscaled)?
-        } else {
-            // Use raw RGB for levels 4+
-            Self::encode_raw_rgb(&downscaled)
-        };
+        // All layers use QOI compression
+        let cached_bytes = Self::encode_qoi(&downscaled)?;
         
         cache.save_tile(&coord, &cached_bytes)?;
         
@@ -469,6 +469,7 @@ impl PyramidTileGenerator {
     /// 
     /// This is used for pyramid tiles to avoid expensive QOI encoding.
     /// Format: 3 bytes per pixel (RGB), no compression.
+    #[allow(dead_code)]
     fn encode_raw_rgb(buffer: &PixelBuffer) -> Vec<u8> {
         let mut rgb_data = Vec::with_capacity((buffer.width() * buffer.height() * 3) as usize);
         
@@ -785,27 +786,30 @@ mod tests {
             64,
         );
         
-        // Create and cache 4 child tiles at level 0
+        // Create dummy FileLoader for testing Level 1 / Level 2
+        let temp_dump = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp_dump.path(), vec![0u8; 1_000_000]).unwrap();
+        let mut file_loader = crate::FileLoader::new(temp_dump.path(), 512, 64).unwrap();
+
+        // Save 4 child tiles at Level 1 to test Level 2 pyramid generation
         let tile_size = TILE_WIDTH;
-        for i in 0..4 {
-            let x = i % 2;
-            let y = i / 2;
-            let coord = TileCoord::new(0, x, y);
-            
-            // Create a simple tile
-            let buffer = PixelBuffer::with_fill(tile_size, tile_size, Pixel::black());
-            let qoi = PyramidTileGenerator::encode_qoi(&buffer).unwrap();
-            
-            cache.save_tile(&coord, &qoi).unwrap();
+        for y in 0..2 {
+            for x in 0..2 {
+                let coord = TileCoord::new(1, x, y);
+                let buffer = PixelBuffer::with_fill(tile_size, tile_size, Pixel::black());
+                let qoi = PyramidTileGenerator::encode_qoi(&buffer).unwrap();
+                cache.save_tile(&coord, &qoi).unwrap();
+            }
         }
         
-        // Generate pyramid tile at level 1
-        let pyramid_coord = TileCoord::new(1, 0, 0);
+        // Generate pyramid tile at level 2
+        let pyramid_coord = TileCoord::new(2, 0, 0);
         let result = PyramidTileGenerator::generate_pyramid_tile(
             pyramid_coord,
             &metadata,
             &task_queue,
             &cache,
+            &mut file_loader,
             Priority::Normal,
         );
         
@@ -837,20 +841,25 @@ mod tests {
             512,
             64,
         );
+
+        let temp_dump = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp_dump.path(), vec![0u8; 1_000_000]).unwrap();
+        let mut file_loader = crate::FileLoader::new(temp_dump.path(), 512, 64).unwrap();
         
-        // Don't cache any child tiles
+        // Don't cache any child tiles for level 1
         
-        // Try to generate pyramid tile at level 1
-        let pyramid_coord = TileCoord::new(1, 0, 0);
+        // Try to generate pyramid tile at level 2
+        let pyramid_coord = TileCoord::new(2, 0, 0);
         let result = PyramidTileGenerator::generate_pyramid_tile(
             pyramid_coord,
             &metadata,
             &task_queue,
             &cache,
+            &mut file_loader,
             Priority::Normal,
         );
         
-        // Should fail because child tiles are missing
+        // Should fail because child tiles at level 1 are missing
         assert!(result.is_err());
         
         // Verify that a high-priority task was enqueued for the missing child
@@ -859,7 +868,7 @@ mod tests {
         
         let task = dequeued.unwrap();
         assert_eq!(task.priority, Priority::Normal);
-        assert_eq!(task.coord.level, 0); // Child tile at level 0
+        assert_eq!(task.coord.level, 1); // Child tile at level 1
     }
 
     /// Test pyramid tile generation with partial child tiles
@@ -880,23 +889,28 @@ mod tests {
             512,
             64,
         );
+
+        let temp_dump = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp_dump.path(), vec![0u8; 1_000_000]).unwrap();
+        let mut file_loader = crate::FileLoader::new(temp_dump.path(), 512, 64).unwrap();
         
-        // Cache only 2 out of 4 child tiles
+        // Cache only 2 out of 4 child tiles at Level 1
         let tile_size = TILE_WIDTH;
         for i in 0..2 {
-            let coord = TileCoord::new(0, i, 0);
+            let coord = TileCoord::new(1, i, 0);
             let buffer = PixelBuffer::with_fill(tile_size, tile_size, Pixel::black());
             let qoi = PyramidTileGenerator::encode_qoi(&buffer).unwrap();
             cache.save_tile(&coord, &qoi).unwrap();
         }
         
-        // Try to generate pyramid tile at level 1
-        let pyramid_coord = TileCoord::new(1, 0, 0);
+        // Try to generate pyramid tile at level 2
+        let pyramid_coord = TileCoord::new(2, 0, 0);
         let result = PyramidTileGenerator::generate_pyramid_tile(
             pyramid_coord,
             &metadata,
             &task_queue,
             &cache,
+            &mut file_loader,
             Priority::Normal,
         );
         
@@ -925,6 +939,10 @@ mod tests {
             512,
             64,
         );
+
+        let temp_dump = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp_dump.path(), vec![0u8; 1_000_000]).unwrap();
+        let mut file_loader = crate::FileLoader::new(temp_dump.path(), 512, 64).unwrap();
         
         // Try to generate pyramid tile at level 0 (should fail)
         let coord = TileCoord::new(0, 0, 0);
@@ -933,6 +951,7 @@ mod tests {
             &metadata,
             &task_queue,
             &cache,
+            &mut file_loader,
             Priority::Normal,
         );
         

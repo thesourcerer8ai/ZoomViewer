@@ -36,17 +36,24 @@ impl TileGenerator {
     /// # Returns
     /// Vector of Fragment objects representing contiguous byte ranges needed
     pub fn calculate_fragments(coord: TileCoord, metadata: &FileMetadata) -> Vec<Fragment> {
-        // Ensure we're working with level 0 tiles
         if coord.level != 0 {
             return Vec::new();
         }
-
-        // Step 1: Calculate tile bounds in pixels
         let tile_start_pixel_x = (coord.x as u64) * (TILE_WIDTH as u64);
         let tile_end_pixel_x = tile_start_pixel_x + (TILE_WIDTH as u64);
         let tile_start_pixel_y = (coord.y as u64) * (TILE_HEIGHT as u64);
         let tile_end_pixel_y = tile_start_pixel_y + (TILE_HEIGHT as u64);
+        Self::calculate_fragments_for_bounds(tile_start_pixel_x, tile_end_pixel_x, tile_start_pixel_y, tile_end_pixel_y, metadata)
+    }
 
+    /// Calculate byte ranges (fragments) needed for arbitrary pixel bounds at level 0
+    pub fn calculate_fragments_for_bounds(
+        tile_start_pixel_x: u64,
+        tile_end_pixel_x: u64,
+        tile_start_pixel_y: u64,
+        tile_end_pixel_y: u64,
+        metadata: &FileMetadata,
+    ) -> Vec<Fragment> {
         // Step 2: Calculate block dimensions in pixels
         let block_width_pixels = (metadata.page_length as u64) * 8; // 8 pixels per byte
         let block_height_pixels = metadata.block_size as u64; // Each page is 1 pixel tall
@@ -55,15 +62,9 @@ impl TileGenerator {
         let tile_start_byte_x = tile_start_pixel_x / 8;
         let tile_end_byte_x = (tile_end_pixel_x + 7) / 8; // Round up
         
-        // Step 4: Calculate which blocks this tile intersects (for reference)
-        let _start_block_x = tile_start_pixel_x / block_width_pixels;
-        let _end_block_x = (tile_end_pixel_x - 1) / block_width_pixels;
-        let _start_block_y = tile_start_pixel_y / block_height_pixels;
-        let _end_block_y = (tile_end_pixel_y - 1) / block_height_pixels;
-        
         let page_length = metadata.page_length as u64;
         let block_size = metadata.block_size as u64;
-        let grid_width = metadata.grid_width as u64;
+        let grid_height = metadata.grid_height as u64;
         
         let mut fragments = Vec::new();
 
@@ -71,13 +72,13 @@ impl TileGenerator {
         for pixel_y in tile_start_pixel_y..tile_end_pixel_y {
             // Calculate which block (row, col) this pixel row belongs to
             let block_y = pixel_y / block_height_pixels;
-            let block_x = (tile_start_pixel_x / block_width_pixels).min(grid_width - 1);
+            let block_x = tile_start_pixel_x / block_width_pixels;
             
             // Calculate page within the block (0 to block_size-1)
             let page_in_block = pixel_y % block_height_pixels;
             
-            // Calculate block index in file (row-major order)
-            let block_index = block_y * grid_width + block_x;
+            // Calculate block index in file (column-major order: top-to-bottom first, then left-to-right)
+            let block_index = block_x * grid_height + block_y;
             
             // Check if block is within valid range
             if block_index >= metadata.total_blocks {
@@ -85,8 +86,6 @@ impl TileGenerator {
             }
             
             // Calculate byte offset for this row
-            // File layout: Block 0 (all pages), Block 1 (all pages), ...
-            // Within each block: Page 0, Page 1, ..., Page (block_size-1)
             let block_start_offset = block_index * block_size * page_length;
             let page_offset = page_in_block * page_length;
             
@@ -112,6 +111,93 @@ impl TileGenerator {
         }
 
         fragments
+    }
+
+    /// Generate a double-sized (512x512) PixelBuffer directly from dump file for level-1 tile calculation
+    pub fn generate_double_tile_buffer(
+        coord: TileCoord,
+        metadata: &FileMetadata,
+        file_loader: &mut FileLoader,
+    ) -> Result<PixelBuffer> {
+        if coord.level != 1 {
+            return Err(crate::error::Error::InvalidCoordinates(
+                "generate_double_tile_buffer only supports level 1 target coordinates".to_string(),
+            ));
+        }
+
+        let tile_start_pixel_x = (coord.x as u64) * (512 as u64);
+        let tile_end_pixel_x = tile_start_pixel_x + (512 as u64);
+        let tile_start_pixel_y = (coord.y as u64) * (512 as u64);
+        let tile_end_pixel_y = tile_start_pixel_y + (512 as u64);
+
+        let fragments = Self::calculate_fragments_for_bounds(
+            tile_start_pixel_x, tile_end_pixel_x, tile_start_pixel_y, tile_end_pixel_y, metadata
+        );
+
+        let mut canvas = PixelBuffer::new(512, 512);
+
+        if fragments.is_empty() {
+            return Ok(canvas);
+        }
+
+        let tile_data = file_loader.read_fragments(fragments).map_err(|e| {
+            crate::error::Error::TileGenerationFailed(format!("Failed to read fragments: {}", e))
+        })?;
+
+        Self::render_tile_data(&tile_data, TileCoord::new(0, coord.x * 2, coord.y * 2), metadata, &mut canvas)?;
+
+        Ok(canvas)
+    }
+
+    /// Generate a 256x256 QOI tile for negative zoom levels (-1 to -4) by upscaling from dump
+    pub fn generate_zoomed_tile(
+        coord: TileCoord,
+        metadata: &FileMetadata,
+        file_loader: &mut FileLoader,
+    ) -> Result<Vec<u8>> {
+        if coord.level >= 0 {
+            return Err(crate::error::Error::InvalidCoordinates(
+                "generate_zoomed_tile only supports negative level coordinates".to_string(),
+            ));
+        }
+
+        let scale = 1u32 << (-coord.level as u32); // 2, 4, 8, or 16
+        let bits_per_tile = 256 / scale; // 128, 64, 32, or 16
+
+        let l0_start_x = (coord.x as u64) * (bits_per_tile as u64);
+        let l0_end_x = l0_start_x + (bits_per_tile as u64);
+        let l0_start_y = (coord.y as u64) * (bits_per_tile as u64);
+        let l0_end_y = l0_start_y + (bits_per_tile as u64);
+
+        let fragments = Self::calculate_fragments_for_bounds(
+            l0_start_x, l0_end_x, l0_start_y, l0_end_y, metadata
+        );
+
+        let mut small_canvas = PixelBuffer::new(bits_per_tile, bits_per_tile);
+
+        if !fragments.is_empty() {
+            let tile_data = file_loader.read_fragments(fragments).map_err(|e| {
+                crate::error::Error::TileGenerationFailed(format!("Failed to read fragments: {}", e))
+            })?;
+            Self::render_tile_data(&tile_data, TileCoord::new(0, 0, 0), metadata, &mut small_canvas)?;
+        }
+
+        // Upscale small_canvas to 256x256
+        let mut full_canvas = PixelBuffer::new(256, 256);
+        let src_data = small_canvas.data();
+        let dst_data = full_canvas.data_mut();
+
+        for y in 0..256 {
+            let src_y = (y / scale) as usize;
+            let src_row = src_y * (bits_per_tile as usize);
+            let dst_row = (y as usize) * 256;
+            for x in 0..256 {
+                let src_x = (x / scale) as usize;
+                dst_data[dst_row + x as usize] = src_data[src_row + src_x];
+            }
+        }
+
+        Self::encode_qoi(&full_canvas)
     }
 
     /// Generate a high-resolution tile from dump fragments
@@ -207,7 +293,7 @@ impl TileGenerator {
     /// - Processes data in cache-friendly row-major order
     fn render_tile_data(
         tile_data: &[u8],
-        coord: TileCoord,
+        _coord: TileCoord,
         _metadata: &FileMetadata,
         canvas: &mut PixelBuffer,
     ) -> Result<()> {
@@ -305,8 +391,7 @@ impl TileGenerator {
     ///
     /// Creates a tile with a light gray background and "EMPTY" text with coordinates.
     fn generate_empty_tile(coord: TileCoord) -> Result<Vec<u8>> {
-        use imageproc::drawing::draw_text_mut;
-        use rusttype::{Font, Scale};
+        use ab_glyph::{FontRef, PxScale};
         
         // Create a light gray canvas
         let canvas = PixelBuffer::with_fill(
@@ -331,12 +416,12 @@ impl TileGenerator {
         
         // Draw "EMPTY" text with coordinates
         let font_data: &[u8] = include_bytes!("../assets/ChakraPetchMono-Medium.otf");
-        if let Some(font) = Font::try_from_bytes(font_data) {
-            let scale = Scale::uniform(20.0);
+        if let Ok(font) = FontRef::try_from_slice(font_data) {
+            let scale = PxScale::from(20.0);
             
             // Draw "EMPTY" in center
             let empty_text = "EMPTY";
-            draw_text_mut(
+            imageproc::drawing::draw_text_mut(
                 &mut image,
                 image::Rgba([150, 150, 150, 255]), // Medium gray
                 (TILE_WIDTH / 2 - 40) as i32,
@@ -348,8 +433,8 @@ impl TileGenerator {
             
             // Draw coordinates below
             let coord_text = format!("L{}:({},{})", coord.level, coord.x, coord.y);
-            let small_scale = Scale::uniform(14.0);
-            draw_text_mut(
+            let small_scale = PxScale::from(14.0);
+            imageproc::drawing::draw_text_mut(
                 &mut image,
                 image::Rgba([150, 150, 150, 255]),
                 (TILE_WIDTH / 2 - 50) as i32,
@@ -931,7 +1016,7 @@ mod tests {
         let qoi_bytes = TileGenerator::generate_tile(coord, &metadata, &mut file_loader).unwrap();
 
         // Decode the QOI
-        let (header, decoded_data) = qoi::decode_to_vec(&qoi_bytes).unwrap();
+        let (_header, decoded_data) = qoi::decode_to_vec(&qoi_bytes).unwrap();
 
         // Verify we can decode the full image (RGBA format)
         assert_eq!(decoded_data.len(), (TILE_WIDTH * TILE_HEIGHT * 4) as usize, "Buffer size should match RGBA image");

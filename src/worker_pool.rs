@@ -166,7 +166,7 @@ impl WorkerPool {
         shutdown: Arc<AtomicBool>,
         tile_complete_tx: Option<Sender<TileCoord>>,
     ) {
-        log::info!("Worker {} started", worker_id);
+        log::debug!("Worker {} started", worker_id);
 
         let mut tiles_generated = 0u64;
         let mut last_report_time = std::time::Instant::now();
@@ -175,7 +175,7 @@ impl WorkerPool {
         loop {
             // Check for shutdown signal
             if shutdown.load(Ordering::Relaxed) {
-                log::info!("Worker {} shutting down", worker_id);
+                log::debug!("Worker {} shutting down", worker_id);
                 break;
             }
 
@@ -202,17 +202,24 @@ impl WorkerPool {
                     }
 
                     // Generate tile based on level
-                    let result = if task.coord.level == 0 {
+                    let result = if task.coord.level < 0 {
+                        // Negative level tiles are generated on-the-fly in ViewportRenderer
+                        // They should never reach the worker pool
+                        log::warn!("Worker {} received negative level tile {:?}, skipping", worker_id, task.coord);
+                        continue;
+                    } else if task.coord.level == 0 {
                         // High-resolution tile from dump
                         let mut loader = file_loader.lock();
                         TileGenerator::generate_tile(task.coord, &metadata, &mut loader)
                     } else {
-                        // Pyramid tile from lower-level tiles
+                        // Pyramid tile from lower-level tiles or direct dump for level 1
+                        let mut loader = file_loader.lock();
                         PyramidTileGenerator::generate_pyramid_tile(
                             task.coord,
                             &metadata,
                             &task_queue,
                             &cache,
+                            &mut loader,
                             task.priority,
                         )
                     };
@@ -312,7 +319,7 @@ impl WorkerPool {
                                 // Calculate exponential backoff delay: baseDelay * (2 ^ retryCount)
                                 let delay_ms = BASE_DELAY_MS * (1 << task.retry_count);
                                 
-                                log::info!(
+                                log::debug!(
                                     "Worker {} scheduling retry {} for tile {:?} after {}ms",
                                     worker_id,
                                     task.retry_count + 1,
@@ -367,7 +374,7 @@ impl WorkerPool {
             }
         }
 
-        log::info!("Worker {} stopped", worker_id);
+        log::debug!("Worker {} stopped", worker_id);
     }
 
     /// Gracefully stop all workers
@@ -377,7 +384,7 @@ impl WorkerPool {
     /// # Requirements
     /// - Gracefully stops all workers (Requirement 10.1)
     pub fn shutdown(mut self) {
-        log::info!("Shutting down worker pool with {} workers", self.num_workers);
+        log::debug!("Shutting down worker pool with {} workers", self.num_workers);
 
         // Signal shutdown
         self.shutdown.store(true, Ordering::Relaxed);
@@ -389,7 +396,7 @@ impl WorkerPool {
             }
         }
 
-        log::info!("Worker pool shutdown complete");
+        log::debug!("Worker pool shutdown complete");
     }
 
     /// Check if the worker pool is running

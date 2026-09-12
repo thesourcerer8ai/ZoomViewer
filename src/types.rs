@@ -54,8 +54,8 @@ impl FileMetadata {
 /// Tile coordinates in the pyramid
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TileCoord {
-    /// Resolution level (0 = highest resolution)
-    pub level: u32,
+    /// Resolution level (0 = highest resolution, negative = zoomed in)
+    pub level: i32,
     /// Tile column
     pub x: u32,
     /// Tile row
@@ -64,7 +64,7 @@ pub struct TileCoord {
 
 impl TileCoord {
     /// Create a new tile coordinate
-    pub fn new(level: u32, x: u32, y: u32) -> Self {
+    pub fn new(level: i32, x: u32, y: u32) -> Self {
         TileCoord { level, x, y }
     }
 }
@@ -72,8 +72,8 @@ impl TileCoord {
 /// Pyramid level information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PyramidLevel {
-    /// Resolution level
-    pub level: u32,
+    /// Resolution level (negative = zoomed in, 0 = 1:1, positive = zoomed out)
+    pub level: i32,
     /// Tile width in pixels
     pub tile_width: u32,
     /// Tile height in pixels
@@ -88,7 +88,7 @@ pub struct PyramidLevel {
 
 impl PyramidLevel {
     /// Create a new pyramid level
-    pub fn new(level: u32, tile_width: u32, tile_height: u32, tiles_wide: u32, tiles_tall: u32) -> Self {
+    pub fn new(level: i32, tile_width: u32, tile_height: u32, tiles_wide: u32, tiles_tall: u32) -> Self {
         let total_tiles = (tiles_wide as u64) * (tiles_tall as u64);
         PyramidLevel {
             level,
@@ -148,8 +148,8 @@ impl TileTask {
 /// Viewport state
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Viewport {
-    /// Current zoom level
-    pub level: u32,
+    /// Current zoom level (negative = zoomed in, 0 = 1:1, positive = zoomed out)
+    pub level: i32,
     /// Center X coordinate in level coordinate space (pixels)
     pub center_x: f64,
     /// Center Y coordinate in level coordinate space (pixels)
@@ -166,7 +166,7 @@ pub struct Viewport {
 
 impl Viewport {
     /// Create a new viewport
-    pub fn new(level: u32, center_x: f64, center_y: f64, width_pixels: u32, height_pixels: u32) -> Self {
+    pub fn new(level: i32, center_x: f64, center_y: f64, width_pixels: u32, height_pixels: u32) -> Self {
         Viewport {
             level,
             center_x,

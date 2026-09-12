@@ -57,18 +57,29 @@ impl CacheManager {
     
     /// Check if a tile exists in the cache
     ///
+    /// Level 0 and negative level tiles are never cached (streamed from dump), so always returns false.
+    ///
     /// # Requirements
     /// - Checks if tile file exists (Requirement 8.3)
     pub fn tile_exists(&self, coord: &TileCoord) -> bool {
+        if coord.level <= 0 {
+            return false;
+        }
         self.get_tile_path(coord).exists()
     }
     
     /// Load a QOI tile from cache
     ///
+    /// Level 0 and negative level tiles are never cached (streamed from dump), so always returns Err.
+    ///
     /// # Requirements
     /// - Loads QOI from cache (Requirement 8.4)
     /// - Validates QOI integrity
     pub fn load_tile(&self, coord: &TileCoord) -> Result<Vec<u8>> {
+        if coord.level <= 0 {
+            return Err(Error::CacheError("Level 0 and negative level tiles are never cached".to_string()));
+        }
+        
         let path = self.get_tile_path(coord);
         
         // Read the file
@@ -83,10 +94,6 @@ impl CacheManager {
         // QOI files start with magic bytes: "qoif" (0x71 0x6F 0x69 0x66)
         const QOI_SIGNATURE: &[u8] = b"qoif";
         if &data[0..4] != QOI_SIGNATURE {
-            // Allow uncompressed Raw RGB blobs for Level 4+ tiles
-            if data.len() == 256 * 256 * 3 {
-                return Ok(data);
-            }
             return Err(Error::CacheError("Invalid QOI: incorrect signature".to_string()));
         }
         
@@ -95,6 +102,8 @@ impl CacheManager {
     
     /// Save a QOI tile to cache with atomic writes
     ///
+    /// Level 0 tiles are never saved (streamed from dump), so this is a no-op for level 0.
+    ///
     /// Uses atomic writes (write to temp file, then rename) to prevent
     /// incomplete/corrupted tiles from being cached.
     ///
@@ -102,6 +111,11 @@ impl CacheManager {
     /// - Saves QOI to cache (Requirement 8.1, 8.2)
     /// - Creates intermediate directories (Requirement 19.4)
     pub fn save_tile(&self, coord: &TileCoord, qoi_data: &[u8]) -> Result<()> {
+        if coord.level <= 0 {
+            // Level 0 and negative level tiles are never persisted to disk
+            return Ok(());
+        }
+        
         let path = self.get_tile_path(coord);
         
         // Create all intermediate directories
@@ -499,7 +513,7 @@ mod tests {
     #[ignore]
     fn prop_cache_consistency() {
         proptest!(|(
-            level in 0u32..10,
+            level in 0i32..10,
             x in 0u32..100,
             y in 0u32..100,
             data_size in 8usize..1024,

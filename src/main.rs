@@ -191,7 +191,7 @@ fn main() {
                     log::info!("Worker pool started with {} workers", worker_pool.num_workers());
 
                     // Create main application window
-                    let _app_window = AppWindow::new(metadata.clone(), Arc::new(task_queue.clone()), cache.clone(), tile_rx);
+                    let _app_window = AppWindow::new(metadata.clone(), Arc::new(task_queue.clone()), cache.clone(), tile_rx, Some(file_loader_arc.clone()));
 
                     log::info!("NAND Flash Viewer initialized and ready");
                     

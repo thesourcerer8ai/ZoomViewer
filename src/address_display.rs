@@ -71,14 +71,14 @@ impl AddressDisplay {
         }
         
         // Convert viewport pixels to level 0 pixels (account for zoom level)
-        let level_scale = 1u64 << viewport.level; // 2^level
-        let pixel_x_l0 = (viewport_pixel_x * (level_scale as f64)) as u64;
-        let pixel_y_l0 = (viewport_pixel_y * (level_scale as f64)) as u64;
+        let scale = 2.0_f64.powi(viewport.level);
+        let pixel_x_l0 = (viewport_pixel_x * scale) as u64;
+        let pixel_y_l0 = (viewport_pixel_y * scale) as u64;
         
         // Calculate block dimensions in pixels
         let page_length = metadata.page_length as u64;
         let block_size = metadata.block_size as u64;
-        let grid_width = metadata.grid_width as u64;
+        let grid_height = metadata.grid_height as u64;
         
         let block_width_pixels = page_length * 8; // 8 pixels per byte
         let block_height_pixels = block_size; // Each page is 1 pixel tall
@@ -87,8 +87,8 @@ impl AddressDisplay {
         let block_x = pixel_x_l0 / block_width_pixels;
         let block_y = pixel_y_l0 / block_height_pixels;
         
-        // Calculate block index (row-major order: block_y * grid_width + block_x)
-        let block_index = block_y * grid_width + block_x;
+        // Calculate block index (column-major order: block_x * grid_height + block_y)
+        let block_index = block_x * grid_height + block_y;
         
         // Check if block is within valid range
         if block_index >= metadata.total_blocks {
@@ -424,7 +424,7 @@ mod property_tests {
     #[ignore]
     fn prop_mouse_position_address_calculation() {
         proptest!(|(
-            level in 0u32..5,
+            level in 0i32..5,
             center_x in 512.0f64..10000.0,
             center_y in 512.0f64..10000.0,
             screen_x in 0u32..1920,
@@ -601,11 +601,11 @@ mod property_tests {
             // Property: If both are in bounds, second address should be >= first
             // (moving down increases byte position)
             if let (Some(a1), Some(a2)) = (addr1, addr2) {
-                // Calculate linear byte offset for comparison
+                // Calculate linear byte offset for comparison (a1.block and a2.block are already column-major block indices)
                 let offset1 = a1.block * (metadata.block_size as u64) * (metadata.page_length as u64)
                             + a1.page * (metadata.page_length as u64)
                             + a1.byte;
-                let offset2 = a2.block * (metadata.block_size as u64) * (metadata.page_length as u64)
+                let offset2 = a2.block * (metadata.block_size as u64 * metadata.page_length as u64)
                             + a2.page * (metadata.page_length as u64)
                             + a2.byte;
                 
@@ -622,7 +622,7 @@ mod property_tests {
     #[ignore]
     fn prop_out_of_bounds_detection() {
         proptest!(|(
-            level in 0u32..3,
+            level in 0i32..3,
             center_x in 0.0f64..1000.0,
             center_y in 0.0f64..1000.0,
             screen_x in 0u32..1024,

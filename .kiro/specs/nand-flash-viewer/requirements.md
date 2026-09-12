@@ -83,8 +83,10 @@ The NAND Flash Viewer is a high-performance image viewer designed to handle extr
 2. THE Pyramid SHALL use level 0 as the highest resolution (individual bits visible)
 3. WHEN moving to a lower resolution level, THE Pyramid SHALL reduce dimensions by half in both width and height
 4. THE Pyramid SHALL continue creating levels until the entire dump fits in a single tile
-5. WHEN a tile at a lower resolution level is needed, THE Pyramid_Generator SHALL generate it from tiles in the level below (not from the dump directly)
-6. FOR ALL tiles in the pyramid, THE Pyramid SHALL maintain consistent tile dimensions across all levels
+5. Level 0 tiles SHALL NOT be persisted to disk; they SHALL be streamed directly from the dump file to the GUI when needed
+6. Level 1 tiles SHALL be generated directly from the dump file by reading double-sized tile regions (512x512 pixels), downscaling to 256x256 pixels, and compressing with QOI
+7. FOR Level 2 and higher tiles, THE Pyramid_Tile_Generator SHALL generate tiles from 4 composited tiles in the level below
+8. FOR ALL tiles in the pyramid, THE Pyramid SHALL maintain consistent tile dimensions across all levels
 
 ### Requirement 6: Generate Tiles from Dump Fragments
 
@@ -92,23 +94,24 @@ The NAND Flash Viewer is a high-performance image viewer designed to handle extr
 
 #### Acceptance Criteria
 
-1. WHEN a high-resolution tile is requested, THE Tile_Generator SHALL calculate which byte ranges (fragments) from the dump are needed
+1. WHEN a high-resolution tile (level 0) is requested, THE Tile_Generator SHALL calculate which byte ranges (fragments) from the dump are needed
 2. THE Tile_Generator SHALL load only the required fragments from the dump file
-3. THE Tile_Generator SHALL render the fragments into a PNG tile using the bit/byte/block arrangement rules
-4. WHEN tile generation completes, THE Tile_Generator SHALL cache the PNG in the ".cache" directory
+3. THE Tile_Generator SHALL render the fragments into a tile pixel buffer using the bit/byte/block arrangement rules
+4. THE Tile_Generator SHALL NOT cache level 0 tiles to disk, streaming them directly for display
 5. IF a fragment cannot be read from the dump, THEN THE Tile_Generator SHALL mark the tile as failed and report the error
 
-### Requirement 7: Generate Pyramid Tiles from Lower Levels
+### Requirement 7: Generate Pyramid Tiles
 
-**User Story:** As a system component, I want to generate lower-resolution tiles from higher-resolution tiles, so that zoom-out operations are efficient.
+**User Story:** As a system component, I want to generate lower-resolution tiles, so that zoom-out operations are efficient.
 
 #### Acceptance Criteria
 
-1. WHEN a pyramid tile is requested, THE Pyramid_Tile_Generator SHALL load tiles from the resolution level below
-2. IF a required tile from the lower level is not cached, THEN THE Pyramid_Tile_Generator SHALL send a high-priority request to the Task_Queue for that tile
-3. WHEN all required lower-level tiles are available, THE Pyramid_Tile_Generator SHALL composite them into a single tile
-4. THE Pyramid_Tile_Generator SHALL downscale the composited tile to half resolution
-5. WHEN pyramid tile generation completes, THE Pyramid_Tile_Generator SHALL cache the PNG in the ".cache" directory
+1. WHEN a level 1 pyramid tile is requested, THE Pyramid_Tile_Generator SHALL read a double-sized region (512x512 pixels) directly from the dump file, downscale it to 256x256 pixels, encode with QOI, and cache it to disk
+2. WHEN a level 2 or higher pyramid tile is requested, THE Pyramid_Tile_Generator SHALL load tiles from the resolution level below
+3. IF a required tile from the lower level (for level >= 2) is not cached, THEN THE Pyramid_Tile_Generator SHALL send a high-priority request to the Task_Queue for that tile
+4. WHEN all required lower-level tiles are available, THE Pyramid_Tile_Generator SHALL composite them into a single tile
+5. THE Pyramid_Tile_Generator SHALL downscale the composited tile to half resolution
+6. WHEN pyramid tile generation completes (for level >= 1), THE Pyramid_Tile_Generator SHALL cache the QOI compressed tile in the ".cache" directory
 
 ### Requirement 8: Cache Generated Tiles
 
@@ -116,10 +119,10 @@ The NAND Flash Viewer is a high-performance image viewer designed to handle extr
 
 #### Acceptance Criteria
 
-1. THE Cache SHALL store all generated PNG tiles in the ".cache" directory
-2. THE Cache SHALL use a hierarchical directory structure: ".cache/{dump_filename}/{level}/{block_y}/{block_x}.png"
-3. WHEN a tile is requested, THE Cache SHALL check if it exists before generating
-4. IF a tile exists in the cache, THE Cache SHALL load it instead of regenerating
+1. THE Cache SHALL store generated QOI tiles for levels 1 and higher in the ".cache" directory (level 0 tiles are never cached to disk)
+2. THE Cache SHALL use a hierarchical directory structure: ".cache/{dump_filename}/{level}/{block_y}/{block_x}.qoi"
+3. WHEN a tile for level 1+ is requested, THE Cache SHALL check if it exists before generating
+4. IF a tile for level 1+ exists in the cache, THE Cache SHALL load it instead of regenerating
 5. THE Cache SHALL support cache invalidation when the dump file is modified
 
 ### Requirement 9: Implement Task Queue with Priority Levels

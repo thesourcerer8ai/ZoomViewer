@@ -81,7 +81,7 @@ impl TileIterator {
         let max_y = self.max_tiles_y[self.current_level as usize];
         
         // Return current tile
-        let coord = TileCoord::new(self.current_level, self.current_x, self.current_y);
+        let coord = TileCoord::new(self.current_level as i32, self.current_x, self.current_y);
         
         // Advance to next position
         self.current_x += 1;

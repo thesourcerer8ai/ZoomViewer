@@ -12,3 +12,4 @@ target/*/release/deps
 target/*/release/.fingerprint
 target/flycheck0/stderr
 target/flycheck0/stdout
+target/

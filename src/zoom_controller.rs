@@ -10,16 +10,16 @@ use std::sync::{Arc, Mutex};
 /// Default zoom level: 1 bit = 1 pixel (level 0)
 pub const DEFAULT_ZOOM_LEVEL: f64 = 1.0;
 
-/// Maximum zoom level: 1 bit = 16x16 pixels (256 pixels per bit)
-/// This corresponds to a zoom factor of 256.0
-pub const MAX_ZOOM_FACTOR: f64 = 256.0;
+/// Maximum zoom level: 1 bit = 16x16 pixels (level -4)
+/// This corresponds to a zoom factor of 16.0
+pub const MAX_ZOOM_FACTOR: f64 = 16.0;
 
 /// Zoom step for discrete zoom operations (e.g., mouse wheel)
 pub const ZOOM_STEP: f64 = 1.2;
 
 /// ZoomController manages zoom operations
 pub struct ZoomController {
-    /// Current zoom factor (1.0 = 1 bit = 1 pixel, 256.0 = 1 bit = 16x16 pixels)
+    /// Current zoom factor (1.0 = 1 bit = 1 pixel, 16.0 = 1 bit = 16x16 pixels)
     zoom_factor: f64,
     /// Target zoom factor for animation
     target_zoom_factor: f64,
@@ -123,17 +123,10 @@ impl ZoomController {
         
         let old_zoom = self.zoom_factor;
         
-        // Find the previous level boundary (more zoomed out)
-        if self.zoom_factor >= 1.0 {
-            // From level 0, go to level 1
-            self.zoom_factor = 0.5;
-            self.target_zoom_factor = 0.5;
-        } else {
-            // Go to next level (half the current)
-            let next = self.zoom_factor / 2.0;
-            self.zoom_factor = next.max(self.min_zoom_factor);
-            self.target_zoom_factor = self.zoom_factor;
-        }
+        // Go to next level (half the current)
+        let next = self.zoom_factor / 2.0;
+        self.zoom_factor = next.max(self.min_zoom_factor);
+        self.target_zoom_factor = self.zoom_factor;
         
         log::debug!("zoom_out: new zoom set to {}", self.zoom_factor);
         self.update_viewport_after_zoom(center_x, center_y, old_zoom);
@@ -244,16 +237,10 @@ impl ZoomController {
         };
         
         // Calculate pyramid level from zoom factor
-        // For smooth zooming, we use the floor of the level calculation
-        // This allows rendering both current and next level during transitions
-        // Level 0: zoom_factor >= 1.0 (zoomed in or 1:1)
-        // Level 1: zoom_factor = 0.5 (zoomed out 2x)
-        // Level 2: zoom_factor = 0.25 (zoomed out 4x)
-        let new_level = if self.zoom_factor >= 1.0 {
-            0
-        } else {
-            (-self.zoom_factor.log2()).floor() as u32
-        };
+        // Level < 0: zoom_factor > 1.0 (e.g. 2.0 -> level -1, 16.0 -> level -4)
+        // Level 0: zoom_factor = 1.0
+        // Level > 0: zoom_factor < 1.0 (e.g. 0.5 -> level 1)
+        let new_level = (-self.zoom_factor.log2()).floor() as i32;
         
         // Calculate the offset from screen center to mouse position
         let screen_center_x = (self.screen_width as f64) / 2.0;
@@ -262,19 +249,8 @@ impl ZoomController {
         let offset_x = mouse_screen_x - screen_center_x;
         let offset_y = mouse_screen_y - screen_center_y;
         
-        // Calculate new viewport center to keep the point under the mouse cursor fixed in world coordinates.
-        // The formula is: C1 = C0 * 2^(L0-L1) + (Os / 2^L1)(1/Z0 - 1/Z1)
-        // Where:
-        // C0 = old viewport center (world coordinates at old level)
-        // L0 = old pyramid level
-        // L1 = new pyramid level
-        // Os = screen offset from center to mouse (screen coordinates)
-        // Z0 = old zoom factor
-        // Z1 = new zoom factor
-        // C1 = new viewport center (world coordinates at new level)
-
-        let level_diff_pow = 2.0_f64.powi(current_viewport.level as i32 - new_level as i32);
-        let level_scale_new = 2.0_f64.powi(new_level as i32);
+        let level_diff_pow = 2.0_f64.powi(current_viewport.level - new_level);
+        let level_scale_new = 2.0_f64.powi(new_level);
 
         let mut new_center_x = current_viewport.center_x * level_diff_pow + (offset_x / level_scale_new) * (1.0 / old_zoom_factor - 1.0 / self.zoom_factor);
         let mut new_center_y = current_viewport.center_y * level_diff_pow + (offset_y / level_scale_new) * (1.0 / old_zoom_factor - 1.0 / self.zoom_factor);
@@ -285,7 +261,7 @@ impl ZoomController {
         let pixels_tall_l0 = self.metadata.block_size as u64 * self.metadata.grid_height as u64;
         
         // Scale to the new level
-        let scale = 2.0_f64.powi(new_level as i32);
+        let scale = 2.0_f64.powi(new_level);
         let pixels_wide = (pixels_wide_l0 as f64) / scale;
         let pixels_tall = (pixels_tall_l0 as f64) / scale;
         
@@ -314,12 +290,8 @@ impl ZoomController {
     }
     
     /// Get the current pyramid level
-    pub fn get_level(&self) -> u32 {
-        if self.zoom_factor >= 1.0 {
-            0
-        } else {
-            (-self.zoom_factor.log2()).floor() as u32
-        }
+    pub fn get_level(&self) -> i32 {
+        (-self.zoom_factor.log2()).floor() as i32
     }
     
     /// Get the blend factor for smooth zooming between levels
@@ -328,7 +300,7 @@ impl ZoomController {
     /// - 1.0 means fully at next level (more zoomed out)
     pub fn get_blend_factor(&self) -> f64 {
         if self.zoom_factor >= 1.0 {
-            // At level 0, no blending needed
+            // At level 0 or negative levels, no blending needed
             0.0
         } else {
             // Calculate fractional part of level
@@ -339,7 +311,7 @@ impl ZoomController {
     }
     
     /// Get the next pyramid level for blending (one level more zoomed out)
-    pub fn get_next_level(&self) -> Option<u32> {
+    pub fn get_next_level(&self) -> Option<i32> {
         let current_level = self.get_level();
         let blend_factor = self.get_blend_factor();
         

@@ -143,8 +143,8 @@ mod tests {
         // Create cache manager
         let cache = Arc::new(CacheManager::new(&cache_dir, "test.bin".to_string()).unwrap());
         
-        // Create a test tile
-        let coord = TileCoord::new(0, 5, 10);
+        // Create a test tile (Level 1, as Level 0 is never cached)
+        let coord = TileCoord::new(1, 5, 10);
         let test_tile_data = b"qoif\x00\x00\x00\x10\x00\x00\x00\x10\x04\x01test_data".to_vec();
         
         // Save to cache
@@ -174,16 +174,14 @@ mod tests {
         let mut file_loader = FileLoader::new(temp_file.path(), 2048, 64).unwrap();
         let metadata = file_loader.get_metadata().clone();
         
-        let coord = TileCoord::new(0, 0, 0);
+        let coord = TileCoord::new(1, 0, 0);
+        let task_queue = TaskQueue::new();
         
         // Verify tile doesn't exist yet
         assert!(!cache.tile_exists(&coord), "Tile should not exist initially");
         
         // Generate tile
-        let tile_data = TileGenerator::generate_tile(coord, &metadata, &mut file_loader).unwrap();
-        
-        // Cache the tile
-        cache.save_tile(&coord, &tile_data).unwrap();
+        let tile_data = PyramidTileGenerator::generate_pyramid_tile(coord, &metadata, &task_queue, &cache, &mut file_loader, Priority::High).unwrap();
         
         // Verify tile now exists
         assert!(cache.tile_exists(&coord), "Tile should exist after caching");

@@ -1,15 +1,27 @@
 //! Main application window with viewport rendering and event handling
 
 use crate::{
+    workflow::WorkflowEditorState,
     AddressDisplay, CacheManager, FileMetadata, PanController, TaskQueue, TileCoord, Viewport,
     ViewportManager, ViewportRenderer, ZoomController,
 };
-use fltk::{prelude::*, text::TextEditor, window::Window, frame::Frame, enums::{ColorDepth, Event}, app::MouseWheel, image::RgbImage};
+use fltk::{
+    app::MouseWheel,
+    enums::{ColorDepth, Event},
+    frame::Frame,
+    group::{Group, Tabs},
+    image::RgbImage,
+    prelude::*,
+    text::TextEditor,
+    window::{GlWindow, Window},
+};
+use egui_glow::Painter;
+use fltk_egui::EguiState;
 use image::RgbaImage;
-use std::sync::{Arc, Mutex};
-use std::sync::mpsc::Receiver;
-use std::time::Instant;
 use std::collections::HashMap;
+use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 const TILE_WIDTH: u32 = 256;
 const TILE_HEIGHT: u32 = 256;
@@ -19,6 +31,8 @@ const TILE_HEIGHT: u32 = 256;
 pub struct AppWindow {
     /// FLTK window
     window: Window,
+    /// Workflow state
+    workflow_state: Arc<Mutex<WorkflowEditorState>>,
     /// Frame to display the viewport image
     viewport_frame: Arc<Mutex<Frame>>,
     /// Viewport manager for tile identification
@@ -54,12 +68,14 @@ pub struct AppWindow {
 }
 
 impl AppWindow {
+
     /// Create a new application window
     pub fn new(
         metadata: FileMetadata,
         task_queue: Arc<TaskQueue>,
         cache: Arc<CacheManager>,
         tile_rx: Option<Receiver<TileCoord>>,
+        file_loader: Option<Arc<parking_lot::Mutex<crate::FileLoader>>>,
     ) -> Self {
         // Extract filename from path for window title
         let filename = std::path::Path::new(&metadata.path)
@@ -71,17 +87,105 @@ impl AppWindow {
         let mut window = Window::default()
             .with_size(1024, 768)
             .with_label(&format!("NAND Dump Viewer - {}", filename));
-        
-        window.make_resizable(true);
-        window.size_range(800, 600, 0, 0); // Min size 800x600, no max size
 
-        // Create viewport frame to display the image
+        let tabs = Tabs::default().with_size(1024, 768).with_pos(0, 0);
+
+        // --- TAB 1: NAND Dump Viewer ---
+        let tab_viewer = Group::default()
+            .with_size(1024, 738)
+            .with_pos(0, 30)
+            .with_label("NAND Viewer\t");
+
         let mut viewport_frame = Frame::default()
-            .with_size(1024, 708)
-            .with_pos(0, 0);
-        
-        // Make the frame resizable
+            .with_size(1024, 648)
+            .with_pos(0, 30);
         viewport_frame.set_frame(fltk::enums::FrameType::FlatBox);
+
+        // Create status bar
+        let mut status_bar = TextEditor::default()
+            .with_size(1024, 60)
+            .with_pos(0, 678);
+        status_bar.set_buffer(fltk::text::TextBuffer::default());
+
+        tab_viewer.end();
+
+        // --- TAB 2: Workflow Editor (embedded egui GL Canvas) ---
+        let tab_workflow = Group::default()
+            .with_size(1024, 738)
+            .with_pos(0, 30)
+            .with_label("Workflow Editor\t");
+
+        let _workflow_state = Arc::new(Mutex::new(WorkflowEditorState::new(None)));
+
+        let mut gl_win = GlWindow::default()
+            .with_size(1024, 738)
+            .with_pos(0, 30);
+        gl_win.set_mode(fltk::enums::Mode::Opengl3);
+        gl_win.end();
+
+        tab_workflow.end();
+
+        tabs.end();
+        window.resizable(&tabs);
+        window.end();
+        window.show();
+
+        // Setup fltk-egui for workflow tab with lazy initialization on first draw
+        let workflow_state = Arc::new(Mutex::new(WorkflowEditorState::new(Some(&metadata.path))));
+        let egui_state: Arc<Mutex<Option<(Painter, EguiState)>>> = Arc::new(Mutex::new(None));
+        let egui_ctx = egui::Context::default();
+
+        let workflow_state_draw = workflow_state.clone();
+        let egui_state_draw = egui_state.clone();
+        let egui_ctx_draw = egui_ctx.clone();
+
+        gl_win.draw(move |w| {
+            if !w.shown() {
+                return;
+            }
+            w.make_current();
+            let mut state_guard = egui_state_draw.lock().unwrap();
+            if state_guard.is_none() {
+                *state_guard = Some(fltk_egui::init(w));
+            }
+            if let Some((painter, state)) = state_guard.as_mut() {
+                let raw_input = state.take_input();
+                let ppp = state.pixels_per_point();
+
+                let full_output = egui_ctx_draw.run(raw_input, |ctx| {
+                    let mut wf = workflow_state_draw.lock().unwrap();
+                    wf.show_ui(ctx);
+                });
+
+                state.fuse_output(w, full_output.platform_output);
+                let clipped_primitives = egui_ctx_draw.tessellate(full_output.shapes, full_output.pixels_per_point);
+
+                painter.paint_and_update_textures(
+                    [w.width() as u32, w.height() as u32],
+                    ppp,
+                    &clipped_primitives,
+                    &full_output.textures_delta,
+                );
+                w.swap_buffers();
+            }
+        });
+
+        let egui_state_handle = egui_state.clone();
+        let mut gl_win_handle = gl_win.clone();
+        gl_win_handle.handle(move |w, ev| {
+            if let Ok(mut state_guard) = egui_state_handle.try_lock() {
+                if let Some((_, state)) = state_guard.as_mut() {
+                    state.fuse_input(w, ev);
+                }
+            }
+            match ev {
+                Event::Push | Event::Drag | Event::Move | Event::Released | Event::KeyDown | Event::KeyUp | Event::MouseWheel | Event::Resize => {
+                    w.redraw();
+                    true
+                }
+                _ => false,
+            }
+        });
 
         // Create viewport manager
         let viewport_manager = Arc::new(Mutex::new(ViewportManager::new(
@@ -94,7 +198,7 @@ impl AppWindow {
             metadata.clone(),
             viewport_manager.clone(),
             1024,
-            708, // Account for status bar height
+            648, // Account for status bar height
         )));
 
         // Create pan controller
@@ -102,37 +206,30 @@ impl AppWindow {
             metadata.clone(),
             viewport_manager.clone(),
             1024,
-            708,
+            648,
         )));
 
         // Create address display
         let address_display = Arc::new(Mutex::new(AddressDisplay::new()));
 
         // Create viewport renderer
-        let viewport_renderer = Arc::new(ViewportRenderer::new(cache.clone(), TILE_WIDTH, TILE_HEIGHT));
+        let viewport_renderer = if let Some(ref fl) = file_loader {
+            Arc::new(ViewportRenderer::with_file_loader(cache.clone(), TILE_WIDTH, TILE_HEIGHT, fl.clone(), metadata.clone()))
+        } else {
+            Arc::new(ViewportRenderer::new(cache.clone(), TILE_WIDTH, TILE_HEIGHT))
+        };
 
         // Initialize viewport at upper left corner with default zoom (level 0)
-        // Center the viewport so that (0,0) is at the upper left corner
         {
             let mut vm = viewport_manager.lock().unwrap();
-            let center_x = 1024.0 / 2.0; // Half of viewport width
-            let center_y = 708.0 / 2.0;  // Half of viewport height
-            vm.update_viewport(0, center_x, center_y, 1024, 708);
+            let center_x = 1024.0 / 2.0;
+            let center_y = 648.0 / 2.0;
+            vm.update_viewport(0, center_x, center_y, 1024, 648);
             vm.update_task_priorities();
         }
 
-        // Create status bar for address display
-        let mut status_bar = TextEditor::default()
-            .with_size(1024, 60)
-            .with_pos(0, 708);
-        status_bar.set_buffer(fltk::text::TextBuffer::default());
-        // Note: TextEditor doesn't have set_editable, but we can make it read-only by not allowing input
-
-        window.end();
-        window.show();
-
         // Create initial viewport image
-        let viewport_image = Arc::new(Mutex::new(RgbaImage::new(1024, 708)));
+        let viewport_image = Arc::new(Mutex::new(RgbaImage::new(1024, 648)));
         
         // Create FLTK tile cache
         let fltk_tile_cache = Arc::new(Mutex::new(HashMap::new()));
@@ -145,6 +242,7 @@ impl AppWindow {
 
         let app_window = AppWindow {
             window,
+            workflow_state: workflow_state.clone(),
             viewport_frame: viewport_frame_arc.clone(),
             viewport_manager: viewport_manager.clone(),
             zoom_controller: zoom_controller.clone(),
@@ -660,6 +758,101 @@ impl AppWindow {
                         win.redraw();
                         true
                     }
+                    fltk::enums::Event::KeyDown => {
+                        let state = fltk::app::event_state();
+                        if state.contains(fltk::enums::EventState::Ctrl) {
+                            let key = fltk::app::event_key();
+                            let key_char = key.to_char();
+                            let is_zero = key_char == Some('0');
+                            let is_plus = key_char == Some('+') || key_char == Some('=');
+                            let is_minus = key_char == Some('-');
+
+                            if is_zero || is_plus || is_minus {
+                                let center_x = (win.width() as f64) / 2.0;
+                                let status_bar_height = 60.0;
+                                let center_y = ((win.height() as f64) - status_bar_height) / 2.0;
+                                let render_start = Instant::now();
+
+                                {
+                                    let mut zoom_ctrl = zoom_controller_resize.lock().unwrap();
+                                    if is_zero {
+                                        log::debug!("Hotkey Ctrl+0: resetting zoom to level 0 (1.0x)");
+                                        zoom_ctrl.set_zoom(1.0, center_x, center_y);
+                                    } else if is_plus {
+                                        log::debug!("Hotkey Ctrl++: zooming in");
+                                        zoom_ctrl.zoom_in(center_x, center_y);
+                                    } else if is_minus {
+                                        log::debug!("Hotkey Ctrl+-: zooming out");
+                                        zoom_ctrl.zoom_out(center_x, center_y);
+                                    }
+                                }
+
+                                // Re-render viewport
+                                let viewport = viewport_manager_resize.lock().unwrap();
+                                let vp = viewport.get_viewport().clone();
+                                viewport.update_task_priorities();
+                                drop(viewport);
+
+                                let zoom = zoom_controller_wheel.lock().unwrap();
+                                let blend_level = zoom.get_next_level();
+                                let blend_factor = zoom.get_blend_factor();
+                                drop(zoom);
+
+                                let rendered_image = viewport_renderer_wheel.render_viewport(&vp, blend_level, blend_factor);
+                                let mut viewport_img = viewport_image_wheel.lock().unwrap();
+                                *viewport_img = rendered_image;
+
+                                let width = viewport_img.width() as i32;
+                                let height = viewport_img.height() as i32;
+                                let raw_data = viewport_img.as_raw().clone();
+                                drop(viewport_img);
+
+                                if let Ok(fltk_img) = fltk::image::RgbImage::new(&raw_data, width, height, ColorDepth::Rgba8) {
+                                    let mut frame = viewport_frame_resize.lock().unwrap();
+                                    frame.set_image(Some(fltk_img));
+                                    frame.redraw();
+                                }
+
+                                let render_duration = render_start.elapsed().as_secs_f64() * 1000.0;
+                                let time_since_last_render = {
+                                    let mut last_time = last_render_time_wheel.lock().unwrap();
+                                    let now = Instant::now();
+                                    let time_since = last_time.map(|t| now.duration_since(t).as_secs_f64() * 1000.0).unwrap_or(0.0);
+                                    *last_time = Some(now);
+                                    time_since
+                                };
+
+                                if let Ok(status_bar) = status_bar_wheel.lock() {
+                                    if let Some(mut buf) = status_bar.buffer() {
+                                        let addr_display = address_display_wheel.lock().unwrap();
+                                        let address_str = addr_display.get_address();
+                                        drop(addr_display);
+
+                                        let zoom_factor = {
+                                            let zoom = zoom_controller_wheel.lock().unwrap();
+                                            zoom.get_zoom_factor()
+                                        };
+
+                                        let half_width = (vp.width_pixels as f64) / 2.0;
+                                        let half_height = (vp.height_pixels as f64) / 2.0;
+                                        let left = (vp.center_x - half_width).max(0.0) as u64;
+                                        let right = (vp.center_x + half_width) as u64;
+                                        let top = (vp.center_y - half_height).max(0.0) as u64;
+                                        let bottom = (vp.center_y + half_height) as u64;
+
+                                        buf.set_text(&format!(
+                                            "Address: {}\nRender: {:.1}ms | Since last: {:.1}ms | Zoom: {:.3}x | Level: {} | Viewport: ({}, {}) - ({}, {})",
+                                            address_str, render_duration, time_since_last_render, zoom_factor, vp.level, left, top, right, bottom
+                                        ));
+                                    }
+                                }
+
+                                win.redraw();
+                                return true;
+                            }
+                        }
+                        false
+                    }
                     fltk::enums::Event::Close => {
                         fltk::app::quit();
                         true
@@ -935,7 +1128,7 @@ mod tests {
             CacheManager::new(temp_dir.path(), "test.bin".to_string()).unwrap(),
         );
 
-        let window = AppWindow::new(metadata, task_queue, cache, None);
+        let window = AppWindow::new(metadata, task_queue, cache, None, None);
         assert_eq!(window.metadata.page_length, 512);
         assert_eq!(window.metadata.block_size, 64);
     }
@@ -951,7 +1144,7 @@ mod tests {
             CacheManager::new(temp_dir.path(), "test.bin".to_string()).unwrap(),
         );
 
-        let mut window = AppWindow::new(metadata, task_queue, cache, None);
+        let mut window = AppWindow::new(metadata, task_queue, cache, None, None);
         window.handle_mouse_move(100, 100);
         assert_eq!(window.mouse_x, 100);
         assert_eq!(window.mouse_y, 100);
@@ -968,7 +1161,7 @@ mod tests {
             CacheManager::new(temp_dir.path(), "test.bin".to_string()).unwrap(),
         );
 
-        let window = AppWindow::new(metadata, task_queue, cache, None);
+        let window = AppWindow::new(metadata, task_queue, cache, None, None);
         let viewport = window.get_viewport();
 
         // Should start at level 0 (highest resolution)

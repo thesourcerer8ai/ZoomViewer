@@ -125,16 +125,16 @@ impl PanController {
     ///
     /// # Returns
     /// Tuple of (min_x, max_x, min_y, max_y) in level coordinates
-    fn calculate_boundaries(&self, level: u32) -> (f64, f64, f64, f64) {
+    fn calculate_boundaries(&self, level: i32) -> (f64, f64, f64, f64) {
         // Calculate total pixels at level 0 (highest resolution)
         let pixels_wide_l0 = (self.metadata.page_length as u64 * 8) * self.metadata.grid_width as u64;
         // Each page is 1 pixel tall
         let pixels_tall_l0 = self.metadata.block_size as u64 * self.metadata.grid_height as u64;
         
-        // Scale by level (each level is half the resolution)
-        let scale_factor = 2u64.pow(level);
-        let pixels_wide = (pixels_wide_l0 / scale_factor) as f64;
-        let pixels_tall = (pixels_tall_l0 / scale_factor) as f64;
+        // Scale by level (positive level = downscaled, negative level = upscaled)
+        let scale_factor = 2.0_f64.powi(level);
+        let pixels_wide = (pixels_wide_l0 as f64) / scale_factor;
+        let pixels_tall = (pixels_tall_l0 as f64) / scale_factor;
         
         // Calculate minimum and maximum center positions
         // The center can't be less than half the viewport size from the edge

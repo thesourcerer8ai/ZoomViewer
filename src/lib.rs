@@ -57,3 +57,5 @@ pub use viewport_renderer::ViewportRenderer;
 pub use app_window::AppWindow;
 pub use multi_file_manager::{MultiFileManager, DumpId, DumpFileState};
 pub use window_manager::{WindowManager, WindowId, WindowState};
+pub mod workflow;
+pub use workflow::{WorkflowEditorState, WorkflowNode, WorkflowNodeKind};

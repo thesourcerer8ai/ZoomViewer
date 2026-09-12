@@ -154,7 +154,6 @@ impl BitRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use proptest::prelude::*;
 
     #[test]
     fn test_pixel_creation() {

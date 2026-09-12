@@ -42,15 +42,17 @@ impl CoordinateParser {
     /// 4. Calculate position within block: pageInBlock = (byteY % (pageLength * blockSize)) / pageLength, byteInPage = byteX % (pageLength * 8)
     /// 5. Calculate offset: (blockY * gridWidth + blockX) * blockSize * pageLength + pageInBlock * pageLength + byteInPage
     pub fn tile_to_byte_offset(coord: TileCoord, metadata: &FileMetadata) -> u64 {
-        let level_scale = 1u32 << coord.level; // 2^level
-        
-        // Step 1: Calculate tile dimensions at level 0
-        let tile_w0 = TILE_WIDTH * level_scale;
-        let tile_h0 = TILE_HEIGHT * level_scale;
+        let (tile_w0, tile_h0) = if coord.level >= 0 {
+            let level_scale = 1u64 << (coord.level as u32);
+            ((TILE_WIDTH as u64) * level_scale, (TILE_HEIGHT as u64) * level_scale)
+        } else {
+            let level_scale = 1u64 << ((-coord.level) as u32);
+            ((TILE_WIDTH as u64) / level_scale, (TILE_HEIGHT as u64) / level_scale)
+        };
         
         // Step 2: Calculate pixel position in level 0
-        let pixel_x = (coord.x as u64) * (tile_w0 as u64);
-        let pixel_y = (coord.y as u64) * (tile_h0 as u64);
+        let pixel_x = (coord.x as u64) * tile_w0;
+        let pixel_y = (coord.y as u64) * tile_h0;
         
         // Step 3: Convert pixels to bytes
         let byte_x = pixel_x / 8;
@@ -88,7 +90,7 @@ impl CoordinateParser {
     /// 3. Calculate byte position in global grid: byteY = blockY * pageLength * blockSize + pageInBlock * pageLength, byteX = blockX * pageLength * 8 + byteInPage
     /// 4. Calculate pixel position: pixelX = byteX * 8, pixelY = byteY
     /// 5. Calculate tile coordinates: x = pixelX / (tileWidth * 2^level), y = pixelY / (tileHeight * 2^level)
-    pub fn byte_offset_to_tile(offset: u64, level: u32, metadata: &FileMetadata) -> TileCoord {
+    pub fn byte_offset_to_tile(offset: u64, level: i32, metadata: &FileMetadata) -> TileCoord {
         let page_length = metadata.page_length as u64;
         let grid_width = metadata.grid_width as u64;
         let block_size = metadata.block_size as u64;
@@ -115,9 +117,13 @@ impl CoordinateParser {
         let pixel_y = byte_y;
         
         // Step 5: Calculate tile coordinates
-        let level_scale = 1u64 << level; // 2^level
-        let tile_w0 = (TILE_WIDTH as u64) * level_scale;
-        let tile_h0 = (TILE_HEIGHT as u64) * level_scale;
+        let (tile_w0, tile_h0) = if level >= 0 {
+            let scale = 1u64 << (level as u32);
+            ((TILE_WIDTH as u64) * scale, (TILE_HEIGHT as u64) * scale)
+        } else {
+            let scale = 1u64 << ((-level) as u32);
+            ((TILE_WIDTH as u64) / scale, (TILE_HEIGHT as u64) / scale)
+        };
         
         let x = (pixel_x / tile_w0) as u32;
         let y = (pixel_y / tile_h0) as u32;
@@ -576,7 +582,7 @@ mod property_tests {
     #[ignore]
     fn prop_coordinate_round_trip() {
         proptest!(|(
-            level in 0u32..10,
+            level in 0i32..10,
             y in 0u32..100,
             page_length in 512u32..4096,
             block_size in 64u32..1024,

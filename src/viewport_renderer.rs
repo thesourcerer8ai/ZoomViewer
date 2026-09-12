@@ -1,8 +1,9 @@
 //! Viewport renderer - composites tiles into the viewport for display
 
-use crate::{CacheManager, TileCoord, Viewport};
+use crate::{CacheManager, TileCoord, Viewport, FileLoader, FileMetadata, TileGenerator};
 use image::RgbaImage;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 
 /// Renders tiles from cache into a viewport image
@@ -15,6 +16,10 @@ pub struct ViewportRenderer {
     tile_height: u32,
     /// Cache of decoded tile images (TileCoord -> RgbaImage)
     decoded_tile_cache: Arc<Mutex<HashMap<TileCoord, Arc<RgbaImage>>>>,
+    /// Optional file loader for direct level-0 tile rendering
+    file_loader: Option<Arc<Mutex<FileLoader>>>,
+    /// Optional file metadata for direct level-0 tile rendering
+    metadata: Option<FileMetadata>,
 }
 
 impl ViewportRenderer {
@@ -25,12 +30,32 @@ impl ViewportRenderer {
             tile_width,
             tile_height,
             decoded_tile_cache: Arc::new(Mutex::new(HashMap::new())),
+            file_loader: None,
+            metadata: None,
+        }
+    }
+
+    /// Create a new viewport renderer with file loader for level-0 direct streaming
+    pub fn with_file_loader(
+        cache: Arc<CacheManager>,
+        tile_width: u32,
+        tile_height: u32,
+        file_loader: Arc<Mutex<FileLoader>>,
+        metadata: FileMetadata,
+    ) -> Self {
+        ViewportRenderer {
+            cache,
+            tile_width,
+            tile_height,
+            decoded_tile_cache: Arc::new(Mutex::new(HashMap::new())),
+            file_loader: Some(file_loader),
+            metadata: Some(metadata),
         }
     }
 
     /// Render viewport to an RGBA image
     /// Returns an image with missing tiles shown as gray placeholders
-    pub fn render_viewport(&self, viewport: &Viewport, _blend_level: Option<u32>, _blend_factor: f64) -> RgbaImage {
+    pub fn render_viewport(&self, viewport: &Viewport, _blend_level: Option<i32>, _blend_factor: f64) -> RgbaImage {
         let mut image = RgbaImage::new(viewport.width_pixels, viewport.height_pixels);
 
         // Fill with light gray background
@@ -92,46 +117,51 @@ impl ViewportRenderer {
 
         // Try to get decoded tile from cache first
         let tile_rgba = {
-            let cache = self.decoded_tile_cache.lock().unwrap();
+            let cache = self.decoded_tile_cache.lock();
             cache.get(&coord).cloned()
         };
 
         let tile_rgba = if let Some(cached_tile) = tile_rgba {
             cached_tile
         } else {
-            // Load and decode tile
-            match self.cache.load_tile(&coord) {
-                Ok(tile_data) => {
-                    // Decode Raw RGB or QOI/PNG
-                    let decoded = if tile_data.len() == 256 * 256 * 3 {
-                        let mut img = image::RgbaImage::new(256, 256);
-                        for (i, chunk) in tile_data.chunks_exact(3).enumerate() {
-                            let x = (i as u32) % 256;
-                            let y = (i as u32) / 256;
-                            img.put_pixel(x, y, image::Rgba([chunk[0], chunk[1], chunk[2], 255]));
-                        }
-                        Arc::new(img)
+            // Load and decode tile (or generate Level <= 0 on-the-fly)
+            let tile_data_opt = if coord.level <= 0 {
+                if let (Some(loader_arc), Some(meta)) = (&self.file_loader, &self.metadata) {
+                    let mut loader = loader_arc.lock();
+                    if coord.level == 0 {
+                        TileGenerator::generate_tile(coord, meta, &mut loader).ok()
                     } else {
-                        match image::load_from_memory(&tile_data) {
-                            Ok(tile_img) => Arc::new(tile_img.to_rgba8()),
-                            Err(_) => {
-                                // Failed to decode, show placeholder
-                                self.draw_placeholder(image, screen_x, screen_y, screen_width, screen_height, coord);
-                                return;
-                            }
+                        TileGenerator::generate_zoomed_tile(coord, meta, &mut loader).ok()
+                    }
+                } else {
+                    None
+                }
+            } else {
+                self.cache.load_tile(&coord).ok()
+            };
+
+            match tile_data_opt {
+                Some(tile_data) => {
+                    // Decode Raw RGB or QOI/PNG
+                    let decoded = match image::load_from_memory(&tile_data) {
+                        Ok(tile_img) => Arc::new(tile_img.to_rgba8()),
+                        Err(_) => {
+                            // Failed to decode, show placeholder
+                            self.draw_placeholder(image, screen_x, screen_y, screen_width, screen_height, coord);
+                            return;
                         }
                     };
                     
-                    // Cache the decoded tile
+                    // Cache the decoded tile in memory
                     {
-                        let mut cache = self.decoded_tile_cache.lock().unwrap();
+                        let mut cache = self.decoded_tile_cache.lock();
                         cache.insert(coord, decoded.clone());
                     }
                     
                     decoded
                 }
-                Err(_) => {
-                    // Tile not in cache, show placeholder
+                None => {
+                    // Tile not available, show placeholder
                     self.draw_placeholder(image, screen_x, screen_y, screen_width, screen_height, coord);
                     return;
                 }
@@ -180,20 +210,19 @@ impl ViewportRenderer {
         
         // Draw coordinate text if there's enough space
         if width >= 60 && height >= 30 {
-            use imageproc::drawing::draw_text_mut;
-            use rusttype::{Font, Scale};
+            use ab_glyph::{FontRef, PxScale};
             
-            // Use DejaVu Sans Mono font (embedded)
+            // Use ChakraPetchMono-Medium font (embedded)
             let font_data: &[u8] = include_bytes!("../assets/ChakraPetchMono-Medium.otf");
-            if let Some(font) = Font::try_from_bytes(font_data) {
-                let scale = Scale::uniform(14.0);
+            if let Ok(font) = FontRef::try_from_slice(font_data) {
+                let scale = PxScale::from(14.0);
                 let text = format!("L{}:({},{})", coord.level, coord.x, coord.y);
                 
                 // Position text near top-left of placeholder
                 let text_x = (x + 8).min(image.width().saturating_sub(1));
                 let text_y = (y + 8).min(image.height().saturating_sub(1));
                 
-                draw_text_mut(
+                imageproc::drawing::draw_text_mut(
                     image,
                     image::Rgba([50, 50, 50, 255]), // Dark gray text
                     text_x as i32,

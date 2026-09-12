@@ -43,7 +43,7 @@ impl ViewportManager {
     /// 4. Updates task priorities in the queue
     pub fn update_viewport(
         &mut self,
-        level: u32,
+        level: i32,
         center_x: f64,
         center_y: f64,
         width_pixels: u32,
@@ -97,7 +97,7 @@ impl ViewportManager {
             self.task_queue.enqueue(crate::types::TileTask::new(
                 *tile,
                 Priority::High,
-                tile.level == 0,
+                tile.level <= 0,
             ));
             enqueued_visible += 1;
         }
@@ -108,14 +108,14 @@ impl ViewportManager {
                 self.task_queue.enqueue(crate::types::TileTask::new(
                     *tile,
                     Priority::Normal,
-                    tile.level == 0,
+                    tile.level <= 0,
                 ));
                 enqueued_adjacent += 1;
             }
         }
         
         // Enqueue parent level tiles (level + 1) with normal priority for smooth zoom-out
-        if self.viewport.level < 10 { // Reasonable max level
+        if self.viewport.level >= 0 && self.viewport.level < 10 { // Reasonable max level
             let parent_level = self.viewport.level + 1;
             let parent_tiles = self.calculate_parent_level_tiles(parent_level);
             
@@ -243,7 +243,7 @@ impl ViewportManager {
     /// Calculate tiles at the parent level (level + 1) that cover the current viewport
     ///
     /// These tiles provide a lower-resolution view for smooth zoom-out transitions
-    fn calculate_parent_level_tiles(&self, parent_level: u32) -> Vec<TileCoord> {
+    fn calculate_parent_level_tiles(&self, parent_level: i32) -> Vec<TileCoord> {
         let mut parent_tiles = Vec::new();
         
         // Calculate viewport bounds in pixel coordinates at current level
@@ -287,17 +287,21 @@ impl ViewportManager {
     /// Calculate the maximum number of tiles at a given level
     ///
     /// Returns (tiles_wide, tiles_tall)
-    fn calculate_max_tiles_at_level(&self, level: u32) -> (u32, u32) {
+    fn calculate_max_tiles_at_level(&self, level: i32) -> (u32, u32) {
         // Calculate total pixels at level 0 (highest resolution)
         // Each byte is 8 pixels wide, pages are arranged vertically
         let pixels_wide_l0 = (self.metadata.page_length as u64 * 8) * self.metadata.grid_width as u64;
         // Each page is 1 pixel tall
         let pixels_tall_l0 = self.metadata.block_size as u64 * self.metadata.grid_height as u64;
         
-        // Scale by level (each level is half the resolution)
-        let scale_factor = 2u64.pow(level);
-        let pixels_wide = pixels_wide_l0 / scale_factor;
-        let pixels_tall = pixels_tall_l0 / scale_factor;
+        // Scale by level (positive level = downscaled, negative level = upscaled)
+        let (pixels_wide, pixels_tall) = if level >= 0 {
+            let scale_factor = 2u64.pow(level as u32);
+            (pixels_wide_l0 / scale_factor, pixels_tall_l0 / scale_factor)
+        } else {
+            let scale_factor = 2u64.pow((-level) as u32);
+            (pixels_wide_l0 * scale_factor, pixels_tall_l0 * scale_factor)
+        };
         
         // Convert to tiles
         let tiles_wide = ((pixels_wide + TILE_SIZE as u64 - 1) / TILE_SIZE as u64) as u32;
@@ -470,7 +474,7 @@ mod property_tests {
     #[ignore]
     fn prop_viewport_tile_identification() {
         proptest!(|(
-            level in 0u32..5,
+            level in 0i32..5,
             center_x in 0.0f64..10000.0,
             center_y in 0.0f64..10000.0,
             width_pixels in 512u32..2048,
@@ -562,7 +566,7 @@ mod property_tests {
     #[ignore]
     fn prop_adjacent_tiles_non_overlapping() {
         proptest!(|(
-            level in 0u32..5,
+            level in 0i32..5,
             center_x in 512.0f64..5000.0,
             center_y in 512.0f64..5000.0,
             width_pixels in 512u32..1920,
@@ -611,7 +615,7 @@ mod property_tests {
     #[ignore]
     fn prop_priority_updates() {
         proptest!(|(
-            level in 0u32..3,
+            level in 0i32..3,
             center_x in 512.0f64..2048.0,
             center_y in 512.0f64..2048.0,
         )| {
