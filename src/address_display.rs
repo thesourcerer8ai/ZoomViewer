@@ -79,6 +79,11 @@ impl AddressDisplay {
         let page_length = metadata.page_length as u64;
         let block_size = metadata.block_size as u64;
         let grid_height = metadata.grid_height as u64;
+
+        if page_length == 0 || block_size == 0 || grid_height == 0 {
+            self.address = None;
+            return;
+        }
         
         let block_width_pixels = page_length * 8; // 8 pixels per byte
         let block_height_pixels = block_size; // Each page is 1 pixel tall
@@ -214,6 +219,16 @@ mod tests {
     #[test]
     fn test_address_display_creation() {
         let display = AddressDisplay::new();
+        assert!(!display.is_mouse_in_bounds());
+        assert_eq!(display.get_address(), "N/A");
+    }
+
+    #[test]
+    fn test_update_mouse_position_empty_metadata() {
+        let mut display = AddressDisplay::new();
+        let metadata = FileMetadata::default();
+        let viewport = create_test_viewport();
+        display.update_mouse_position(100, 100, &viewport, &metadata);
         assert!(!display.is_mouse_in_bounds());
         assert_eq!(display.get_address(), "N/A");
     }

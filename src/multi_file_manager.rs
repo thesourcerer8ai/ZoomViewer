@@ -4,6 +4,7 @@
 //! Each dump file has its own cache directory, worker pool, and viewport state.
 
 use crate::cache_manager::CacheManager;
+use crate::data_provider::DumpDataProvider;
 use crate::file_loader::FileLoader;
 use crate::task_queue::TaskQueue;
 use crate::types::{FileMetadata, Viewport};
@@ -33,8 +34,8 @@ pub struct DumpFileState {
     pub cache: Arc<CacheManager>,
     /// Task queue for this dump
     pub task_queue: Arc<TaskQueue>,
-    /// File loader for this dump
-    pub file_loader: Arc<Mutex<FileLoader>>,
+    /// Data provider for this dump (FileLoader wrapped as DumpDataProvider)
+    pub file_loader: Arc<Mutex<dyn DumpDataProvider>>,
     /// Worker pool for this dump
     pub worker_pool: Option<WorkerPool>,
     /// Viewport state for this dump
@@ -91,12 +92,13 @@ impl MultiFileManager {
         // Create per-file task queue
         let task_queue = Arc::new(TaskQueue::new());
 
-        // Create per-file file loader
-        let file_loader = Arc::new(Mutex::new(FileLoader::new(
+        // Create per-file file loader (wrapped as dyn DumpDataProvider)
+        let raw_loader = FileLoader::new(
             &metadata.path,
             metadata.page_length,
             metadata.block_size,
-        )?));
+        )?;
+        let file_loader: Arc<Mutex<dyn DumpDataProvider>> = Arc::new(Mutex::new(raw_loader));
 
         // Create initial viewport at upper left corner
         let viewport = Viewport::new(0, 0.0, 0.0, 1024, 768);

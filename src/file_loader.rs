@@ -151,7 +151,7 @@ impl FileLoader {
     ///
     /// # Returns
     /// Vector of merged fragments with gaps filled
-    fn merge_contiguous_fragments(fragments: &[Fragment]) -> Vec<Fragment> {
+    pub fn merge_contiguous_fragments(fragments: &[Fragment]) -> Vec<Fragment> {
         if fragments.is_empty() {
             return Vec::new();
         }

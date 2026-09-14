@@ -4,7 +4,7 @@
 //! Validates: Requirements 6.1, 6.2, 6.3
 
 use crate::types::{FileMetadata, TileCoord, Fragment};
-use crate::file_loader::FileLoader;
+use crate::data_provider::DumpDataProvider;
 use crate::bit_renderer::PixelBuffer;
 use crate::error::Result;
 
@@ -117,7 +117,7 @@ impl TileGenerator {
     pub fn generate_double_tile_buffer(
         coord: TileCoord,
         metadata: &FileMetadata,
-        file_loader: &mut FileLoader,
+        file_loader: &mut dyn DumpDataProvider,
     ) -> Result<PixelBuffer> {
         if coord.level != 1 {
             return Err(crate::error::Error::InvalidCoordinates(
@@ -153,7 +153,7 @@ impl TileGenerator {
     pub fn generate_zoomed_tile(
         coord: TileCoord,
         metadata: &FileMetadata,
-        file_loader: &mut FileLoader,
+        file_loader: &mut dyn DumpDataProvider,
     ) -> Result<Vec<u8>> {
         if coord.level >= 0 {
             return Err(crate::error::Error::InvalidCoordinates(
@@ -218,7 +218,7 @@ impl TileGenerator {
     pub fn generate_tile(
         coord: TileCoord,
         metadata: &FileMetadata,
-        file_loader: &mut FileLoader,
+        file_loader: &mut dyn DumpDataProvider,
     ) -> Result<Vec<u8>> {
         let start_time = std::time::Instant::now();
         
@@ -524,6 +524,7 @@ impl TileGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FileLoader;
 
     #[test]
     fn test_calculate_fragments_tile_0_0() {

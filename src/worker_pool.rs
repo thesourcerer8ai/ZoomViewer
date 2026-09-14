@@ -7,7 +7,7 @@
 //! **Validates: Requirements 10.1, 10.2, 10.3, 10.4, 10.5, 10.6**
 
 use crate::cache_manager::CacheManager;
-use crate::file_loader::FileLoader;
+use crate::data_provider::DumpDataProvider;
 use crate::pyramid_tile_generator::PyramidTileGenerator;
 use crate::task_queue::TaskQueue;
 use crate::tile_generator::TileGenerator;
@@ -50,7 +50,7 @@ impl WorkerPool {
     pub fn new(
         _task_queue: TaskQueue,
         _cache: CacheManager,
-        _file_loader: Arc<Mutex<FileLoader>>,
+        _file_loader: Arc<Mutex<dyn DumpDataProvider>>,
         _metadata: FileMetadata,
     ) -> Self {
         // Get number of available CPU cores, minimum 1
@@ -86,7 +86,7 @@ impl WorkerPool {
         &mut self,
         task_queue: TaskQueue,
         cache: CacheManager,
-        file_loader: Arc<Mutex<FileLoader>>,
+        file_loader: Arc<Mutex<dyn DumpDataProvider>>,
         metadata: FileMetadata,
     ) {
         let tile_tx = self.tile_complete_tx.clone();
@@ -161,7 +161,7 @@ impl WorkerPool {
         worker_id: usize,
         task_queue: TaskQueue,
         cache: CacheManager,
-        file_loader: Arc<Mutex<FileLoader>>,
+        file_loader: Arc<Mutex<dyn DumpDataProvider>>,
         metadata: FileMetadata,
         shutdown: Arc<AtomicBool>,
         tile_complete_tx: Option<Sender<TileCoord>>,
@@ -210,7 +210,7 @@ impl WorkerPool {
                     } else if task.coord.level == 0 {
                         // High-resolution tile from dump
                         let mut loader = file_loader.lock();
-                        TileGenerator::generate_tile(task.coord, &metadata, &mut loader)
+                        TileGenerator::generate_tile(task.coord, &metadata, &mut *loader)
                     } else {
                         // Pyramid tile from lower-level tiles or direct dump for level 1
                         let mut loader = file_loader.lock();
@@ -219,7 +219,7 @@ impl WorkerPool {
                             &metadata,
                             &task_queue,
                             &cache,
-                            &mut loader,
+                            &mut *loader,
                             task.priority,
                         )
                     };
@@ -413,12 +413,14 @@ impl WorkerPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data_provider::DumpDataProvider;
+    use crate::FileLoader;
     use crate::types::{Priority, TileCoord, TileTask};
     use tempfile::{NamedTempFile, TempDir};
     use std::io::{Write, Seek};
 
-    /// Helper function to create a test file and file loader
-    fn create_test_file_loader() -> (NamedTempFile, FileLoader) {
+    /// Helper function to create a test file loader wrapped as DumpDataProvider
+    fn create_test_file_loader() -> (NamedTempFile, Arc<Mutex<dyn DumpDataProvider>>, FileMetadata) {
         let mut temp_file = NamedTempFile::new().unwrap();
         // Write some test data
         temp_file.write_all(&[0xAA; 10240]).unwrap();
@@ -428,7 +430,9 @@ mod tests {
         temp_file.flush().unwrap();
 
         let file_loader = FileLoader::new(temp_file.path(), 512, 64).unwrap();
-        (temp_file, file_loader)
+        let metadata = file_loader.get_metadata().clone();
+        let provider: Arc<Mutex<dyn DumpDataProvider>> = Arc::new(Mutex::new(file_loader));
+        (temp_file, provider, metadata)
     }
 
     #[test]
@@ -436,9 +440,7 @@ mod tests {
         let task_queue = TaskQueue::new();
         let temp_dir = TempDir::new().unwrap();
         let cache = CacheManager::new(temp_dir.path(), "test.bin".to_string()).unwrap();
-        let (_temp_file, file_loader) = create_test_file_loader();
-        let metadata = file_loader.get_metadata().clone();
-        let file_loader_arc = Arc::new(Mutex::new(file_loader));
+        let (_temp_file, file_loader_arc, metadata) = create_test_file_loader();
 
         let pool = WorkerPool::new(
             task_queue,
@@ -457,9 +459,7 @@ mod tests {
         let task_queue = TaskQueue::new();
         let temp_dir = TempDir::new().unwrap();
         let cache = CacheManager::new(temp_dir.path(), "test.bin".to_string()).unwrap();
-        let (_temp_file, file_loader) = create_test_file_loader();
-        let metadata = file_loader.get_metadata().clone();
-        let file_loader_arc = Arc::new(Mutex::new(file_loader));
+        let (_temp_file, file_loader_arc, metadata) = create_test_file_loader();
 
         let mut pool = WorkerPool::new(
             task_queue.clone(),
@@ -482,9 +482,7 @@ mod tests {
         let task_queue = TaskQueue::new();
         let temp_dir = TempDir::new().unwrap();
         let cache = CacheManager::new(temp_dir.path(), "test.bin".to_string()).unwrap();
-        let (_temp_file, file_loader) = create_test_file_loader();
-        let metadata = file_loader.get_metadata().clone();
-        let file_loader_arc = Arc::new(Mutex::new(file_loader));
+        let (_temp_file, file_loader_arc, metadata) = create_test_file_loader();
 
         // Enqueue a task
         let coord = TileCoord::new(0, 0, 0);
@@ -519,9 +517,7 @@ mod tests {
         let task_queue = TaskQueue::new();
         let temp_dir = TempDir::new().unwrap();
         let cache = CacheManager::new(temp_dir.path(), "test.bin".to_string()).unwrap();
-        let (_temp_file, file_loader) = create_test_file_loader();
-        let metadata = file_loader.get_metadata().clone();
-        let file_loader_arc = Arc::new(Mutex::new(file_loader));
+        let (_temp_file, file_loader_arc, metadata) = create_test_file_loader();
 
         // Enqueue multiple tasks
         let coords = vec![
@@ -565,9 +561,7 @@ mod tests {
         let task_queue = TaskQueue::new();
         let temp_dir = TempDir::new().unwrap();
         let cache = CacheManager::new(temp_dir.path(), "test.bin".to_string()).unwrap();
-        let (_temp_file, file_loader) = create_test_file_loader();
-        let metadata = file_loader.get_metadata().clone();
-        let file_loader_arc = Arc::new(Mutex::new(file_loader));
+        let (_temp_file, file_loader_arc, metadata) = create_test_file_loader();
 
         // Enqueue tasks with different priorities
         let low_coord = TileCoord::new(0, 0, 0);
@@ -608,9 +602,7 @@ mod tests {
         let task_queue = TaskQueue::new();
         let temp_dir = TempDir::new().unwrap();
         let cache = CacheManager::new(temp_dir.path(), "test.bin".to_string()).unwrap();
-        let (_temp_file, file_loader) = create_test_file_loader();
-        let metadata = file_loader.get_metadata().clone();
-        let file_loader_arc = Arc::new(Mutex::new(file_loader));
+        let (_temp_file, file_loader_arc, metadata) = create_test_file_loader();
 
         // Don't enqueue any tasks
         let mut pool = WorkerPool::new(
@@ -639,9 +631,7 @@ mod tests {
         let task_queue = TaskQueue::new();
         let temp_dir = TempDir::new().unwrap();
         let cache = CacheManager::new(temp_dir.path(), "test.bin".to_string()).unwrap();
-        let (_temp_file, file_loader) = create_test_file_loader();
-        let metadata = file_loader.get_metadata().clone();
-        let file_loader_arc = Arc::new(Mutex::new(file_loader));
+        let (_temp_file, file_loader_arc, metadata) = create_test_file_loader();
 
         // Pre-cache a tile
         let coord = TileCoord::new(0, 0, 0);

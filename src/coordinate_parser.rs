@@ -62,6 +62,10 @@ impl CoordinateParser {
         let page_length = metadata.page_length as u64;
         let grid_width = metadata.grid_width as u64;
         let block_size = metadata.block_size as u64;
+
+        if page_length == 0 || block_size == 0 || grid_width == 0 {
+            return 0;
+        }
         
         let bytes_per_block_width = page_length * 8;
         let bytes_per_block_height = page_length * block_size;
@@ -94,6 +98,10 @@ impl CoordinateParser {
         let page_length = metadata.page_length as u64;
         let grid_width = metadata.grid_width as u64;
         let block_size = metadata.block_size as u64;
+
+        if page_length == 0 || block_size == 0 || grid_width == 0 {
+            return TileCoord::new(level, 0, 0);
+        }
         
         // Step 1: Calculate block coordinates
         let block_stride = block_size * page_length * grid_width;
@@ -566,6 +574,14 @@ mod tests {
         // Higher levels should have larger offsets for same (x, y)
         assert!(offset_l1 > offset_l0);
         assert!(offset_l2 > offset_l1);
+    }
+
+    #[test]
+    fn test_empty_metadata_safe() {
+        let meta = FileMetadata::default();
+        let coord = TileCoord::new(0, 0, 0);
+        assert_eq!(CoordinateParser::tile_to_byte_offset(coord, &meta), 0);
+        assert_eq!(CoordinateParser::byte_offset_to_tile(0, 0, &meta), TileCoord::new(0, 0, 0));
     }
 }
 

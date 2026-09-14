@@ -58,4 +58,14 @@ pub use app_window::AppWindow;
 pub use multi_file_manager::{MultiFileManager, DumpId, DumpFileState};
 pub use window_manager::{WindowManager, WindowId, WindowState};
 pub mod workflow;
+pub mod data_provider;
+pub mod search;
+pub mod search_tab;
+pub mod hex_tab;
+
+pub use data_provider::{DumpDataProvider, FileDataProvider, SearchFilteredDataProvider, XorDataProvider};
+pub use search::{SearchResult, SearchOptions, SearchMode, search_provider, search_provider_with_sender, export_results_to_file};
+pub use search_tab::SearchTabState;
+pub use hex_tab::{HexTabState, HexDiffMode};
+
 pub use workflow::{WorkflowEditorState, WorkflowNode, WorkflowNodeKind};

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// File metadata for a NAND dump
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FileMetadata {
     /// Path to the dump file
     pub path: String,
@@ -251,5 +251,18 @@ mod tests {
         assert_eq!(vp.center_y, 512.0);
         assert_eq!(vp.width_pixels, 1024);
         assert_eq!(vp.height_pixels, 768);
+    }
+
+    #[test]
+    fn test_file_metadata_default() {
+        let meta = FileMetadata::default();
+        assert_eq!(meta.path, "");
+        assert_eq!(meta.size, 0);
+        assert_eq!(meta.page_length, 0);
+        assert_eq!(meta.block_size, 0);
+        assert_eq!(meta.total_pages, 0);
+        assert_eq!(meta.total_blocks, 0);
+        assert_eq!(meta.grid_width, 0);
+        assert_eq!(meta.grid_height, 0);
     }
 }

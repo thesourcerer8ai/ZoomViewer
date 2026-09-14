@@ -1,15 +1,14 @@
-//! Viewport renderer - composites tiles into the viewport for display
-
-use crate::{CacheManager, TileCoord, Viewport, FileLoader, FileMetadata, TileGenerator};
+use crate::data_provider::DumpDataProvider;
+use crate::{CacheManager, TileCoord, Viewport, FileMetadata, TileGenerator};
 use image::RgbaImage;
 use std::sync::Arc;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 
 /// Renders tiles from cache into a viewport image
 pub struct ViewportRenderer {
     /// Cache manager for loading tiles
-    cache: Arc<CacheManager>,
+    cache: Arc<RwLock<Arc<CacheManager>>>,
     /// Tile width in pixels
     tile_width: u32,
     /// Tile height in pixels
@@ -17,21 +16,21 @@ pub struct ViewportRenderer {
     /// Cache of decoded tile images (TileCoord -> RgbaImage)
     decoded_tile_cache: Arc<Mutex<HashMap<TileCoord, Arc<RgbaImage>>>>,
     /// Optional file loader for direct level-0 tile rendering
-    file_loader: Option<Arc<Mutex<FileLoader>>>,
+    file_loader: Arc<RwLock<Option<Arc<Mutex<dyn DumpDataProvider>>>>>,
     /// Optional file metadata for direct level-0 tile rendering
-    metadata: Option<FileMetadata>,
+    metadata: Arc<RwLock<Option<FileMetadata>>>,
 }
 
 impl ViewportRenderer {
     /// Create a new viewport renderer
     pub fn new(cache: Arc<CacheManager>, tile_width: u32, tile_height: u32) -> Self {
         ViewportRenderer {
-            cache,
+            cache: Arc::new(RwLock::new(cache)),
             tile_width,
             tile_height,
             decoded_tile_cache: Arc::new(Mutex::new(HashMap::new())),
-            file_loader: None,
-            metadata: None,
+            file_loader: Arc::new(RwLock::new(None)),
+            metadata: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -40,17 +39,35 @@ impl ViewportRenderer {
         cache: Arc<CacheManager>,
         tile_width: u32,
         tile_height: u32,
-        file_loader: Arc<Mutex<FileLoader>>,
+        file_loader: Arc<Mutex<dyn DumpDataProvider>>,
         metadata: FileMetadata,
     ) -> Self {
         ViewportRenderer {
-            cache,
+            cache: Arc::new(RwLock::new(cache)),
             tile_width,
             tile_height,
             decoded_tile_cache: Arc::new(Mutex::new(HashMap::new())),
-            file_loader: Some(file_loader),
-            metadata: Some(metadata),
+            file_loader: Arc::new(RwLock::new(Some(file_loader))),
+            metadata: Arc::new(RwLock::new(Some(metadata))),
         }
+    }
+
+    /// Dynamically update the data provider, cache, and metadata
+    pub fn update_provider(
+        &self,
+        provider: Arc<Mutex<dyn DumpDataProvider>>,
+        cache: Arc<CacheManager>,
+        metadata: FileMetadata,
+    ) {
+        *self.cache.write() = cache;
+        *self.file_loader.write() = Some(provider);
+        *self.metadata.write() = Some(metadata);
+        self.decoded_tile_cache.lock().clear();
+    }
+
+    /// Clear in-memory decoded tile cache
+    pub fn clear_cache(&self) {
+        self.decoded_tile_cache.lock().clear();
     }
 
     /// Render viewport to an RGBA image
@@ -126,18 +143,20 @@ impl ViewportRenderer {
         } else {
             // Load and decode tile (or generate Level <= 0 on-the-fly)
             let tile_data_opt = if coord.level <= 0 {
-                if let (Some(loader_arc), Some(meta)) = (&self.file_loader, &self.metadata) {
+                let fl_guard = self.file_loader.read();
+                let meta_guard = self.metadata.read();
+                if let (Some(loader_arc), Some(meta)) = (fl_guard.as_ref(), meta_guard.as_ref()) {
                     let mut loader = loader_arc.lock();
                     if coord.level == 0 {
-                        TileGenerator::generate_tile(coord, meta, &mut loader).ok()
+                        TileGenerator::generate_tile(coord, meta, &mut *loader).ok()
                     } else {
-                        TileGenerator::generate_zoomed_tile(coord, meta, &mut loader).ok()
+                        TileGenerator::generate_zoomed_tile(coord, meta, &mut *loader).ok()
                     }
                 } else {
                     None
                 }
             } else {
-                self.cache.load_tile(&coord).ok()
+                self.cache.read().load_tile(&coord).ok()
             };
 
             match tile_data_opt {

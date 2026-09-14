@@ -305,7 +305,7 @@ impl PyramidTileGenerator {
         metadata: &FileMetadata,
         task_queue: &TaskQueue,
         cache: &CacheManager,
-        file_loader: &mut crate::file_loader::FileLoader,
+        file_loader: &mut dyn crate::data_provider::DumpDataProvider,
         priority: Priority,
     ) -> Result<Vec<u8>> {
         // Ensure this is not a level 0 or negative level tile

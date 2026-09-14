@@ -2,8 +2,9 @@
 
 use crate::{
     workflow::WorkflowEditorState,
-    AddressDisplay, CacheManager, FileMetadata, PanController, TaskQueue, TileCoord, Viewport,
-    ViewportManager, ViewportRenderer, ZoomController,
+    AddressDisplay, CacheManager, DumpDataProvider, FileMetadata, HexTabState, PanController,
+    SearchTabState, TaskQueue, TileCoord, Viewport, ViewportManager, ViewportRenderer,
+    ZoomController,
 };
 use fltk::{
     app::MouseWheel,
@@ -33,6 +34,10 @@ pub struct AppWindow {
     window: Window,
     /// Workflow state
     workflow_state: Arc<Mutex<WorkflowEditorState>>,
+    /// Search tab state
+    pub search_tab_state: Arc<Mutex<SearchTabState>>,
+    /// Hex tab state
+    pub hex_tab_state: Arc<Mutex<HexTabState>>,
     /// Frame to display the viewport image
     viewport_frame: Arc<Mutex<Frame>>,
     /// Viewport manager for tile identification
@@ -75,7 +80,8 @@ impl AppWindow {
         task_queue: Arc<TaskQueue>,
         cache: Arc<CacheManager>,
         tile_rx: Option<Receiver<TileCoord>>,
-        file_loader: Option<Arc<parking_lot::Mutex<crate::FileLoader>>>,
+        file_loader: Option<Arc<parking_lot::Mutex<dyn DumpDataProvider>>>,
+        initial_workflow: Option<WorkflowEditorState>,
     ) -> Self {
         // Extract filename from path for window title
         let filename = std::path::Path::new(&metadata.path)
@@ -91,7 +97,7 @@ impl AppWindow {
         let tabs = Tabs::default().with_size(1024, 768).with_pos(0, 0);
 
         // --- TAB 1: NAND Dump Viewer ---
-        let tab_viewer = Group::default()
+        let mut tab_viewer = Group::default()
             .with_size(1024, 738)
             .with_pos(0, 30)
             .with_label("NAND Viewer\t");
@@ -115,8 +121,6 @@ impl AppWindow {
             .with_pos(0, 30)
             .with_label("Workflow Editor\t");
 
-        let _workflow_state = Arc::new(Mutex::new(WorkflowEditorState::new(None)));
-
         let mut gl_win = GlWindow::default()
             .with_size(1024, 738)
             .with_pos(0, 30);
@@ -125,13 +129,50 @@ impl AppWindow {
 
         tab_workflow.end();
 
+        // --- TAB 3: Search (embedded egui GL Canvas) ---
+        let tab_search = Group::default()
+            .with_size(1024, 738)
+            .with_pos(0, 30)
+            .with_label("Search\t");
+
+        let mut gl_search = GlWindow::default()
+            .with_size(1024, 738)
+            .with_pos(0, 30);
+        gl_search.set_mode(fltk::enums::Mode::Opengl3);
+        gl_search.end();
+
+        tab_search.end();
+
+        // --- TAB 4: Hex Viewer (embedded egui GL Canvas) ---
+        let tab_hex = Group::default()
+            .with_size(1024, 738)
+            .with_pos(0, 30)
+            .with_label("Hex\t");
+
+        let mut gl_hex = GlWindow::default()
+            .with_size(1024, 738)
+            .with_pos(0, 30);
+        gl_hex.set_mode(fltk::enums::Mode::Opengl3);
+        gl_hex.end();
+
+        tab_hex.end();
+
         tabs.end();
+
+        if file_loader.is_none() {
+            tab_viewer.deactivate();
+            let mut tabs_mut = tabs.clone();
+            let _ = tabs_mut.set_value(&tab_workflow);
+        }
+
         window.resizable(&tabs);
         window.end();
         window.show();
 
         // Setup fltk-egui for workflow tab with lazy initialization on first draw
-        let workflow_state = Arc::new(Mutex::new(WorkflowEditorState::new(Some(&metadata.path))));
+        let workflow_state = Arc::new(Mutex::new(
+            initial_workflow.unwrap_or_else(|| WorkflowEditorState::new(Some(&metadata.path)))
+        ));
         let egui_state: Arc<Mutex<Option<(Painter, EguiState)>>> = Arc::new(Mutex::new(None));
         let egui_ctx = egui::Context::default();
 
@@ -170,28 +211,290 @@ impl AppWindow {
             }
         });
 
+        // Directly attach event handler to gl_win and set focus to ensure it receives mouse events
         let egui_state_handle = egui_state.clone();
-        let mut gl_win_handle = gl_win.clone();
-        gl_win_handle.handle(move |w, ev| {
+        gl_win.handle(move |w, ev| {
+            // Forward FLTK events to egui state
             if let Ok(mut state_guard) = egui_state_handle.try_lock() {
                 if let Some((_, state)) = state_guard.as_mut() {
                     state.fuse_input(w, ev);
                 }
             }
+            // Request redraw for relevant events
             match ev {
-                Event::Push | Event::Drag | Event::Move | Event::Released | Event::KeyDown | Event::KeyUp | Event::MouseWheel | Event::Resize => {
+                Event::Push => {
+                    let _ = w.take_focus();
+                    w.redraw();
+                    true
+                }
+                Event::Focus | Event::Unfocus => {
+                    // Accept/release keyboard focus so FLTK delivers KeyDown/KeyUp events
+                    w.redraw();
+                    true
+                }
+                Event::Drag | Event::Move | Event::Released | Event::KeyDown | Event::KeyUp | Event::MouseWheel | Event::Resize => {
                     w.redraw();
                     true
                 }
                 _ => false,
             }
         });
+        // Ensure the GL window can gain focus to receive keyboard and mouse input
+        gl_win.set_visible_focus();
+
+        // Setup fltk-egui for search tab
+        let search_tab_state = Arc::new(Mutex::new(SearchTabState::new()));
+        let search_egui_state: Arc<Mutex<Option<(Painter, EguiState)>>> = Arc::new(Mutex::new(None));
+        let search_egui_ctx = egui::Context::default();
+
+        let search_tab_draw = search_tab_state.clone();
+        let search_egui_state_draw = search_egui_state.clone();
+        let search_egui_ctx_draw = search_egui_ctx.clone();
+        let workflow_for_search = workflow_state.clone();
+
+        gl_search.draw(move |w| {
+            if !w.shown() {
+                return;
+            }
+            w.make_current();
+            let mut state_guard = search_egui_state_draw.lock().unwrap();
+            if state_guard.is_none() {
+                *state_guard = Some(fltk_egui::init(w));
+            }
+            if let Some((painter, state)) = state_guard.as_mut() {
+                let raw_input = state.take_input();
+                let ppp = state.pixels_per_point();
+
+                let (target_name, provider_opt) = {
+                    let wf = workflow_for_search.lock().unwrap();
+                    match wf.build_search_provider() {
+                        Ok((_id, name, prov)) => (name, Some(prov)),
+                        Err(e) => (format!("None ({})", e), None),
+                    }
+                };
+
+                let full_output = search_egui_ctx_draw.run(raw_input, |ctx| {
+                    let mut st = search_tab_draw.lock().unwrap();
+                    st.show_ui(ctx, &target_name, provider_opt);
+                });
+
+                state.fuse_output(w, full_output.platform_output);
+                let clipped_primitives = search_egui_ctx_draw.tessellate(full_output.shapes, full_output.pixels_per_point);
+
+                painter.paint_and_update_textures(
+                    [w.width() as u32, w.height() as u32],
+                    ppp,
+                    &clipped_primitives,
+                    &full_output.textures_delta,
+                );
+                w.swap_buffers();
+            }
+        });
+
+        let search_egui_handle = search_egui_state.clone();
+        let mut gl_search_handle = gl_search.clone();
+        gl_search_handle.handle(move |w, ev| {
+            if let Ok(mut state_guard) = search_egui_handle.try_lock() {
+                if let Some((_, state)) = state_guard.as_mut() {
+                    state.fuse_input(w, ev);
+                }
+            }
+            match ev {
+                Event::Push => {
+                    // Request keyboard focus when user clicks inside the GL window
+                    let _ = w.take_focus();
+                    w.redraw();
+                    true
+                }
+                Event::Focus | Event::Unfocus => {
+                    // Accept/release keyboard focus so FLTK delivers KeyDown/KeyUp events
+                    w.redraw();
+                    true
+                }
+                Event::Drag | Event::Move | Event::Released | Event::KeyDown | Event::KeyUp | Event::MouseWheel | Event::Resize => {
+                    w.redraw();
+                    true
+                }
+                _ => false,
+            }
+        });
+        gl_search.set_visible_focus();
+
+        // Setup fltk-egui for hex tab
+        let hex_tab_state = Arc::new(Mutex::new(HexTabState::new()));
+        let hex_egui_state: Arc<Mutex<Option<(Painter, EguiState)>>> = Arc::new(Mutex::new(None));
+        let hex_egui_ctx = egui::Context::default();
+
+        let hex_tab_draw = hex_tab_state.clone();
+        let hex_egui_state_draw = hex_egui_state.clone();
+        let hex_egui_ctx_draw = hex_egui_ctx.clone();
+        let workflow_for_hex = workflow_state.clone();
+        let search_tab_for_hex = search_tab_state.clone();
+
+        gl_hex.draw(move |w| {
+            if !w.shown() {
+                return;
+            }
+            w.make_current();
+            let mut state_guard = hex_egui_state_draw.lock().unwrap();
+            if state_guard.is_none() {
+                *state_guard = Some(fltk_egui::init(w));
+            }
+            if let Some((painter, state)) = state_guard.as_mut() {
+                let raw_input = state.take_input();
+                let ppp = state.pixels_per_point();
+
+                let (main_prov_opt, raw_prov_opt) = {
+                    let wf = workflow_for_hex.lock().unwrap();
+                    match wf.build_hex_providers() {
+                        Ok((main_p, raw_p)) => (Some(main_p), raw_p),
+                        Err(_) => (None, None),
+                    }
+                };
+
+                let (search_results_clone, pattern_len) = {
+                    if let Ok(st) = search_tab_for_hex.try_lock() {
+                        let pat_bytes = crate::search::parse_pattern(&st.options).unwrap_or_default();
+                        (st.results.clone(), pat_bytes.len())
+                    } else {
+                        (Vec::new(), 0)
+                    }
+                };
+
+                let full_output = hex_egui_ctx_draw.run(raw_input, |ctx| {
+                    let mut ht = hex_tab_draw.lock().unwrap();
+                    ht.show_ui(
+                        ctx,
+                        main_prov_opt.as_ref(),
+                        raw_prov_opt.as_ref(),
+                        &search_results_clone,
+                        pattern_len,
+                    );
+                });
+
+                state.fuse_output(w, full_output.platform_output);
+                let clipped_primitives = hex_egui_ctx_draw.tessellate(full_output.shapes, full_output.pixels_per_point);
+
+                painter.paint_and_update_textures(
+                    [w.width() as u32, w.height() as u32],
+                    ppp,
+                    &clipped_primitives,
+                    &full_output.textures_delta,
+                );
+                w.swap_buffers();
+            }
+        });
+
+        let hex_egui_handle = hex_egui_state.clone();
+        let mut gl_hex_handle = gl_hex.clone();
+        gl_hex_handle.handle(move |w, ev| {
+            if let Ok(mut state_guard) = hex_egui_handle.try_lock() {
+                if let Some((_, state)) = state_guard.as_mut() {
+                    state.fuse_input(w, ev);
+                }
+            }
+            match ev {
+                Event::Push => {
+                    let _ = w.take_focus();
+                    w.redraw();
+                    true
+                }
+                Event::Focus | Event::Unfocus => {
+                    w.redraw();
+                    true
+                }
+                Event::Drag | Event::Move | Event::Released | Event::KeyDown | Event::KeyUp | Event::MouseWheel | Event::Resize => {
+                    w.redraw();
+                    true
+                }
+                _ => false,
+            }
+        });
+        gl_hex.set_visible_focus();
 
         // Create viewport manager
         let viewport_manager = Arc::new(Mutex::new(ViewportManager::new(
             metadata.clone(),
             task_queue.clone(),
         )));
+
+        // Tab switch callback to immediately redraw OpenGL contexts and sync positions
+        let mut tabs_switch = tabs.clone();
+        let tabs_for_cb = tabs_switch.clone();
+        let mut gl_win_switch = gl_win.clone();
+        let mut gl_search_switch = gl_search.clone();
+        let mut gl_hex_switch = gl_hex.clone();
+        let hex_tab_switch = hex_tab_state.clone();
+        let viewport_manager_tab_switch = viewport_manager.clone();
+        let metadata_tab_switch = metadata.clone();
+
+        tabs_switch.set_callback(move |_| {
+            gl_win_switch.redraw();
+            gl_search_switch.redraw();
+            gl_hex_switch.redraw();
+            // Set keyboard focus to the appropriate GL window when its tab becomes active.
+            if let Some(active) = tabs_for_cb.value() {
+                let lbl = active.label();
+                let trimmed = lbl.trim();
+                if trimmed.starts_with("Workflow") {
+                    gl_win_switch.set_visible_focus();
+                } else if trimmed.starts_with("Search") {
+                    gl_search_switch.set_visible_focus();
+                } else if trimmed.starts_with("Hex") {
+                    gl_hex_switch.set_visible_focus();
+                    // Synchronize NAND viewer position to Hex Tab
+                    let pl = metadata_tab_switch.page_length as u64;
+                    let bs = metadata_tab_switch.block_size as u64;
+                    let gh = metadata_tab_switch.grid_height as u64;
+                    if pl > 0 && bs > 0 && gh > 0 {
+                        if let Ok(vm) = viewport_manager_tab_switch.try_lock() {
+                            let vp = vm.get_viewport();
+                            let scale = 2.0_f64.powi(vp.level);
+                            let pixel_x_l0 = (vp.center_x * scale).max(0.0) as u64;
+                            let pixel_y_l0 = (vp.center_y * scale).max(0.0) as u64;
+                            let block_width_pixels = pl * 8;
+                            let block_height_pixels = bs;
+                            let block_x = pixel_x_l0 / block_width_pixels;
+                            let block_y = pixel_y_l0 / block_height_pixels;
+                            let block = block_x * gh + block_y;
+                            let page = pixel_y_l0 % block_height_pixels;
+                            let byte_in_page = (pixel_x_l0 % block_width_pixels) / 8;
+                            let block_stride = pl * bs;
+                            let offset = block * block_stride + page * pl + byte_in_page;
+                            if let Ok(mut ht) = hex_tab_switch.try_lock() {
+                                ht.pending_jump_offset = Some(offset);
+                            }
+                        }
+                    }
+                } else if trimmed.starts_with("NAND") {
+                    // Synchronize Hex Tab position back to NAND viewer
+                    let pl = metadata_tab_switch.page_length as u64;
+                    let bs = metadata_tab_switch.block_size as u64;
+                    let gh = metadata_tab_switch.grid_height as u64;
+                    if pl > 0 && bs > 0 && gh > 0 {
+                        if let Ok(ht) = hex_tab_switch.try_lock() {
+                            let block = if bs > 0 { ht.current_page / bs } else { 0 };
+                            let page = if bs > 0 { ht.current_page % bs } else { 0 };
+                            let byte_in_page = ht.col_offset_in_page;
+
+                            let block_x = block / gh;
+                            let block_y = block % gh;
+                            let pixel_x_l0 = (block_x * (pl * 8) + (byte_in_page * 8)) as f64;
+                            let pixel_y_l0 = (block_y * bs + page) as f64;
+
+                            if let Ok(mut vm) = viewport_manager_tab_switch.try_lock() {
+                                let vp = vm.get_viewport().clone();
+                                let scale = 2.0_f64.powi(vp.level);
+                                let center_x = pixel_x_l0 / scale;
+                                let center_y = pixel_y_l0 / scale;
+                                vm.update_viewport(vp.level, center_x, center_y, vp.width_pixels, vp.height_pixels);
+                                vm.update_task_priorities();
+                            }
+                        }
+                    }
+                }
+            }
+        });
 
         // Create zoom controller
         let zoom_controller = Arc::new(Mutex::new(ZoomController::new(
@@ -243,12 +546,14 @@ impl AppWindow {
         let app_window = AppWindow {
             window,
             workflow_state: workflow_state.clone(),
+            search_tab_state: search_tab_state.clone(),
+            hex_tab_state: hex_tab_state.clone(),
             viewport_frame: viewport_frame_arc.clone(),
             viewport_manager: viewport_manager.clone(),
             zoom_controller: zoom_controller.clone(),
             pan_controller: pan_controller.clone(),
             address_display,
-            metadata,
+            metadata: metadata.clone(),
             task_queue,
             cache: cache.clone(),
             viewport_renderer: viewport_renderer.clone(),
@@ -352,54 +657,7 @@ impl AppWindow {
                         let addr_display = address_display_for_events.lock().unwrap();
                         if let Some((block, page, byte, _bit)) = addr_display.get_address_components() {
                             let metadata = &metadata_for_events;
-                            
-                            // Convert dump file path to absolute path
-                            let dump_path = std::path::Path::new(&metadata.path);
-                            let absolute_path = if dump_path.is_absolute() {
-                                dump_path.to_path_buf()
-                            } else {
-                                std::env::current_dir()
-                                    .unwrap_or_else(|_| std::path::PathBuf::from("."))
-                                    .join(dump_path)
-                            };
-                            let dump_path_str = absolute_path.to_string_lossy();
-                            
-                            // Calculate page start: block * block_size + page_number
-                            let page_start = (block as u32 * metadata.block_size) + (page as u32);
-                            
-                            // Build the URL
-                            let url = format!(
-                                "http://localhost/cgi-bin/drresearch/xorviewer.pl?dump={}&pagesize={}&pagesperblock={}&pagestart={}&start={}",
-                                dump_path_str,
-                                metadata.page_length,
-                                metadata.block_size,
-                                page_start,
-                                byte
-                            );
-                            
-                            log::info!("Opening URL: {}", url);
-                            
-                            // Open URL in browser
-                            #[cfg(target_os = "linux")]
-                            {
-                                let _ = std::process::Command::new("xdg-open")
-                                    .arg(&url)
-                                    .spawn();
-                            }
-                            
-                            #[cfg(target_os = "macos")]
-                            {
-                                let _ = std::process::Command::new("open")
-                                    .arg(&url)
-                                    .spawn();
-                            }
-                            
-                            #[cfg(target_os = "windows")]
-                            {
-                                let _ = std::process::Command::new("cmd")
-                                    .args(&["/C", "start", &url])
-                                    .spawn();
-                            }
+                            let _ = open_xorviewer_in_browser(metadata, block as u64, page as u64, byte as u64);
                         }
                         return true;
                     } else if button == 3 {  // Right button - pan
@@ -535,61 +793,176 @@ impl AppWindow {
         app_window.composite_tiles_into_viewport();
         app_window.draw_viewport_to_frame();
         
-        // Set up tile completion listener if receiver is available
+        // Set up unified timer loop (tile completion, search jump navigation, workflow output sync)
+        let viewport_image_clone = app_window.viewport_image.clone();
+        let viewport_frame_clone = app_window.viewport_frame.clone();
+        let viewport_renderer_clone = app_window.viewport_renderer.clone();
+        let viewport_manager_clone = app_window.viewport_manager.clone();
+        let zoom_controller_clone = app_window.zoom_controller.clone();
+        let search_tab_timer = app_window.search_tab_state.clone();
+        let hex_tab_timer = app_window.hex_tab_state.clone();
+        let workflow_state_timer = app_window.workflow_state.clone();
+        let mut tabs_timer = tabs.clone();
+        let mut tab_viewer_timer = tab_viewer.clone();
+        let mut gl_search_timer = gl_search.clone();
+        let mut gl_hex_timer = gl_hex.clone();
+        let fltk_tile_cache_timer = app_window.fltk_tile_cache.clone();
+        let initial_identity = file_loader.as_ref().map(|fl| fl.lock().cache_identity()).unwrap_or_default();
+        let current_identity_timer = Arc::new(Mutex::new(initial_identity));
+        let metadata_timer = Arc::new(Mutex::new(metadata.clone()));
+
+        // Channel for tile receiver bridge
+        let (s, r) = fltk::app::channel::<TileCoord>();
         if let Some(rx) = tile_rx {
-            let viewport_image_clone = app_window.viewport_image.clone();
-            let viewport_frame_clone = app_window.viewport_frame.clone();
-            let viewport_renderer_clone = app_window.viewport_renderer.clone();
-            let viewport_manager_clone = app_window.viewport_manager.clone();
-            let zoom_controller_clone = app_window.zoom_controller.clone();
-            
-            // Use FLTK's channel mechanism to receive notifications from worker threads
-            let (s, r) = fltk::app::channel::<TileCoord>();
-            
-            // Spawn a thread to bridge between std::sync::mpsc and fltk::app::channel
             std::thread::spawn(move || {
                 while let Ok(coord) = rx.recv() {
                     let _ = s.send(coord);
                 }
             });
-            
-            // Set up FLTK receiver callback using add_timeout
-            fltk::app::add_timeout3(0.1, move |handle| {
-                // Check for tile completion messages
-                if let Some(coord) = r.recv() {
-                    log::debug!("Tile completed notification received: {:?}", coord);
-                    
-                    // Re-render viewport
-                    let viewport = viewport_manager_clone.lock().unwrap();
-                    let vp = viewport.get_viewport().clone();
-                    drop(viewport);
-                    
-                    // Get blend parameters from zoom controller
-                    let zoom = zoom_controller_clone.lock().unwrap();
-                    let blend_level = zoom.get_next_level();
-                    let blend_factor = zoom.get_blend_factor();
-                    drop(zoom);
-                    
-                    let rendered_image = viewport_renderer_clone.render_viewport(&vp, blend_level, blend_factor);
-                    let mut viewport_img = viewport_image_clone.lock().unwrap();
-                    *viewport_img = rendered_image;
-                    
-                    let width = viewport_img.width() as i32;
-                    let height = viewport_img.height() as i32;
-                    let raw_data = viewport_img.as_raw().clone();
-                    drop(viewport_img);
-                    
-                    if let Ok(fltk_img) = fltk::image::RgbImage::new(&raw_data, width, height, ColorDepth::Rgba8) {
-                        let mut frame = viewport_frame_clone.lock().unwrap();
-                        frame.set_image(Some(fltk_img));
-                        frame.redraw();
+        }
+
+        fltk::app::add_timeout3(0.05, move |handle| {
+            let mut need_redraw = false;
+
+            // 1. Check for tile completion messages
+            while let Some(_coord) = r.recv() {
+                need_redraw = true;
+            }
+
+            // 2. Check if Search tab requested a jump to match or has live updates
+            if let Ok(mut st) = search_tab_timer.try_lock() {
+                let had_new = st.poll_results();
+                if st.is_searching || had_new {
+                    gl_search_timer.redraw();
+                }
+                if let Some((block, page, offset)) = st.jump_target.take() {
+                    let _ = tabs_timer.set_value(&tab_viewer_timer);
+                    tabs_timer.redraw();
+                    tab_viewer_timer.redraw();
+
+                    let (pl, bs, gh) = {
+                        let m = metadata_timer.lock().unwrap();
+                        (m.page_length as u64, m.block_size as u64, m.grid_height as u64)
+                    };
+                    if let Ok(mut ht) = hex_tab_timer.try_lock() {
+                        let block_stride = pl * bs;
+                        let byte_off = block * block_stride + page * pl + offset;
+                        ht.pending_jump_offset = Some(byte_off);
+                    }
+                    if gh > 0 && pl > 0 && bs > 0 {
+                        let block_x = block / gh;
+                        let block_y = block % gh;
+                        let pixel_x_l0 = (block_x * (pl * 8) + (offset * 8)) as f64;
+                        let pixel_y_l0 = (block_y * bs + page) as f64;
+
+                        let mut vm = viewport_manager_clone.lock().unwrap();
+                        let vp = vm.get_viewport().clone();
+                        let scale = 2.0_f64.powi(vp.level);
+                        let center_x = pixel_x_l0 / scale;
+                        let center_y = pixel_y_l0 / scale;
+                        vm.update_viewport(vp.level, center_x, center_y, vp.width_pixels, vp.height_pixels);
+                        vm.update_task_priorities();
+                    }
+                    need_redraw = true;
+                }
+            }
+
+            // 2b. Check if Hex tab requested a jump to NAND viewer
+            if let Ok(mut ht) = hex_tab_timer.try_lock() {
+                if let Some((block, page, offset)) = ht.jump_to_nand.take() {
+                    let _ = tabs_timer.set_value(&tab_viewer_timer);
+                    tabs_timer.redraw();
+                    tab_viewer_timer.redraw();
+
+                    let (pl, bs, gh) = {
+                        let m = metadata_timer.lock().unwrap();
+                        (m.page_length as u64, m.block_size as u64, m.grid_height as u64)
+                    };
+                    if gh > 0 && pl > 0 && bs > 0 {
+                        let block_x = block / gh;
+                        let block_y = block % gh;
+                        let pixel_x_l0 = (block_x * (pl * 8) + (offset * 8)) as f64;
+                        let pixel_y_l0 = (block_y * bs + page) as f64;
+
+                        let mut vm = viewport_manager_clone.lock().unwrap();
+                        let vp = vm.get_viewport().clone();
+                        let scale = 2.0_f64.powi(vp.level);
+                        let center_x = pixel_x_l0 / scale;
+                        let center_y = pixel_y_l0 / scale;
+                        vm.update_viewport(vp.level, center_x, center_y, vp.width_pixels, vp.height_pixels);
+                        vm.update_task_priorities();
+                    }
+                    need_redraw = true;
+                }
+            }
+
+            // 3. Check if active OutputViewer in workflow changed (Variante A)
+            if let Ok(wf) = workflow_state_timer.try_lock() {
+                match wf.build_active_output_provider() {
+                    Ok(provider) => {
+                        let new_ident = provider.lock().cache_identity();
+                        let mut cur_ident = current_identity_timer.lock().unwrap();
+                        if *cur_ident != new_ident {
+                            log::info!("Switching ZoomViewer to new active workflow output: {}", new_ident);
+                            *cur_ident = new_ident.clone();
+                            let new_meta = provider.lock().get_metadata();
+                            *metadata_timer.lock().unwrap() = new_meta.clone();
+
+                            if let Ok(new_cache) = CacheManager::new(".cache", new_ident) {
+                                viewport_renderer_clone.update_provider(provider, Arc::new(new_cache), new_meta.clone());
+                            }
+                            if let Ok(mut tc) = fltk_tile_cache_timer.try_lock() {
+                                tc.clear();
+                            }
+
+                            if let Ok(mut vm) = viewport_manager_clone.try_lock() {
+                                let center_x = 1024.0 / 2.0;
+                                let center_y = 648.0 / 2.0;
+                                vm.update_viewport(0, center_x, center_y, 1024, 648);
+                                vm.update_task_priorities();
+                            }
+                            tab_viewer_timer.activate();
+                            gl_hex_timer.redraw();
+                            need_redraw = true;
+                        }
+                    }
+                    Err(_) => {
+                        let mut cur_ident = current_identity_timer.lock().unwrap();
+                        if !cur_ident.is_empty() {
+                            log::info!("No active workflow output provider available: disabling ZoomViewer tab");
+                            *cur_ident = String::new();
+                            tab_viewer_timer.deactivate();
+                        }
                     }
                 }
-                
-                // Repeat timer
-                fltk::app::repeat_timeout3(0.1, handle);
-            });
-        }
+            }
+
+            if need_redraw {
+                let vp = viewport_manager_clone.lock().unwrap().get_viewport().clone();
+                let zoom = zoom_controller_clone.lock().unwrap();
+                let blend_level = zoom.get_next_level();
+                let blend_factor = zoom.get_blend_factor();
+                drop(zoom);
+
+                let rendered_image = viewport_renderer_clone.render_viewport(&vp, blend_level, blend_factor);
+                let mut viewport_img = viewport_image_clone.lock().unwrap();
+                *viewport_img = rendered_image;
+
+                let width = viewport_img.width() as i32;
+                let height = viewport_img.height() as i32;
+                let raw_data = viewport_img.as_raw().clone();
+                drop(viewport_img);
+
+                if let Ok(fltk_img) = fltk::image::RgbImage::new(&raw_data, width, height, ColorDepth::Rgba8) {
+                    let mut frame = viewport_frame_clone.lock().unwrap();
+                    frame.set_image(Some(fltk_img));
+                    frame.redraw();
+                }
+            }
+
+            // Repeat timer
+            fltk::app::repeat_timeout3(0.05, handle);
+        });
 
         // Set up window event handler (resize, close, mouse wheel)
         {
@@ -1099,6 +1472,72 @@ impl AppWindow {
     }
 }
 
+/// Build the xorviewer URL for a specific location
+pub fn build_xorviewer_url(
+    metadata: &FileMetadata,
+    block: u64,
+    page: u64,
+    offset_in_page: u64,
+) -> Option<String> {
+    if metadata.path.is_empty() {
+        return None;
+    }
+
+    let dump_path = std::path::Path::new(&metadata.path);
+    let absolute_path = if dump_path.is_absolute() {
+        dump_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join(dump_path)
+    };
+    let dump_path_str = absolute_path.to_string_lossy();
+    let page_start = (block as u64 * metadata.block_size as u64) + page;
+
+    Some(format!(
+        "http://localhost/cgi-bin/drresearch/xorviewer.pl?dump={}&pagesize={}&pagesperblock={}&pagestart={}&start={}",
+        dump_path_str,
+        metadata.page_length,
+        metadata.block_size,
+        page_start,
+        offset_in_page
+    ))
+}
+
+/// Open the xorviewer URL for a specific location in a web browser
+pub fn open_xorviewer_in_browser(
+    metadata: &FileMetadata,
+    block: u64,
+    page: u64,
+    offset_in_page: u64,
+) -> Option<String> {
+    let url = build_xorviewer_url(metadata, block, page, offset_in_page)?;
+    log::info!("Opening URL in browser: {}", url);
+
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("xdg-open")
+            .arg(&url)
+            .spawn();
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open")
+            .arg(&url)
+            .spawn();
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(&["/C", "start", &url])
+            .spawn();
+    }
+
+    Some(url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1128,7 +1567,7 @@ mod tests {
             CacheManager::new(temp_dir.path(), "test.bin".to_string()).unwrap(),
         );
 
-        let window = AppWindow::new(metadata, task_queue, cache, None, None);
+        let window = AppWindow::new(metadata, task_queue, cache, None, None, None);
         assert_eq!(window.metadata.page_length, 512);
         assert_eq!(window.metadata.block_size, 64);
     }
@@ -1144,7 +1583,7 @@ mod tests {
             CacheManager::new(temp_dir.path(), "test.bin".to_string()).unwrap(),
         );
 
-        let mut window = AppWindow::new(metadata, task_queue, cache, None, None);
+        let mut window = AppWindow::new(metadata, task_queue, cache, None, None, None);
         window.handle_mouse_move(100, 100);
         assert_eq!(window.mouse_x, 100);
         assert_eq!(window.mouse_y, 100);
@@ -1161,7 +1600,7 @@ mod tests {
             CacheManager::new(temp_dir.path(), "test.bin".to_string()).unwrap(),
         );
 
-        let window = AppWindow::new(metadata, task_queue, cache, None, None);
+        let window = AppWindow::new(metadata, task_queue, cache, None, None, None);
         let viewport = window.get_viewport();
 
         // Should start at level 0 (highest resolution)
@@ -1169,5 +1608,24 @@ mod tests {
         // Should start at upper left corner
         assert_eq!(viewport.center_x, 0.0);
         assert_eq!(viewport.center_y, 0.0);
+    }
+
+    #[test]
+    fn test_build_xorviewer_url() {
+        let meta = FileMetadata::new("dump.bin".to_string(), 100_000, 512, 64);
+        let url = build_xorviewer_url(&meta, 2, 5, 128);
+        assert!(url.is_some());
+        let u = url.unwrap();
+        assert!(u.contains("http://localhost/cgi-bin/drresearch/xorviewer.pl"));
+        assert!(u.contains("pagesize=512"));
+        assert!(u.contains("pagesperblock=64"));
+        assert!(u.contains("pagestart=133")); // 2 * 64 + 5 = 133
+        assert!(u.contains("start=128"));
+    }
+
+    #[test]
+    fn test_build_xorviewer_url_empty_path() {
+        let meta = FileMetadata::default();
+        assert_eq!(build_xorviewer_url(&meta, 0, 0, 0), None);
     }
 }
