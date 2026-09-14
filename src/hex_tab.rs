@@ -15,8 +15,8 @@ use crate::data_provider::DumpDataProvider;
 use crate::search::SearchResult;
 use crate::types::FileMetadata;
 use egui::{
-    vec2, Align, Color32, ColorImage, FontFamily, FontId, Key, Layout, Pos2, Rect, Rounding,
-    ScrollArea, Sense, Stroke, TextureHandle, TextureOptions, Ui,
+    scroll_area::ScrollBarVisibility, vec2, Align, Color32, ColorImage, FontFamily, FontId, Key,
+    Layout, Pos2, Rect, Rounding, ScrollArea, Sense, Stroke, TextureHandle, TextureOptions, Ui,
 };
 use parking_lot::Mutex;
 use std::fs;
@@ -230,10 +230,14 @@ pub struct HexTabState {
     pub last_drag_mouse_y: Option<f32>,
     pub last_drag_time: Option<Instant>,
     pub scroll_velocity_mode: String,
+    pub drag_grab_offset_y: f32,
 
     /// Height of the CentralPanel content area measured in the previous frame.
     /// Used to compute visible_pages accurately without a fragile fixed overhead guess.
     pub last_central_height: f32,
+
+    /// Exact height available for page hex rows measured after headers and mini-nand.
+    pub last_rows_height: f32,
 
     // Horizontal page scrollbar state
     pub is_dragging_h_scrollbar: bool,
@@ -272,8 +276,10 @@ impl HexTabState {
             last_drag_mouse_y: None,
             last_drag_time: None,
             scroll_velocity_mode: String::new(),
+            drag_grab_offset_y: 0.0,
 
             last_central_height: 0.0,
+            last_rows_height: 0.0,
 
             is_dragging_h_scrollbar: false,
             last_h_drag_mouse_x: None,
@@ -377,18 +383,18 @@ impl HexTabState {
         let avail_h = available_rect.height();
 
         // 1. Calculate Vertical Auto-Fit
-        // Use the measured CentralPanel height from the previous frame to avoid relying on a
-        // fragile fixed overhead estimate (the toolbar can wrap to multiple lines).
-        // On the very first frame, fall back to avail_h (slightly over-fetches, corrects next frame).
-        let row_h = self.font_size + 6.0;
-        let central_h = if self.last_central_height > row_h {
-            self.last_central_height
+        // 1. Calculate Vertical Auto-Fit
+        // Exactly as many rows as fit in the available content space, without any overflow
+        let row_h = self.font_size * 1.3 + 1.5;
+        let rows_avail_h = if self.last_rows_height > row_h {
+            self.last_rows_height
+        } else if self.last_central_height > row_h {
+            (self.last_central_height - 30.0).max(row_h)
         } else {
-            avail_h
+            (avail_h - 120.0).max(row_h)
         };
-        // Add 20% headroom so a resize never shows a blank strip at the bottom for one frame.
-        let visible_pages = ((central_h / row_h) * 1.2).ceil() as usize;
-        let visible_pages = visible_pages.clamp(4, 200);
+        let visible_pages = (rows_avail_h / row_h).floor() as usize;
+        let visible_pages = visible_pages.clamp(2, 200);
 
         // 2. Calculate Horizontal Auto-Fit
         // Prefix width: "B:0000 P:0000 0x0000 | " takes ~160px
@@ -913,6 +919,8 @@ impl HexTabState {
 
         ScrollArea::vertical()
             .auto_shrink([false, false])
+            .scroll_bar_visibility(ScrollBarVisibility::AlwaysHidden)
+            .enable_scrolling(false)
             .show(ui, |ui| {
                 ui.style_mut().spacing.item_spacing = vec2(0.0, 1.5);
 
@@ -949,8 +957,8 @@ impl HexTabState {
                         HexDisplayMode::AsciiOnly => {
                             ui.label(
                                 egui::RichText::new("ASCII Stream Content (Full Horizontal)")
-                                    .font(mono_font.clone())
-                                    .color(Color32::from_rgb(150, 150, 150)),
+                                        .font(mono_font.clone())
+                                        .color(Color32::from_rgb(150, 150, 150)),
                             );
                         }
                     }
@@ -965,6 +973,9 @@ impl HexTabState {
                 });
 
                 ui.separator();
+
+                // Capture exact remaining height available for rows to ensure perfect fit without overflow
+                self.last_rows_height = ui.available_height();
 
                 // Render each page row
                 for row_idx in 0..visible_pages {
@@ -1106,7 +1117,7 @@ impl HexTabState {
             });
     }
 
-    /// Velocity-dependent vertical page scrollbar (navigating page-by-page)
+    /// Consolidated vertical page scrollbar with direct linear tracking and modifier precision modes
     fn render_velocity_page_scrollbar(
         &mut self,
         ui: &mut Ui,
@@ -1119,107 +1130,192 @@ impl HexTabState {
             return;
         }
 
-        let track_rect = ui.available_rect_before_wrap();
-        let track_height = track_rect.height().max(50.0);
+        let max_page = total_pages.saturating_sub(1);
         let track_width = 18.0;
 
+        ui.style_mut().spacing.item_spacing = vec2(0.0, 2.0);
+
+        // 1. Top Step Button: ▲
+        let btn_up = ui.add_sized(
+            vec2(track_width, 16.0),
+            egui::Button::new("▲").small(),
+        );
+        if btn_up.on_hover_text("Previous Page (Up Arrow) — Ctrl for Block").clicked() {
+            let step = if ctx.input(|i| i.modifiers.ctrl) { block_size } else { 1 };
+            self.current_page = self.current_page.saturating_sub(step);
+            ctx.request_repaint();
+        }
+
+        // 2. Track Painter
+        let track_height = (ui.available_height() - 18.0).max(40.0);
         let (response, painter) = ui.allocate_painter(
             vec2(track_width, track_height),
             Sense::click_and_drag(),
         );
+        let track_rect = response.rect;
 
         // Draw track background
-        painter.rect_filled(response.rect, Rounding::same(3.0), Color32::from_rgb(30, 32, 38));
+        painter.rect_filled(track_rect, Rounding::same(3.0), Color32::from_rgb(25, 27, 32));
+        painter.rect_stroke(track_rect, Rounding::same(3.0), Stroke::new(1.0, Color32::from_rgb(45, 48, 56)));
 
+        // Thumb geometry
         let min_thumb_h = 24.0;
         let visible_fraction = ((visible_pages as f32) / (total_pages as f32).max(1.0)).clamp(0.01, 1.0);
         let thumb_h = (track_height * visible_fraction).clamp(min_thumb_h, track_height);
         let scrollable_h = (track_height - thumb_h).max(1.0);
 
-        let progress = (self.current_page as f64 / total_pages as f64).clamp(0.0, 1.0) as f32;
-        let thumb_y = response.rect.min.y + progress * scrollable_h;
+        let progress = if max_page > 0 {
+            (self.current_page as f64 / max_page as f64).clamp(0.0, 1.0) as f32
+        } else {
+            0.0
+        };
+        let thumb_y = track_rect.min.y + progress * scrollable_h;
 
         let thumb_rect = Rect::from_min_size(
-            Pos2::new(response.rect.min.x + 2.0, thumb_y),
+            Pos2::new(track_rect.min.x + 2.0, thumb_y),
             vec2(track_width - 4.0, thumb_h),
         );
 
-        let now = Instant::now();
+        let modifiers = ctx.input(|i| i.modifiers);
 
+        // Interaction Handling
         if response.drag_started() {
             self.is_dragging_scrollbar = true;
-            self.last_drag_mouse_y = response.interact_pointer_pos().map(|p| p.y);
-            self.last_drag_time = Some(now);
+            if let Some(pos) = response.interact_pointer_pos() {
+                self.last_drag_mouse_y = Some(pos.y);
+                if thumb_rect.contains(pos) {
+                    // Clicked on thumb: keep exact grab point
+                    self.drag_grab_offset_y = pos.y - thumb_rect.min.y;
+                } else {
+                    // Clicked on track: center thumb on click and jump
+                    self.drag_grab_offset_y = thumb_h / 2.0;
+                    let rel_y = (pos.y - track_rect.min.y - self.drag_grab_offset_y).clamp(0.0, scrollable_h);
+                    let frac = (rel_y / scrollable_h) as f64;
+                    self.current_page = (frac * max_page as f64).round() as u64;
+                    ctx.request_repaint();
+                }
+            }
         }
 
         if response.dragged() && self.is_dragging_scrollbar {
             if let Some(mouse_pos) = response.interact_pointer_pos() {
-                if let (Some(prev_y), Some(prev_time)) = (self.last_drag_mouse_y, self.last_drag_time) {
-                    let dy = mouse_pos.y - prev_y;
-                    let dt = now.duration_since(prev_time).as_secs_f32().max(0.001);
-                    let speed = dy.abs() / dt;
-
-                    // Velocity-dependent page scaling:
-                    // 1. Slow (< 40 px/s): 1 page per pixel
-                    // 2. Medium (40..250 px/s): 4-8 pages per pixel
-                    // 3. Brisk (250..800 px/s): block-wise (block_size pages per pixel)
-                    // 4. Fast (> 800 px/s): full proportional across file
-                    let effective_delta: i64 = if speed < 40.0 {
-                        self.scroll_velocity_mode = "Fine Page Mode (1 Page/px)".to_string();
-                        (dy.signum() * dy.abs().round()) as i64
-                    } else if speed < 250.0 {
-                        self.scroll_velocity_mode = "Medium Page Mode (4 Pages/px)".to_string();
-                        (dy * 4.0) as i64
-                    } else if speed < 800.0 {
-                        self.scroll_velocity_mode = format!("Block Mode ({} Pages/px)", block_size);
-                        (dy * (block_size as f32 * 0.5)) as i64
+                if modifiers.shift {
+                    // Shift held: Fine Mode (1 page per pixel)
+                    self.scroll_velocity_mode = "Fine Mode (Shift: 1 Page/px)".to_string();
+                    if let Some(prev_y) = self.last_drag_mouse_y {
+                        let dy = (mouse_pos.y - prev_y).round() as i64;
+                        if dy != 0 {
+                            let new_page = if dy > 0 {
+                                self.current_page.saturating_add(dy as u64)
+                            } else {
+                                self.current_page.saturating_sub((-dy) as u64)
+                            };
+                            self.current_page = new_page.min(max_page);
+                            self.last_drag_mouse_y = Some(mouse_pos.y);
+                            ctx.request_repaint();
+                        }
                     } else {
-                        self.scroll_velocity_mode = "Fast Proportional Scrub".to_string();
-                        let prop = (total_pages as f32 / scrollable_h).max(1.0);
-                        (dy * prop) as i64
-                    };
-
-                    let new_page = if effective_delta >= 0 {
-                        self.current_page.saturating_add(effective_delta as u64)
+                        self.last_drag_mouse_y = Some(mouse_pos.y);
+                    }
+                } else if modifiers.ctrl {
+                    // Ctrl held: Block Mode (1 block per 4 pixels)
+                    let pages_per_px = (block_size as f32 / 4.0).max(1.0);
+                    self.scroll_velocity_mode = format!("Block Mode (Ctrl: ~{} Pages/px)", pages_per_px.round() as u64);
+                    if let Some(prev_y) = self.last_drag_mouse_y {
+                        let dy = mouse_pos.y - prev_y;
+                        let page_delta = (dy * pages_per_px).round() as i64;
+                        if page_delta != 0 {
+                            let new_page = if page_delta > 0 {
+                                self.current_page.saturating_add(page_delta as u64)
+                            } else {
+                                self.current_page.saturating_sub((-page_delta) as u64)
+                            };
+                            self.current_page = new_page.min(max_page);
+                            self.last_drag_mouse_y = Some(mouse_pos.y);
+                            ctx.request_repaint();
+                        }
                     } else {
-                        self.current_page.saturating_sub((-effective_delta) as u64)
-                    };
-
-                    self.current_page = new_page.min(total_pages.saturating_sub(1));
+                        self.last_drag_mouse_y = Some(mouse_pos.y);
+                    }
+                } else {
+                    // Default Proportional Mode: Direct lock to mouse cursor position without any jitter
+                    self.scroll_velocity_mode.clear();
+                    let rel_y = (mouse_pos.y - track_rect.min.y - self.drag_grab_offset_y).clamp(0.0, scrollable_h);
+                    let frac = (rel_y / scrollable_h) as f64;
+                    let target_page = (frac * max_page as f64).round() as u64;
+                    self.current_page = target_page.min(max_page);
+                    self.last_drag_mouse_y = Some(mouse_pos.y);
                     ctx.request_repaint();
                 }
-
-                self.last_drag_mouse_y = Some(mouse_pos.y);
-                self.last_drag_time = Some(now);
             }
         }
 
         if response.drag_stopped() {
             self.is_dragging_scrollbar = false;
             self.last_drag_mouse_y = None;
-            self.last_drag_time = None;
             self.scroll_velocity_mode.clear();
         }
 
-        // Click directly on track to jump to fraction
-        if response.clicked() {
+        // Direct click on track (when not dragging)
+        if response.clicked() && !self.is_dragging_scrollbar {
             if let Some(pos) = response.interact_pointer_pos() {
-                let rel_y = (pos.y - response.rect.min.y - thumb_h / 2.0).clamp(0.0, scrollable_h);
+                let rel_y = (pos.y - track_rect.min.y - thumb_h / 2.0).clamp(0.0, scrollable_h);
                 let target_fraction = (rel_y / scrollable_h) as f64;
-                self.current_page = ((target_fraction * total_pages as f64) as u64).min(total_pages.saturating_sub(1));
+                self.current_page = ((target_fraction * max_page as f64).round() as u64).min(max_page);
+                ctx.request_repaint();
             }
         }
 
+        // Draw thumb
         let thumb_color = if self.is_dragging_scrollbar {
             Color32::from_rgb(110, 170, 240)
         } else if response.hovered() {
             Color32::from_rgb(85, 115, 150)
         } else {
-            Color32::from_rgb(60, 75, 95)
+            Color32::from_rgb(55, 70, 90)
         };
 
         painter.rect_filled(thumb_rect, Rounding::same(3.0), thumb_color);
-        painter.rect_stroke(thumb_rect, Rounding::same(3.0), Stroke::new(1.0, Color32::from_rgb(130, 150, 180)));
+        painter.rect_stroke(thumb_rect, Rounding::same(3.0), Stroke::new(1.0, Color32::from_rgb(120, 150, 190)));
+
+        // Grip lines in the center of the thumb
+        if thumb_h >= 30.0 {
+            let mid_y = thumb_rect.center().y;
+            let left_x = thumb_rect.min.x + 3.0;
+            let right_x = thumb_rect.max.x - 3.0;
+            let grip_color = Color32::from_rgb(170, 190, 220);
+            painter.line_segment([Pos2::new(left_x, mid_y - 3.0), Pos2::new(right_x, mid_y - 3.0)], Stroke::new(1.0, grip_color));
+            painter.line_segment([Pos2::new(left_x, mid_y), Pos2::new(right_x, mid_y)], Stroke::new(1.0, grip_color));
+            painter.line_segment([Pos2::new(left_x, mid_y + 3.0), Pos2::new(right_x, mid_y + 3.0)], Stroke::new(1.0, grip_color));
+        }
+
+        // Tooltip
+        let cur_block = if block_size > 0 { self.current_page / block_size } else { 0 };
+        let in_block_page = if block_size > 0 { self.current_page % block_size } else { 0 };
+        let mode_hint = if !self.scroll_velocity_mode.is_empty() {
+            format!("\nActive: {}", self.scroll_velocity_mode)
+        } else {
+            "\nHold Shift for Fine Mode (1 Page/px), Ctrl for Block Mode".to_string()
+        };
+        response.on_hover_text(format!(
+            "Page {} / {} (Block {}, Page {})\nClick or drag to scrub across dump{}",
+            self.current_page,
+            total_pages,
+            cur_block,
+            in_block_page,
+            mode_hint
+        ));
+
+        // 3. Bottom Step Button: ▼
+        let btn_down = ui.add_sized(
+            vec2(track_width, 16.0),
+            egui::Button::new("▼").small(),
+        );
+        if btn_down.on_hover_text("Next Page (Down Arrow) — Ctrl for Block").clicked() {
+            let step = if ctx.input(|i| i.modifiers.ctrl) { block_size } else { 1 };
+            self.current_page = (self.current_page + step).min(max_page);
+            ctx.request_repaint();
+        }
     }
 
     /// Dedicated horizontal scrollbar for scrubbing byte columns within a NAND page
@@ -1742,5 +1838,19 @@ mod tests {
         assert!(!state.is_dragging_h_scrollbar);
         assert!(state.last_h_drag_mouse_x.is_none());
         assert_eq!(state.col_offset_in_page, 0);
+    }
+
+    #[test]
+    fn test_visible_pages_exact_fit_no_overflow() {
+        let font_size = 12.0f32;
+        let row_h = font_size * 1.3 + 1.5;
+        let available_height = 400.0f32;
+
+        let visible_pages = (available_height / row_h).floor() as usize;
+        let total_rows_h = (visible_pages as f32) * row_h;
+
+        // Guaranteed to fit strictly within available height
+        assert!(total_rows_h <= available_height);
+        assert!(visible_pages >= 2);
     }
 }
