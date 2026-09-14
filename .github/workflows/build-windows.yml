@@ -17,6 +17,20 @@ jobs:
     - name: Install Rust (stable)
       uses: dtolnay/rust-toolchain@stable
     
+    - name: Pre-fetch and verify/patch dependencies
+      shell: pwsh
+      run: |
+        cargo fetch
+        Get-ChildItem -Path "$env:USERPROFILE\.cargo\registry\src" -Filter "CMakeLists.txt" -Recurse | Where-Object { $_.FullName -match 'cfltk[\\/]CMakeLists\.txt$' } | ForEach-Object {
+            Write-Host "Inspecting $($_.FullName)"
+            $content = Get-Content $_.FullName -Raw
+            if ($content -match 'MultiThreaded\$\<\$<CONFIG:Release>:Release\>') {
+                Write-Host "Patching invalid MultiThreadedRelease in $($_.FullName)"
+                $fixed = $content.Replace('MultiThreaded$<$<CONFIG:Release>:Release>', 'MultiThreaded$<$<CONFIG:Debug>:Debug>')
+                Set-Content -Path $_.FullName -Value $fixed
+            }
+        }
+
     - name: Build Release
       run: cargo build --release
       env:
