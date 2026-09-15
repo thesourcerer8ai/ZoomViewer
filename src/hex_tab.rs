@@ -19,7 +19,6 @@ use egui::{
     Layout, Pos2, Rect, Rounding, ScrollArea, Sense, Stroke, TextureHandle, TextureOptions, Ui,
 };
 use parking_lot::Mutex;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -212,12 +211,6 @@ pub struct HexTabState {
     /// Error message for invalid address entry
     pub goto_error: Option<String>,
 
-    /// Parsed page structure records from .case file
-    pub page_records: Vec<PageStructureRecord>,
-    /// Path of loaded .case file
-    pub case_file_path: Option<PathBuf>,
-    /// Whether we already attempted auto-loading .case for this dump
-    pub case_auto_loaded_for: String,
 
     /// Texture for the miniature bit-level NAND viewer
     mini_nand_texture: Option<TextureHandle>,
@@ -265,10 +258,6 @@ impl HexTabState {
             goto_address_input: "0x00000000".to_string(),
             goto_error: None,
 
-            page_records: Vec::new(),
-            case_file_path: None,
-            case_auto_loaded_for: String::new(),
-
             mini_nand_texture: None,
             jump_to_nand: None,
 
@@ -305,30 +294,9 @@ impl HexTabState {
         self.current_page * pl + self.col_offset_in_page
     }
 
-    /// Try auto-loading .case file for the given dump metadata path
-    fn try_auto_load_case(&mut self, meta: &FileMetadata) {
-        if self.case_auto_loaded_for == meta.path && !self.page_records.is_empty() {
-            return;
-        }
-        self.case_auto_loaded_for = meta.path.clone();
-
-        if let Some(case_path) = find_associated_case_file(&meta.path) {
-            if let Ok(content) = fs::read_to_string(&case_path) {
-                let recs = parse_case_file(&content);
-                if !recs.is_empty() {
-                    log::info!("Loaded {} page structure records from {}", recs.len(), case_path.display());
-                    self.page_records = recs;
-                    self.case_file_path = Some(case_path);
-                }
-            }
-        }
-    }
-
-    /// Find the segment in page_records covering a given byte column inside the page
-    pub fn find_segment_at_column(&self, col: u64) -> Option<&PageStructureRecord> {
-        self.page_records
-            .iter()
-            .find(|r| col >= r.start && col <= r.stop)
+    /// Find the segment covering a given byte column (helper for external callers)
+    pub fn find_segment_at_column<'a>(col: u64, records: &'a [PageStructureRecord]) -> Option<&'a PageStructureRecord> {
+        records.iter().find(|r| col >= r.start && col <= r.stop)
     }
 
     /// Main entry point to render the Hex Tab UI
@@ -339,6 +307,7 @@ impl HexTabState {
         raw_provider_opt: Option<&Arc<Mutex<dyn DumpDataProvider>>>,
         search_results: &[SearchResult],
         search_pattern_len: usize,
+        page_records: &[PageStructureRecord],
     ) {
         let Some(main_prov_arc) = main_provider_opt else {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -364,9 +333,6 @@ impl HexTabState {
         };
 
         let has_xor_diff = raw_provider_opt.is_some();
-
-        // Auto-load .case if not yet loaded
-        self.try_auto_load_case(&meta);
 
         // Handle pending external jump (e.g. from NAND viewer or search)
         if let Some(target) = self.pending_jump_offset.take() {
@@ -470,12 +436,13 @@ impl HexTabState {
                 bytes_per_row,
                 has_xor_diff,
                 search_results,
+                page_records,
             );
         });
 
         // Render Status Bar
         egui::TopBottomPanel::bottom("hex_status_bar").show(ctx, |ui| {
-            self.render_status_bar(ui, &meta, bytes_per_row, has_xor_diff);
+            self.render_status_bar(ui, &meta, bytes_per_row, has_xor_diff, page_records);
         });
 
         // Main Center Area — capture the response to measure the actual allocated height.
@@ -531,6 +498,7 @@ impl HexTabState {
                                     has_xor_diff,
                                     search_results,
                                     search_pattern_len,
+                                    page_records,
                                 );
                             },
                         );
@@ -541,6 +509,7 @@ impl HexTabState {
                             ctx,
                             page_length,
                             bytes_per_row,
+                            page_records,
                         );
                     },
                 );
@@ -598,6 +567,7 @@ impl HexTabState {
         bytes_per_row: usize,
         has_xor_diff: bool,
         search_results: &[SearchResult],
+        page_records: &[PageStructureRecord],
     ) {
         ui.horizontal_wrapped(|ui| {
             // Display Mode selector
@@ -650,16 +620,16 @@ impl HexTabState {
             }
 
             // Page structure quick jump dropdown
-            if !self.page_records.is_empty() {
+            if !page_records.is_empty() {
                 ui.separator();
                 egui::ComboBox::from_label("Structure")
                     .selected_text(
-                        self.find_segment_at_column(self.col_offset_in_page)
+                        HexTabState::find_segment_at_column(self.col_offset_in_page, page_records)
                             .map(|r| r.name.as_str())
                             .unwrap_or("Segments..."),
                     )
                     .show_ui(ui, |ui| {
-                        for rec in &self.page_records {
+                        for rec in page_records {
                             let is_active = self.col_offset_in_page >= rec.start && self.col_offset_in_page <= rec.stop;
                             let label = format!("{} (0x{:X}..0x{:X}, {} B)", rec.name, rec.start, rec.stop, rec.stop - rec.start + 1);
                             if ui.selectable_label(is_active, label).clicked() {
@@ -731,6 +701,7 @@ impl HexTabState {
         meta: &FileMetadata,
         bytes_per_row: usize,
         has_xor_diff: bool,
+        page_records: &[PageStructureRecord],
     ) {
         let cur_linear = self.current_linear_offset(meta);
         let (block, page, _offset_in_page) = HexTabState::offset_to_nand_coords(cur_linear, meta);
@@ -751,7 +722,7 @@ impl HexTabState {
             ui.separator();
             ui.label(format!("Linear: 0x{:08X} / 0x{:08X}", cur_linear, meta.size));
 
-            if let Some(seg) = self.find_segment_at_column(self.col_offset_in_page) {
+            if let Some(seg) = HexTabState::find_segment_at_column(self.col_offset_in_page, page_records) {
                 ui.separator();
                 let seg_color = match seg.kind {
                     PageSegmentKind::Data => Color32::from_rgb(120, 200, 255),
@@ -905,6 +876,7 @@ impl HexTabState {
         has_xor_diff: bool,
         search_results: &[SearchResult],
         search_pattern_len: usize,
+        page_records: &[PageStructureRecord],
     ) {
         let mono_font = FontId::new(self.font_size, FontFamily::Monospace);
         let block_size = meta.block_size as u64;
@@ -936,7 +908,7 @@ impl HexTabState {
                         HexDisplayMode::HexAndAscii | HexDisplayMode::HexOnly => {
                             for col_idx in 0..bytes_per_row {
                                 let abs_col = self.col_offset_in_page + col_idx as u64;
-                                let col_color = if let Some(seg) = self.find_segment_at_column(abs_col) {
+                                let col_color = if let Some(seg) = HexTabState::find_segment_at_column(abs_col, page_records) {
                                     match seg.kind {
                                         PageSegmentKind::Data => Color32::from_rgb(130, 190, 240),
                                         PageSegmentKind::Ecc => Color32::from_rgb(255, 150, 70),
@@ -1055,7 +1027,7 @@ impl HexTabState {
                                 }
 
                                 // Segment background highlight if configured
-                                if let Some(seg) = self.find_segment_at_column(abs_col) {
+                                if let Some(seg) = HexTabState::find_segment_at_column(abs_col, page_records) {
                                     if seg.kind == PageSegmentKind::SpareArea {
                                         rich = rich.background_color(Color32::from_rgba_premultiplied(80, 70, 10, 40));
                                     } else if seg.kind == PageSegmentKind::Ecc {
@@ -1073,7 +1045,7 @@ impl HexTabState {
                                             ui.label(format!("Raw:    0x{:02X} ({})", r, r));
                                             ui.label(format!("Output: 0x{:02X} ({})", a, a));
                                             ui.label(format!("XOR:    0x{:02X}", r ^ a));
-                                            if let Some(s) = self.find_segment_at_column(abs_col) {
+                                            if let Some(s) = HexTabState::find_segment_at_column(abs_col, page_records) {
                                                 ui.label(format!("Segment: {} ({})", s.name, format!("{:?}", s.kind)));
                                             }
                                         });
@@ -1325,6 +1297,7 @@ impl HexTabState {
         ctx: &egui::Context,
         page_length: u64,
         bytes_per_row: usize,
+        page_records: &[PageStructureRecord],
     ) {
         if page_length == 0 {
             return;
@@ -1369,8 +1342,8 @@ impl HexTabState {
             );
 
             // 2. Draw .case page structure segments onto track
-            if !self.page_records.is_empty() {
-                for rec in &self.page_records {
+            if !page_records.is_empty() {
+                for rec in page_records {
                     if rec.stop < rec.start {
                         continue;
                     }
@@ -1494,7 +1467,7 @@ impl HexTabState {
             } else {
                 self.col_offset_in_page
             };
-            let seg_str = self.find_segment_at_column(hover_col)
+            let seg_str = HexTabState::find_segment_at_column(hover_col, page_records)
                 .map(|s| format!(" | Segment: {} ({:?})", s.name, s.kind))
                 .unwrap_or_default();
 
@@ -1755,8 +1728,7 @@ mod tests {
 
     #[test]
     fn test_find_segment_at_column() {
-        let mut state = HexTabState::new();
-        state.page_records = vec![
+        let records = vec![
             PageStructureRecord {
                 name: "SA".to_string(),
                 start: 0,
@@ -1777,19 +1749,19 @@ mod tests {
             },
         ];
 
-        let seg_sa = state.find_segment_at_column(4);
+        let seg_sa = HexTabState::find_segment_at_column(4, &records);
         assert!(seg_sa.is_some());
         assert_eq!(seg_sa.unwrap().kind, PageSegmentKind::SpareArea);
 
-        let seg_data = state.find_segment_at_column(100);
+        let seg_data = HexTabState::find_segment_at_column(100, &records);
         assert!(seg_data.is_some());
         assert_eq!(seg_data.unwrap().kind, PageSegmentKind::Data);
 
-        let seg_ecc = state.find_segment_at_column(550);
+        let seg_ecc = HexTabState::find_segment_at_column(550, &records);
         assert!(seg_ecc.is_some());
         assert_eq!(seg_ecc.unwrap().kind, PageSegmentKind::Ecc);
 
-        let seg_none = state.find_segment_at_column(900);
+        let seg_none = HexTabState::find_segment_at_column(900, &records);
         assert!(seg_none.is_none());
     }
 

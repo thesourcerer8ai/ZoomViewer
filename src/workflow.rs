@@ -56,6 +56,10 @@ pub enum WorkflowNodeKind {
         export_path: String,
         auto_export: bool,
     },
+    FuseMount {
+        mount_path: String,
+        auto_mount: bool,
+    },
 }
 
 /// Data structure for a node in the workflow graph
@@ -157,6 +161,23 @@ impl WorkflowNode {
         }
     }
 
+    pub fn new_fuse_mount(id: usize, pos: [f32; 2]) -> Self {
+        let mount_path = crate::fuse_node::default_mount_dir_for_node(id)
+            .to_string_lossy()
+            .to_string();
+        Self {
+            id,
+            name: "FUSE Mount".to_string(),
+            pos,
+            kind: WorkflowNodeKind::FuseMount {
+                mount_path,
+                auto_mount: false,
+            },
+            status: NodeExecutionStatus::Idle,
+            output_log: "Ready to mount virtual filesystem".to_string(),
+        }
+    }
+
     pub fn execute(&mut self) {
         self.status = NodeExecutionStatus::Running;
         let start_time = std::time::Instant::now();
@@ -217,6 +238,13 @@ impl WorkflowNode {
                 self.output_log = format!(
                     "Workflow Output ready!\nExport target: {}\nAuto-export: {}",
                     export_path, auto_export
+                );
+            }
+            WorkflowNodeKind::FuseMount { mount_path, auto_mount } => {
+                self.status = NodeExecutionStatus::Completed;
+                self.output_log = format!(
+                    "FUSE Mount node ready!\nMount target: {}\nAuto-mount: {}",
+                    mount_path, auto_mount
                 );
             }
         }
@@ -419,6 +447,9 @@ pub struct WorkflowEditorState {
     /// Active background searches per node_id: (cancel_flag, progress_bytes, total_bytes, rx) (not persisted)
     #[serde(skip, default)]
     pub active_searches: Arc<Mutex<HashMap<usize, ActiveSearchState>>>,
+    /// Active FUSE filesystem mounts per node_id (not persisted)
+    #[serde(skip, default)]
+    pub active_fuse_mounts: Arc<Mutex<HashMap<usize, crate::fuse_node::ActiveFuseMount>>>,
 }
 
 impl Default for WorkflowEditorState {
@@ -478,6 +509,7 @@ impl WorkflowEditorState {
                     file_browser_show_all: HashMap::new(),
                     pending_xor_offer: None,
                     active_searches: Arc::new(Mutex::new(HashMap::new())),
+                    active_fuse_mounts: Arc::new(Mutex::new(HashMap::new())),
                 };
             }
         }
@@ -501,6 +533,7 @@ impl WorkflowEditorState {
             file_browser_show_all: HashMap::new(),
             pending_xor_offer: None,
             active_searches: Arc::new(Mutex::new(HashMap::new())),
+            active_fuse_mounts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -571,6 +604,7 @@ impl WorkflowEditorState {
             WorkflowNodeKind::BlockArranger { .. } => WorkflowNode::new_block_arranger(id, pos),
             WorkflowNodeKind::OutputViewer { .. } => WorkflowNode::new_output(id, pos, "Viewer"),
             WorkflowNodeKind::FileExport { .. } => WorkflowNode::new_export(id, pos),
+            WorkflowNodeKind::FuseMount { .. } => WorkflowNode::new_fuse_mount(id, pos),
         };
 
         self.nodes.push(node);
@@ -589,6 +623,34 @@ impl WorkflowEditorState {
         }
         // Fallback to first OutputViewer found in nodes
         self.nodes.iter().find(|n| matches!(n.kind, WorkflowNodeKind::OutputViewer { .. })).map(|n| n.id)
+    }
+
+    /// Walk upstream from the active OutputViewer and return the `page_length` of
+    /// the first `Input` node found in the pipeline. Returns `None` when no pipeline
+    /// is active or no Input node exists upstream.
+    pub fn active_page_length(&self) -> Option<u32> {
+        let output_id = self.get_active_output_node_id()?;
+        let mut current_id = output_id;
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(current_id) {
+                break; // cycle guard
+            }
+            if let Some(node) = self.nodes.iter().find(|n| n.id == current_id) {
+                if let WorkflowNodeKind::Input { page_length, .. } = &node.kind {
+                    if *page_length > 0 {
+                        return Some(*page_length);
+                    }
+                }
+            }
+            // Walk one step upstream
+            if let Some(conn) = self.connections.iter().find(|c| c.to_node == current_id) {
+                current_id = conn.from_node;
+            } else {
+                break;
+            }
+        }
+        None
     }
 
     /// Recursively builds a dynamic `DumpDataProvider` pipeline rooted at `target_node_id`.
@@ -671,6 +733,12 @@ impl WorkflowEditorState {
                 let incoming = self.connections.iter()
                     .find(|c| c.to_node == target_node_id)
                     .ok_or_else(|| format!("FileExport node #{} has no input connected", target_node_id))?;
+                self.build_data_provider_internal(incoming.from_node, visited)
+            }
+            WorkflowNodeKind::FuseMount { .. } => {
+                let incoming = self.connections.iter()
+                    .find(|c| c.to_node == target_node_id)
+                    .ok_or_else(|| format!("FuseMount node #{} has no input connected", target_node_id))?;
                 self.build_data_provider_internal(incoming.from_node, visited)
             }
         }
@@ -1000,6 +1068,13 @@ impl WorkflowEditorState {
                 match &n.kind {
                     WorkflowNodeKind::PatternSearch { .. } => "search",
                     WorkflowNodeKind::FileExport { .. } => "export",
+                    WorkflowNodeKind::FuseMount { auto_mount, .. } => {
+                        if *auto_mount {
+                            "fuse_mount"
+                        } else {
+                            "other"
+                        }
+                    }
                     _ => "other",
                 }
             });
@@ -1014,6 +1089,9 @@ impl WorkflowEditorState {
                 }
                 Some("export") => {
                     self.execute_export_node(id);
+                }
+                Some("fuse_mount") => {
+                    let _ = self.mount_fuse_node(id);
                 }
                 _ => {
                     if let Some(node) = self.nodes.iter_mut().find(|n| n.id == id) {
@@ -1031,6 +1109,7 @@ impl WorkflowEditorState {
                 match &n.kind {
                     WorkflowNodeKind::PatternSearch { .. } => "search",
                     WorkflowNodeKind::FileExport { .. } => "export",
+                    WorkflowNodeKind::FuseMount { .. } => "fuse_mount",
                     _ => "other",
                 }
             });
@@ -1046,6 +1125,9 @@ impl WorkflowEditorState {
                 }
                 Some("export") => {
                     self.execute_export_node(selected_id);
+                }
+                Some("fuse_mount") => {
+                    let _ = self.mount_fuse_node(selected_id);
                 }
                 _ => {
                     if let Some(node) = self.nodes.iter_mut().find(|n| n.id == selected_id) {
@@ -1086,6 +1168,44 @@ impl WorkflowEditorState {
         }
     }
 
+    /// Checks if a FuseMount node is currently active and mounted
+    pub fn is_fuse_node_mounted(&self, node_id: usize) -> bool {
+        let mounts = self.active_fuse_mounts.lock();
+        if let Some(mount) = mounts.get(&node_id) {
+            mount.is_mounted.load(Ordering::SeqCst)
+        } else {
+            false
+        }
+    }
+
+    /// Mounts the virtual FUSE filesystem for a FuseMount node
+    pub fn mount_fuse_node(&mut self, node_id: usize) -> Result<PathBuf, String> {
+        let node = self.nodes.iter().find(|n| n.id == node_id)
+            .ok_or_else(|| format!("Node #{} not found", node_id))?;
+        let mount_path_str = match &node.kind {
+            WorkflowNodeKind::FuseMount { mount_path, .. } => mount_path.clone(),
+            _ => return Err(format!("Node #{} is not a FuseMount node", node_id)),
+        };
+
+        if mount_path_str.trim().is_empty() {
+            return Err("Mount path cannot be empty".to_string());
+        }
+
+        let mount_path = PathBuf::from(&mount_path_str);
+        let provider = self.build_data_provider(node_id)?;
+
+        let active_mount = crate::fuse_node::ActiveFuseMount::mount(provider, &mount_path)?;
+        self.active_fuse_mounts.lock().insert(node_id, active_mount);
+        Ok(mount_path)
+    }
+
+    /// Unmounts the virtual FUSE filesystem for a FuseMount node
+    pub fn unmount_fuse_node(&mut self, node_id: usize) {
+        if let Some(mut mount) = self.active_fuse_mounts.lock().remove(&node_id) {
+            mount.unmount();
+        }
+    }
+
     /// Render workflow menu bar, toolbar and interactive node graph UI
     pub fn show_ui(&mut self, ctx: &egui::Context) {
         self.poll_active_searches(ctx);
@@ -1095,6 +1215,8 @@ impl WorkflowEditorState {
         let mut action_run_search: Option<usize> = None;
         let mut action_cancel_search: Option<usize> = None;
         let mut action_export_node: Option<usize> = None;
+        let mut action_mount_fuse: Option<usize> = None;
+        let mut action_unmount_fuse: Option<usize> = None;
 
         egui::TopBottomPanel::top("workflow_top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -1164,6 +1286,16 @@ impl WorkflowEditorState {
                         self.add_node(WorkflowNodeKind::FileExport {
                             export_path: "output.bin".to_string(),
                             auto_export: false,
+                        });
+                        ui.close_menu();
+                    }
+                    if ui.button("FUSE Mount").clicked() {
+                        let mount_path = crate::fuse_node::default_mount_dir_for_node(self.next_node_id)
+                            .to_string_lossy()
+                            .to_string();
+                        self.add_node(WorkflowNodeKind::FuseMount {
+                            mount_path,
+                            auto_mount: false,
                         });
                         ui.close_menu();
                     }
@@ -1250,6 +1382,14 @@ impl WorkflowEditorState {
                 let searches = self.active_searches.lock();
                 searches.iter()
                     .map(|(&id, s)| (id, (s.progress_bytes.load(Ordering::Relaxed), s.total_bytes)))
+                    .collect()
+            };
+
+            // Pre-collect active FUSE mounts info to avoid borrowing self inside node closure
+            let active_fuse_mounted_ids: std::collections::HashSet<usize> = {
+                let mounts = self.active_fuse_mounts.lock();
+                mounts.iter()
+                    .filter_map(|(&id, m)| if m.is_mounted.load(Ordering::SeqCst) { Some(id) } else { None })
                     .collect()
             };
 
@@ -1464,6 +1604,32 @@ impl WorkflowEditorState {
                                     action_export_node = Some(node_id);
                                 }
                             }
+                            WorkflowNodeKind::FuseMount { mount_path, auto_mount } => {
+                                ui.label("Mount Point:");
+                                ui.text_edit_singleline(mount_path);
+                                ui.checkbox(auto_mount, "Auto Mount on Run");
+                                ui.add_space(4.0);
+
+                                let is_mounted = active_fuse_mounted_ids.contains(&node_id);
+                                if is_mounted {
+                                    ui.colored_label(egui::Color32::from_rgb(80, 220, 120), "● Mounted");
+                                    ui.horizontal(|ui| {
+                                        if ui.button("⏹ Unmount").on_hover_text("Unmount virtual filesystem").clicked() {
+                                            action_unmount_fuse = Some(node_id);
+                                        }
+                                        #[cfg(unix)]
+                                        if ui.button("📂 Open").on_hover_text("Open mount folder in file manager").clicked() {
+                                            let _ = std::process::Command::new("xdg-open").arg(&*mount_path).spawn();
+                                        }
+                                    });
+                                    ui.label(egui::RichText::new("Exposed: dump.bin, meta.json, blocks/, pages/").italics().weak().size(11.0));
+                                } else {
+                                    ui.colored_label(egui::Color32::from_rgb(200, 200, 200), "○ Not Mounted");
+                                    if ui.button("▶ Mount FUSE").on_hover_text("Mount live pipeline as virtual filesystem").clicked() {
+                                        action_mount_fuse = Some(node_id);
+                                    }
+                                }
+                            }
                         }
 
                         ui.separator();
@@ -1658,6 +1824,7 @@ impl WorkflowEditorState {
 
             // Handle deletion
             if let Some(del_id) = delete_id {
+                self.unmount_fuse_node(del_id);
                 self.nodes.retain(|n| n.id != del_id);
                 self.connections.retain(|c| c.from_node != del_id && c.to_node != del_id);
                 if self.selected_node == Some(del_id) {
@@ -1685,6 +1852,34 @@ impl WorkflowEditorState {
         }
         if let Some(e_node_id) = action_export_node {
             self.execute_export_node(e_node_id);
+        }
+        if let Some(m_node_id) = action_mount_fuse {
+            match self.mount_fuse_node(m_node_id) {
+                Ok(path) => {
+                    let msg = format!("FUSE filesystem mounted at '{}'", path.display());
+                    self.status_message = msg.clone();
+                    if let Some(node) = self.nodes.iter_mut().find(|n| n.id == m_node_id) {
+                        node.status = NodeExecutionStatus::Completed;
+                        node.output_log = msg;
+                    }
+                }
+                Err(e) => {
+                    self.status_message = format!("FUSE mount failed on node #{}: {}", m_node_id, e);
+                    if let Some(node) = self.nodes.iter_mut().find(|n| n.id == m_node_id) {
+                        node.status = NodeExecutionStatus::Error(e.clone());
+                        node.output_log = format!("Mount failed: {}", e);
+                    }
+                }
+            }
+        }
+        if let Some(u_node_id) = action_unmount_fuse {
+            self.unmount_fuse_node(u_node_id);
+            let msg = format!("FUSE node #{} unmounted", u_node_id);
+            self.status_message = msg.clone();
+            if let Some(node) = self.nodes.iter_mut().find(|n| n.id == u_node_id) {
+                node.status = NodeExecutionStatus::Idle;
+                node.output_log = msg;
+            }
         }
     }
 }
@@ -1788,6 +1983,7 @@ mod tests {
             file_browser_show_all: HashMap::new(),
             pending_xor_offer: None,
             active_searches: Arc::new(Mutex::new(HashMap::new())),
+            active_fuse_mounts: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // Build data provider for OutputViewer node 4
@@ -1822,6 +2018,7 @@ mod tests {
             file_browser_show_all: HashMap::new(),
             pending_xor_offer: None,
             active_searches: Arc::new(Mutex::new(HashMap::new())),
+            active_fuse_mounts: Arc::new(Mutex::new(HashMap::new())),
         };
 
         match state.build_data_provider(1) {
@@ -1872,6 +2069,7 @@ mod tests {
             file_browser_show_all: HashMap::new(),
             pending_xor_offer: None,
             active_searches: Arc::new(Mutex::new(HashMap::new())),
+            active_fuse_mounts: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let exported = state.export_node_to_file(2).expect("Export should succeed");
@@ -1969,6 +2167,7 @@ mod tests {
             file_browser_show_all: HashMap::new(),
             pending_xor_offer: None,
             active_searches: Arc::new(Mutex::new(HashMap::new())),
+            active_fuse_mounts: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // Insert XOR
@@ -2058,6 +2257,7 @@ mod tests {
             file_browser_show_all: HashMap::new(),
             pending_xor_offer: None,
             active_searches: Arc::new(Mutex::new(HashMap::new())),
+            active_fuse_mounts: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let (main_p, raw_p) = state_simple.build_hex_providers().unwrap();
@@ -2162,6 +2362,7 @@ mod tests {
             file_browser_show_all: HashMap::new(),
             pending_xor_offer: None,
             active_searches: Arc::new(Mutex::new(HashMap::new())),
+            active_fuse_mounts: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // 1. Before executing search: filtered view has 0 matching pages (suppresses all pages)
@@ -2196,5 +2397,59 @@ mod tests {
         // Verify Page 1 of filtered output corresponds to original Page 3
         let p1_bytes = filtered_provider.lock().read_bytes(512, 13).unwrap();
         assert_eq!(&p1_bytes, b"|Block data 3");
+    }
+
+    #[test]
+    fn test_fuse_mount_node_lifecycle_and_provider() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        let payload = vec![0xABu8; 32768];
+        tmp.write_all(&payload).unwrap();
+        tmp.flush().unwrap();
+        let tmp_path = tmp.path().to_str().unwrap().to_string();
+
+        let mut state = WorkflowEditorState::new(None);
+        state.nodes.clear();
+        state.connections.clear();
+
+        // 1. Input Node
+        state.add_node(WorkflowNodeKind::Input {
+            file_path: tmp_path,
+            page_length: 512,
+            block_size: 64,
+        });
+        let input_id = state.nodes[0].id;
+
+        // 2. FuseMount Node
+        state.add_node(WorkflowNodeKind::FuseMount {
+            mount_path: "/tmp/test_fuse_mount".to_string(),
+            auto_mount: false,
+        });
+        let fuse_id = state.nodes[1].id;
+
+        // Connect Input -> FuseMount
+        state.connections.push(NodeConnection {
+            from_node: input_id,
+            to_node: fuse_id,
+        });
+
+        // Verify provider can be built from FuseMount node
+        let provider = state.build_data_provider(fuse_id).expect("Should build data provider through FuseMount");
+        let meta = provider.lock().get_metadata();
+        assert_eq!(meta.size, 32768);
+        assert_eq!(meta.page_length, 512);
+        assert_eq!(meta.block_size, 64);
+        assert_eq!(meta.total_pages, 64);
+
+        let bytes = provider.lock().read_bytes(0, 4).unwrap();
+        assert_eq!(bytes, vec![0xAB, 0xAB, 0xAB, 0xAB]);
+
+        // Verify mount status checks
+        assert!(!state.is_fuse_node_mounted(fuse_id));
+
+        // Test serde serialization roundtrip
+        let json = serde_json::to_string(&state).expect("Workflow with FuseMount should serialize");
+        let deserialized: WorkflowEditorState = serde_json::from_str(&json).expect("Workflow should deserialize");
+        assert_eq!(deserialized.nodes.len(), 2);
+        assert!(matches!(deserialized.nodes[1].kind, WorkflowNodeKind::FuseMount { .. }));
     }
 }

@@ -3,8 +3,8 @@
 use crate::{
     workflow::WorkflowEditorState,
     AddressDisplay, CacheManager, DumpDataProvider, FileMetadata, HexTabState, PanController,
-    SearchTabState, TaskQueue, TileCoord, Viewport, ViewportManager, ViewportRenderer,
-    ZoomController,
+    PageStructureTabState, SearchTabState, TaskQueue, TileCoord, Viewport, ViewportManager,
+    ViewportRenderer, ZoomController,
 };
 use fltk::{
     app::MouseWheel,
@@ -38,6 +38,8 @@ pub struct AppWindow {
     pub search_tab_state: Arc<Mutex<SearchTabState>>,
     /// Hex tab state
     pub hex_tab_state: Arc<Mutex<HexTabState>>,
+    /// Page structure editor tab state (shared with hex tab and workflow)
+    pub page_structure_tab_state: Arc<Mutex<PageStructureTabState>>,
     /// Frame to display the viewport image
     viewport_frame: Arc<Mutex<Frame>>,
     /// Viewport manager for tile identification
@@ -156,6 +158,20 @@ impl AppWindow {
         gl_hex.end();
 
         tab_hex.end();
+
+        // --- TAB 5: Page Structure Editor (embedded egui GL Canvas) ---
+        let tab_page_structure = Group::default()
+            .with_size(1024, 738)
+            .with_pos(0, 30)
+            .with_label("Page Structure\t");
+
+        let mut gl_page_structure = GlWindow::default()
+            .with_size(1024, 738)
+            .with_pos(0, 30);
+        gl_page_structure.set_mode(fltk::enums::Mode::Opengl3);
+        gl_page_structure.end();
+
+        tab_page_structure.end();
 
         tabs.end();
 
@@ -320,6 +336,9 @@ impl AppWindow {
         });
         gl_search.set_visible_focus();
 
+        // Setup page structure state early so it can be shared with the hex tab draw closure
+        let page_structure_state = Arc::new(Mutex::new(PageStructureTabState::new()));
+
         // Setup fltk-egui for hex tab
         let hex_tab_state = Arc::new(Mutex::new(HexTabState::new()));
         let hex_egui_state: Arc<Mutex<Option<(Painter, EguiState)>>> = Arc::new(Mutex::new(None));
@@ -330,6 +349,7 @@ impl AppWindow {
         let hex_egui_ctx_draw = hex_egui_ctx.clone();
         let workflow_for_hex = workflow_state.clone();
         let search_tab_for_hex = search_tab_state.clone();
+        let page_structure_for_hex = page_structure_state.clone();
 
         gl_hex.draw(move |w| {
             if !w.shown() {
@@ -361,6 +381,14 @@ impl AppWindow {
                     }
                 };
 
+                let page_records_clone = {
+                    if let Ok(ps) = page_structure_for_hex.try_lock() {
+                        ps.to_page_records()
+                    } else {
+                        Vec::new()
+                    }
+                };
+
                 let full_output = hex_egui_ctx_draw.run(raw_input, |ctx| {
                     let mut ht = hex_tab_draw.lock().unwrap();
                     ht.show_ui(
@@ -369,6 +397,7 @@ impl AppWindow {
                         raw_prov_opt.as_ref(),
                         &search_results_clone,
                         pattern_len,
+                        &page_records_clone,
                     );
                 });
 
@@ -412,6 +441,78 @@ impl AppWindow {
         });
         gl_hex.set_visible_focus();
 
+        // Setup fltk-egui for page structure tab
+        let ps_egui_state: Arc<Mutex<Option<(Painter, EguiState)>>> = Arc::new(Mutex::new(None));
+        let ps_egui_ctx = egui::Context::default();
+
+        let ps_tab_draw = page_structure_state.clone();
+        let ps_egui_state_draw = ps_egui_state.clone();
+        let ps_egui_ctx_draw = ps_egui_ctx.clone();
+        let workflow_for_ps = workflow_state.clone();
+
+        gl_page_structure.draw(move |w| {
+            if !w.shown() {
+                return;
+            }
+            w.make_current();
+            let mut state_guard = ps_egui_state_draw.lock().unwrap();
+            if state_guard.is_none() {
+                *state_guard = Some(fltk_egui::init(w));
+            }
+            if let Some((painter, state)) = state_guard.as_mut() {
+                let raw_input = state.take_input();
+                let ppp = state.pixels_per_point();
+
+                let active_page_length = {
+                    let wf = workflow_for_ps.lock().unwrap();
+                    wf.active_page_length()
+                };
+
+                let full_output = ps_egui_ctx_draw.run(raw_input, |ctx| {
+                    let mut ps = ps_tab_draw.lock().unwrap();
+                    ps.show_ui(ctx, active_page_length);
+                });
+
+                state.fuse_output(w, full_output.platform_output);
+                let clipped_primitives = ps_egui_ctx_draw.tessellate(full_output.shapes, full_output.pixels_per_point);
+
+                painter.paint_and_update_textures(
+                    [w.width() as u32, w.height() as u32],
+                    ppp,
+                    &clipped_primitives,
+                    &full_output.textures_delta,
+                );
+                w.swap_buffers();
+            }
+        });
+
+        let ps_egui_handle = ps_egui_state.clone();
+        let mut gl_ps_handle = gl_page_structure.clone();
+        gl_ps_handle.handle(move |w, ev| {
+            if let Ok(mut state_guard) = ps_egui_handle.try_lock() {
+                if let Some((_, state)) = state_guard.as_mut() {
+                    state.fuse_input(w, ev);
+                }
+            }
+            match ev {
+                Event::Push => {
+                    let _ = w.take_focus();
+                    w.redraw();
+                    true
+                }
+                Event::Focus | Event::Unfocus => {
+                    w.redraw();
+                    true
+                }
+                Event::Drag | Event::Move | Event::Released | Event::KeyDown | Event::KeyUp | Event::MouseWheel | Event::Resize => {
+                    w.redraw();
+                    true
+                }
+                _ => false,
+            }
+        });
+        gl_page_structure.set_visible_focus();
+
         // Create viewport manager
         let viewport_manager = Arc::new(Mutex::new(ViewportManager::new(
             metadata.clone(),
@@ -424,6 +525,7 @@ impl AppWindow {
         let mut gl_win_switch = gl_win.clone();
         let mut gl_search_switch = gl_search.clone();
         let mut gl_hex_switch = gl_hex.clone();
+        let mut gl_page_structure_switch = gl_page_structure.clone();
         let hex_tab_switch = hex_tab_state.clone();
         let viewport_manager_tab_switch = viewport_manager.clone();
         let metadata_tab_switch = metadata.clone();
@@ -432,6 +534,7 @@ impl AppWindow {
             gl_win_switch.redraw();
             gl_search_switch.redraw();
             gl_hex_switch.redraw();
+            gl_page_structure_switch.redraw();
             // Set keyboard focus to the appropriate GL window when its tab becomes active.
             if let Some(active) = tabs_for_cb.value() {
                 let lbl = active.label();
@@ -440,6 +543,8 @@ impl AppWindow {
                     gl_win_switch.set_visible_focus();
                 } else if trimmed.starts_with("Search") {
                     gl_search_switch.set_visible_focus();
+                } else if trimmed.starts_with("Page") {
+                    gl_page_structure_switch.set_visible_focus();
                 } else if trimmed.starts_with("Hex") {
                     gl_hex_switch.set_visible_focus();
                     // Synchronize NAND viewer position to Hex Tab
@@ -548,6 +653,7 @@ impl AppWindow {
             workflow_state: workflow_state.clone(),
             search_tab_state: search_tab_state.clone(),
             hex_tab_state: hex_tab_state.clone(),
+            page_structure_tab_state: page_structure_state.clone(),
             viewport_frame: viewport_frame_arc.clone(),
             viewport_manager: viewport_manager.clone(),
             zoom_controller: zoom_controller.clone(),

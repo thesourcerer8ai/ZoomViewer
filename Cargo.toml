@@ -23,5 +23,9 @@ fltk-egui = "0.16"
 proptest = "1.4"
 tempfile = "3.8"
 
+[target.'cfg(unix)'.dependencies]
+fuser = { version = "0.14", default-features = false }
+libc = "0.2"
+
 [profile.dev]
 opt-level = 3
