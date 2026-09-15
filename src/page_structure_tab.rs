@@ -143,7 +143,7 @@ impl PageStructureTabState {
         Self {
             segments: Vec::new(),
             target_page_size: 0,
-            case_file_path: String::new(),
+            case_file_path: "download.case".to_string(),
             status_msg: String::new(),
             status_is_error: false,
             case_xml_cache: String::new(),
@@ -299,163 +299,175 @@ impl PageStructureTabState {
         ui.add_space(8.0);
         ui.separator();
 
-        // ── Segment table ─────────────────────────────────────────────────────
-        ui.label(RichText::new("Segments").strong());
-        ui.add_space(4.0);
-
-        let mut remove_idx: Option<usize> = None;
+        // ── Scrollable body (segment table + controls) ────────────────────────
+        // The heading, status indicator, and layout bar above are pinned.
+        // Everything below scrolls so long segment lists stay accessible.
         let mut changed = false;
-        let mut move_up: Option<usize> = None;
-        let mut move_dn: Option<usize> = None;
 
-        egui::Grid::new("ps_seg_grid")
-            .num_columns(7)
-            .spacing([6.0, 4.0])
-            .striped(true)
+        egui::ScrollArea::vertical()
+            .id_source("ps_editor_scroll")
+            .auto_shrink([false, false])
             .show(ui, |ui| {
-                // Header row
-                ui.label(RichText::new("#").weak());
-                ui.label(RichText::new("Type").weak());
-                ui.label(RichText::new("Size (bytes)").weak());
-                ui.label(RichText::new("Start").weak());
-                ui.label(RichText::new("End").weak());
-                ui.label(RichText::new("Reorder").weak());
-                ui.label(RichText::new("").weak());
-                ui.end_row();
+                // ── Segment table ──────────────────────────────────────────────
+                ui.label(RichText::new("Segments").strong());
+                ui.add_space(4.0);
 
-                let mut offset: u32 = 0;
-                let n = self.segments.len();
-                for i in 0..n {
-                    let seg = &self.segments[i];
-                    let seg_start = offset;
-                    let seg_end = offset + seg.size.saturating_sub(1);
-                    offset += seg.size;
+                let mut remove_idx: Option<usize> = None;
+                let mut move_up: Option<usize> = None;
+                let mut move_dn: Option<usize> = None;
 
-                    // Index
-                    ui.label(format!("{}", i + 1));
+                egui::Grid::new("ps_seg_grid")
+                    .num_columns(7)
+                    .spacing([6.0, 4.0])
+                    .striped(true)
+                    .show(ui, |ui| {
+                        // Header row
+                        ui.label(RichText::new("#").weak());
+                        ui.label(RichText::new("Type").weak());
+                        ui.label(RichText::new("Size (bytes)").weak());
+                        ui.label(RichText::new("Start").weak());
+                        ui.label(RichText::new("End").weak());
+                        ui.label(RichText::new("Reorder").weak());
+                        ui.label(RichText::new("").weak());
+                        ui.end_row();
 
-                    // Type dropdown
-                    let current_kind = self.segments[i].kind;
-                    egui::ComboBox::from_id_source(format!("ps_kind_{i}"))
-                        .selected_text(current_kind.label())
-                        .width(90.0)
-                        .show_ui(ui, |ui| {
-                            for &k in SegmentKind::all() {
-                                let sel = ui.selectable_label(current_kind == k,
-                                    RichText::new(k.label()).color(k.color()));
-                                if sel.clicked() {
-                                    self.segments[i].kind = k;
+                        let mut offset: u32 = 0;
+                        let n = self.segments.len();
+                        for i in 0..n {
+                            let seg = &self.segments[i];
+                            let seg_start = offset;
+                            let seg_end = offset + seg.size.saturating_sub(1);
+                            offset += seg.size;
+
+                            // Index
+                            ui.label(format!("{}", i + 1));
+
+                            // Type dropdown
+                            let current_kind = self.segments[i].kind;
+                            egui::ComboBox::from_id_source(format!("ps_kind_{i}"))
+                                .selected_text(current_kind.label())
+                                .width(90.0)
+                                .show_ui(ui, |ui| {
+                                    for &k in SegmentKind::all() {
+                                        let sel = ui.selectable_label(
+                                            current_kind == k,
+                                            RichText::new(k.label()).color(k.color()),
+                                        );
+                                        if sel.clicked() {
+                                            self.segments[i].kind = k;
+                                            changed = true;
+                                        }
+                                    }
+                                });
+
+                            // Size input
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut self.segments[i].size_edit)
+                                    .desired_width(80.0)
+                                    .hint_text("bytes"),
+                            );
+                            if resp.changed() {
+                                if let Ok(v) = self.segments[i].size_edit.parse::<u32>() {
+                                    self.segments[i].size = v;
                                     changed = true;
                                 }
                             }
-                        });
+                            if resp.lost_focus() {
+                                self.segments[i].size_edit = self.segments[i].size.to_string();
+                            }
 
-                    // Size input
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.segments[i].size_edit)
-                            .desired_width(80.0)
-                            .hint_text("bytes"),
-                    );
-                    if resp.changed() {
-                        if let Ok(v) = self.segments[i].size_edit.parse::<u32>() {
-                            self.segments[i].size = v;
-                            changed = true;
-                        }
-                    }
-                    if resp.lost_focus() {
-                        // Normalise
-                        self.segments[i].size_edit = self.segments[i].size.to_string();
-                    }
+                            // Start / End (read-only display)
+                            ui.label(format!("0x{:X}", seg_start));
+                            ui.label(format!("0x{:X}", seg_end));
 
-                    // Start / End (read-only display)
-                    ui.label(format!("0x{:X}", seg_start));
-                    ui.label(format!("0x{:X}", seg_end));
+                            // Reorder buttons
+                            ui.horizontal(|ui| {
+                                if ui.small_button("↑").on_hover_text("Move up").clicked() && i > 0 {
+                                    move_up = Some(i);
+                                }
+                                if ui.small_button("↓").on_hover_text("Move down").clicked() && i + 1 < n {
+                                    move_dn = Some(i);
+                                }
+                            });
 
-                    // Reorder buttons
-                    ui.horizontal(|ui| {
-                        if ui.small_button("▲").on_hover_text("Move up").clicked() && i > 0 {
-                            move_up = Some(i);
-                        }
-                        if ui.small_button("▼").on_hover_text("Move down").clicked() && i + 1 < n {
-                            move_dn = Some(i);
+                            // Remove
+                            if ui.small_button("×").on_hover_text("Remove segment").clicked() {
+                                remove_idx = Some(i);
+                            }
+
+                            ui.end_row();
                         }
                     });
 
-                    // Remove
-                    if ui.small_button("✖").on_hover_text("Remove segment").clicked() {
-                        remove_idx = Some(i);
-                    }
-
-                    ui.end_row();
-                }
-            });
-
-        // Apply mutations after the grid borrow ends
-        if let Some(i) = remove_idx {
-            self.segments.remove(i);
-            changed = true;
-        }
-        if let Some(i) = move_up {
-            self.segments.swap(i, i - 1);
-            changed = true;
-        }
-        if let Some(i) = move_dn {
-            self.segments.swap(i, i + 1);
-            changed = true;
-        }
-
-        ui.add_space(6.0);
-
-        // ── Add segment buttons ────────────────────────────────────────────────
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Add:");
-            for &k in SegmentKind::all() {
-                let btn = egui::Button::new(
-                    RichText::new(format!("+ {}", k.label()))
-                        .color(Color32::WHITE)
-                        .small(),
-                )
-                .fill(k.color())
-                .rounding(Rounding::same(4.0));
-                if ui.add(btn).clicked() {
-                    // Default size: try to fill remaining space, else 0
-                    let remaining = if target > 0 {
-                        target.saturating_sub(self.total_size())
-                    } else {
-                        0
-                    };
-                    self.segments.push(PageSegment::new(k, remaining));
+                // Apply mutations after the grid borrow ends
+                if let Some(i) = remove_idx {
+                    self.segments.remove(i);
                     changed = true;
                 }
-            }
-        });
-
-        ui.add_space(8.0);
-
-        // ── Target page size override ─────────────────────────────────────────
-        ui.horizontal(|ui| {
-            ui.label("Target page size (bytes):");
-            let mut ts = self.target_page_size.to_string();
-            if ui.add(egui::TextEdit::singleline(&mut ts).desired_width(80.0)).changed() {
-                if let Ok(v) = ts.parse::<u32>() {
-                    self.target_page_size = v;
+                if let Some(i) = move_up {
+                    self.segments.swap(i, i - 1);
+                    changed = true;
                 }
-            }
-            if active_page_length.is_some() {
-                ui.label(RichText::new("(synced from workflow)").weak().small());
-            }
-        });
+                if let Some(i) = move_dn {
+                    self.segments.swap(i, i + 1);
+                    changed = true;
+                }
 
-        // ── Status bar ────────────────────────────────────────────────────────
-        if !self.status_msg.is_empty() {
-            ui.add_space(4.0);
-            let color = if self.status_is_error {
-                Color32::from_rgb(239, 68, 68)
-            } else {
-                Color32::from_rgb(34, 197, 94)
-            };
-            ui.colored_label(color, &self.status_msg);
-        }
+                ui.add_space(6.0);
+
+                // ── Add segment buttons ────────────────────────────────────────
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Add:");
+                    for &k in SegmentKind::all() {
+                        let btn = egui::Button::new(
+                            RichText::new(format!("+ {}", k.label()))
+                                .color(Color32::WHITE)
+                                .small(),
+                        )
+                        .fill(k.color())
+                        .rounding(Rounding::same(4.0));
+                        if ui.add(btn).clicked() {
+                            let remaining = if target > 0 {
+                                target.saturating_sub(self.total_size())
+                            } else {
+                                0
+                            };
+                            self.segments.push(PageSegment::new(k, remaining));
+                            changed = true;
+                        }
+                    }
+                });
+
+                ui.add_space(8.0);
+
+                // ── Target page size override ──────────────────────────────────
+                ui.horizontal(|ui| {
+                    ui.label("Target page size (bytes):");
+                    let mut ts = self.target_page_size.to_string();
+                    if ui.add(egui::TextEdit::singleline(&mut ts).desired_width(80.0)).changed() {
+                        if let Ok(v) = ts.parse::<u32>() {
+                            self.target_page_size = v;
+                        }
+                    }
+                    if active_page_length.is_some() {
+                        ui.label(RichText::new("(synced from workflow)").weak().small());
+                    }
+                });
+
+                // ── Status message ─────────────────────────────────────────────
+                if !self.status_msg.is_empty() {
+                    ui.add_space(4.0);
+                    let color = if self.status_is_error {
+                        Color32::from_rgb(239, 68, 68)
+                    } else {
+                        Color32::from_rgb(34, 197, 94)
+                    };
+                    ui.colored_label(color, &self.status_msg);
+                }
+
+                // Bottom padding so the last row isn't flush against the edge.
+                ui.add_space(12.0);
+            }); // end ScrollArea
 
         if changed {
             self.xml_dirty = true;
@@ -472,20 +484,59 @@ impl PageStructureTabState {
     /// Compute the pixel X position of each inter-segment boundary within `rect`.
     /// Returns a Vec of length `segments.len() - 1`.
     fn boundary_x_positions(&self, rect: egui::Rect, total: u32) -> Vec<f32> {
-        let mut positions = Vec::with_capacity(self.segments.len().saturating_sub(1));
+        // Mirror the largest-remainder pixel allocation used when painting,
+        // so drag handles land exactly on painted boundaries.
+        let bar_w = rect.width();
+        let visible: Vec<u32> = self.segments.iter()
+            .filter(|s| s.size > 0)
+            .map(|s| s.size)
+            .collect();
+        let n = visible.len();
+        if n == 0 {
+            return Vec::new();
+        }
+
+        let mut px_widths: Vec<i32> = vec![1; n];
+        let guaranteed = n as i32;
+        let remaining_px = (bar_w.round() as i32 - guaranteed).max(0);
+        let remaining_ideal: f32 = bar_w - guaranteed as f32;
+
+        let mut remainders: Vec<(usize, f32)> = visible.iter().enumerate()
+            .map(|(i, &sz)| {
+                let ideal = sz as f32 / total as f32 * bar_w;
+                let proportional = if remaining_ideal > 0.0 {
+                    (ideal - 1.0).max(0.0) / remaining_ideal * remaining_px as f32
+                } else {
+                    0.0
+                };
+                let floor = proportional.floor() as i32;
+                px_widths[i] += floor;
+                (i, proportional - floor as f32)
+            })
+            .collect();
+
+        let distributed: i32 = px_widths.iter().sum();
+        let leftover = (bar_w.round() as i32 - distributed).max(0);
+        remainders.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (i, _) in remainders.iter().take(leftover as usize) {
+            px_widths[*i] += 1;
+        }
+
+        // Boundaries are the right edges of all but the last segment.
+        let mut positions = Vec::with_capacity(n.saturating_sub(1));
         let mut x = rect.left();
-        // Walk all but the last segment
-        for seg in self.segments.iter().take(self.segments.len().saturating_sub(1)) {
-            let w = (seg.size as f32 / total as f32) * rect.width();
-            x += w.max(1.0);
-            positions.push(x);
+        for w in px_widths.iter().take(n.saturating_sub(1)) {
+            x += *w as f32;
+            positions.push(x.min(rect.right()));
         }
         positions
     }
 
     fn draw_layout_bar(&mut self, ui: &mut Ui, total: u32) {
         let bar_h = 48.0;
-        let available_w = ui.available_width() - 4.0;
+        // Use max_rect width rather than available_width so the bar respects
+        // the side panel reservation even on the first frame.
+        let available_w = (ui.max_rect().width() - 8.0).max(0.0);
 
         if total == 0 || available_w < 10.0 {
             ui.label(RichText::new("(Add segments to see layout)").weak().italics());
@@ -551,17 +602,75 @@ impl PageStructureTabState {
         // Background
         painter.rect_filled(rect, Rounding::same(4.0), Color32::from_rgb(30, 30, 40));
 
-        // Draw segments
-        let mut x = rect.left();
+        // Draw segments using a Bresenham-style pixel allocation:
+        //
+        //   - Each segment's ideal width = (size / total) * bar_width  (float)
+        //   - We accumulate the ideal right-edge position and snap to integer
+        //     pixels, so rounding errors never accumulate across segments.
+        //   - Any segment with size > 0 gets at least 1 pixel.  The "debt"
+        //     created by forcing tiny segments up to 1 px is absorbed by the
+        //     next segment that has spare pixels to give.
+        //
+        // Result: total rendered width == rect.width() exactly; no overflow.
+
+        // First pass — compute each segment's minimum (1) and ideal pixel widths.
+        struct SegPx { ideal: f32, px: i32 }
+        let bar_w = rect.width();
+        let mut seg_px: Vec<SegPx> = self.segments.iter()
+            .filter(|s| s.size > 0)
+            .map(|s| SegPx {
+                ideal: s.size as f32 / total as f32 * bar_w,
+                px: 1, // guaranteed minimum
+            })
+            .collect();
+
+        // Total pixels already "spent" on guarantees
+        let guaranteed: i32 = seg_px.len() as i32;
+        // Remaining pixels to distribute proportionally
+        let remaining_px = (bar_w.round() as i32 - guaranteed).max(0);
+        // Distribute remaining pixels by largest-remainder method.
+        let remaining_ideal: f32 = bar_w - guaranteed as f32;
+        // First, compute floor allocations into a separate vec to avoid
+        // simultaneous borrow of seg_px.
+        let floors_and_fracs: Vec<(i32, f32)> = seg_px.iter()
+            .map(|s| {
+                let proportional = if remaining_ideal > 0.0 {
+                    (s.ideal - 1.0).max(0.0) / remaining_ideal * remaining_px as f32
+                } else {
+                    0.0
+                };
+                let floor = proportional.floor() as i32;
+                (floor, proportional - floor as f32)
+            })
+            .collect();
+        let mut remainders: Vec<(usize, f32)> = floors_and_fracs.iter().enumerate()
+            .map(|(i, &(floor, frac))| { seg_px[i].px += floor; (i, frac) })
+            .collect();
+        // Hand out leftover pixels to the largest remainders first
+        let distributed: i32 = seg_px.iter().map(|s| s.px).sum();
+        let leftover = (bar_w.round() as i32 - distributed).max(0);
+        remainders.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (i, _) in remainders.iter().take(leftover as usize) {
+            seg_px[*i].px += 1;
+        }
+
+        // Second pass — paint using the computed pixel widths.
+        let n_visible = seg_px.len();
+        let mut px_x = rect.left();
+        let mut seg_px_iter = seg_px.iter();
         for (i, seg) in self.segments.iter().enumerate() {
             if seg.size == 0 {
                 continue;
             }
-            let frac = seg.size as f32 / total as f32;
-            let w = (frac * available_w).max(1.0);
-            let seg_rect = egui::Rect::from_min_size(
-                egui::pos2(x, rect.top()),
-                vec2(w, bar_h),
+            let spx = seg_px_iter.next().unwrap();
+            let w = spx.px as f32;
+            let x0 = px_x;
+            let x1 = (px_x + w).min(rect.right());
+            px_x += w;
+
+            let seg_rect = egui::Rect::from_min_max(
+                egui::pos2(x0, rect.top()),
+                egui::pos2(x1, rect.bottom()),
             );
 
             // Fill — dim if a *different* segment's boundary is being dragged.
@@ -587,9 +696,8 @@ impl PageStructureTabState {
                     Color32::WHITE,
                 );
             }
-
-            x += w;
         }
+        let _ = n_visible;
 
         // Draw boundary handles and set resize cursor when hovering one.
         let hover_pos = response.hover_pos().or_else(|| response.interact_pointer_pos());
@@ -683,7 +791,7 @@ impl PageStructureTabState {
         ui.horizontal(|ui| {
             ui.label("File:");
             ui.add(egui::TextEdit::singleline(&mut self.case_file_path)
-                .desired_width(200.0)
+                .desired_width(ui.available_width() - 4.0)
                 .hint_text("path/to/file.case"));
         });
 
@@ -698,49 +806,57 @@ impl PageStructureTabState {
 
         ui.add_space(8.0);
 
-        // XML preview / paste area
-        ui.label(RichText::new("Generated .case XML:").strong());
-        // Refresh XML
-        let _ = self.generate_case_xml();
-        let mut xml_copy = self.case_xml_cache.clone();
-        ui.add(
-            egui::TextEdit::multiline(&mut xml_copy)
-                .desired_width(f32::INFINITY)
-                .desired_rows(18)
-                .font(egui::TextStyle::Monospace),
-        );
-
-        ui.add_space(4.0);
-
-        // Paste & Import
-        ui.label(RichText::new("Paste XML to import:").strong());
-        egui::CollapsingHeader::new("Paste XML here ▼")
-            .default_open(false)
+        egui::ScrollArea::vertical()
+            .id_source("ps_xml_scroll")
+            .auto_shrink([false, false])
             .show(ui, |ui| {
-                use std::cell::RefCell;
-                thread_local! {
-                    static PASTE_BUF: RefCell<String> = RefCell::new(String::new());
-                }
-                let xml_to_import = PASTE_BUF.with(|paste_buf| {
-                    let mut paste_buf = paste_buf.borrow_mut();
-                    ui.add(
-                        egui::TextEdit::multiline(&mut *paste_buf)
-                            .desired_width(f32::INFINITY)
-                            .desired_rows(8)
-                            .hint_text("Paste .case XML here, then click Import")
-                            .font(egui::TextStyle::Monospace),
-                    );
-                    if ui.button("⬆ Import from pasted XML").clicked() {
-                        let xml_clone = paste_buf.clone();
-                        paste_buf.clear();
-                        Some(xml_clone)
-                    } else {
-                        None
-                    }
-                });
-                if let Some(xml) = xml_to_import {
-                    self.import_from_case_xml(&xml);
-                }
+                // XML preview / paste area
+                ui.label(RichText::new("Generated .case XML:").strong());
+                let _ = self.generate_case_xml();
+                let mut xml_copy = self.case_xml_cache.clone();
+                let panel_w = ui.available_width();
+                ui.add(
+                    egui::TextEdit::multiline(&mut xml_copy)
+                        .desired_width(panel_w)
+                        .desired_rows(18)
+                        .font(egui::TextStyle::Monospace),
+                );
+
+                ui.add_space(4.0);
+
+                // Paste & Import
+                ui.label(RichText::new("Paste XML to import:").strong());
+                egui::CollapsingHeader::new("Paste XML here ▼")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        use std::cell::RefCell;
+                        thread_local! {
+                            static PASTE_BUF: RefCell<String> = RefCell::new(String::new());
+                        }
+                        let paste_w = ui.available_width();
+                        let xml_to_import = PASTE_BUF.with(|paste_buf| {
+                            let mut paste_buf = paste_buf.borrow_mut();
+                            ui.add(
+                                egui::TextEdit::multiline(&mut *paste_buf)
+                                    .desired_width(paste_w)
+                                    .desired_rows(8)
+                                    .hint_text("Paste .case XML here, then click Import")
+                                    .font(egui::TextStyle::Monospace),
+                            );
+                            if ui.button("⬆ Import from pasted XML").clicked() {
+                                let xml_clone = paste_buf.clone();
+                                paste_buf.clear();
+                                Some(xml_clone)
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(xml) = xml_to_import {
+                            self.import_from_case_xml(&xml);
+                        }
+                    });
+
+                ui.add_space(8.0);
             });
     }
 

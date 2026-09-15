@@ -74,6 +74,28 @@ pub struct AppWindow {
     last_render_duration: Arc<Mutex<f64>>,
 }
 
+/// Build egui FontDefinitions with ChakraPetch as the primary proportional
+/// font, keeping egui's built-in font as fallback for icons and symbols.
+fn chakra_font_definitions() -> egui::FontDefinitions {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "ChakraPetch".to_owned(),
+        egui::FontData::from_static(include_bytes!("../assets/ChakraPetchMono-Medium.otf")),
+    );
+    // Prepend to both proportional and monospace families so it takes priority,
+    // but the default egui font (which has full Unicode/icon coverage) remains
+    // as fallback for any glyphs ChakraPetch doesn't cover.
+    fonts.families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, "ChakraPetch".to_owned());
+    fonts.families
+        .entry(egui::FontFamily::Monospace)
+        .or_default()
+        .insert(0, "ChakraPetch".to_owned());
+    fonts
+}
+
 impl AppWindow {
 
     /// Create a new application window
@@ -191,7 +213,7 @@ impl AppWindow {
         ));
         let egui_state: Arc<Mutex<Option<(Painter, EguiState)>>> = Arc::new(Mutex::new(None));
         let egui_ctx = egui::Context::default();
-
+        egui_ctx.set_fonts(chakra_font_definitions());
         let workflow_state_draw = workflow_state.clone();
         let egui_state_draw = egui_state.clone();
         let egui_ctx_draw = egui_ctx.clone();
@@ -262,6 +284,7 @@ impl AppWindow {
         let search_tab_state = Arc::new(Mutex::new(SearchTabState::new()));
         let search_egui_state: Arc<Mutex<Option<(Painter, EguiState)>>> = Arc::new(Mutex::new(None));
         let search_egui_ctx = egui::Context::default();
+        search_egui_ctx.set_fonts(chakra_font_definitions());
 
         let search_tab_draw = search_tab_state.clone();
         let search_egui_state_draw = search_egui_state.clone();
@@ -343,6 +366,7 @@ impl AppWindow {
         let hex_tab_state = Arc::new(Mutex::new(HexTabState::new()));
         let hex_egui_state: Arc<Mutex<Option<(Painter, EguiState)>>> = Arc::new(Mutex::new(None));
         let hex_egui_ctx = egui::Context::default();
+        hex_egui_ctx.set_fonts(chakra_font_definitions());
 
         let hex_tab_draw = hex_tab_state.clone();
         let hex_egui_state_draw = hex_egui_state.clone();
@@ -444,6 +468,7 @@ impl AppWindow {
         // Setup fltk-egui for page structure tab
         let ps_egui_state: Arc<Mutex<Option<(Painter, EguiState)>>> = Arc::new(Mutex::new(None));
         let ps_egui_ctx = egui::Context::default();
+        ps_egui_ctx.set_fonts(chakra_font_definitions());
 
         let ps_tab_draw = page_structure_state.clone();
         let ps_egui_state_draw = ps_egui_state.clone();
