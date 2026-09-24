@@ -493,6 +493,10 @@ pub struct WorkflowEditorState {
     /// Active FUSE filesystem mounts per node_id (not persisted)
     #[serde(skip, default)]
     pub active_fuse_mounts: Arc<Mutex<HashMap<usize, crate::fuse_node::ActiveFuseMount>>>,
+    /// Rendered rect of each node from the previous frame, used to draw
+    /// connection wires from actual node edges instead of fixed offsets (not persisted)
+    #[serde(skip, default)]
+    pub node_rects: HashMap<usize, egui::Rect>,
 }
 
 impl Default for WorkflowEditorState {
@@ -553,6 +557,7 @@ impl WorkflowEditorState {
                     pending_xor_offer: None,
                     active_searches: Arc::new(Mutex::new(HashMap::new())),
                     active_fuse_mounts: Arc::new(Mutex::new(HashMap::new())),
+                    node_rects: HashMap::new(),
                 };
             }
         }
@@ -577,6 +582,7 @@ impl WorkflowEditorState {
             pending_xor_offer: None,
             active_searches: Arc::new(Mutex::new(HashMap::new())),
             active_fuse_mounts: Arc::new(Mutex::new(HashMap::new())),
+            node_rects: HashMap::new(),
         }
     }
 
@@ -1594,14 +1600,29 @@ impl WorkflowEditorState {
         egui::CentralPanel::default().show(ctx, |ui| {
             let painter = ui.painter();
 
-            // Draw connection wires
+            // Draw connection wires using last-frame node rects so wires connect
+            // from the right-center of the source node to the left-center of the
+            // target node, rather than a fixed offset from the top-left corner.
             for conn in &self.connections {
-                let from_pos = self.nodes.iter().find(|n| n.id == conn.from_node).map(|n| egui::pos2(n.pos[0] + 200.0, n.pos[1] + 30.0));
-                let to_pos = self.nodes.iter().find(|n| n.id == conn.to_node).map(|n| egui::pos2(n.pos[0], n.pos[1] + 30.0));
+                let from_pos = self.nodes.iter().find(|n| n.id == conn.from_node).map(|n| {
+                    if let Some(rect) = self.node_rects.get(&n.id) {
+                        egui::pos2(rect.max.x, rect.center().y)
+                    } else {
+                        egui::pos2(n.pos[0] + 200.0, n.pos[1] + 30.0)
+                    }
+                });
+                let to_pos = self.nodes.iter().find(|n| n.id == conn.to_node).map(|n| {
+                    if let Some(rect) = self.node_rects.get(&n.id) {
+                        egui::pos2(rect.min.x, rect.center().y)
+                    } else {
+                        egui::pos2(n.pos[0], n.pos[1] + 30.0)
+                    }
+                });
 
                 if let (Some(p1), Some(p2)) = (from_pos, to_pos) {
-                    let cp1 = p1 + egui::vec2(60.0, 0.0);
-                    let cp2 = p2 - egui::vec2(60.0, 0.0);
+                    let dx = (p2.x - p1.x).abs().max(80.0) * 0.5;
+                    let cp1 = p1 + egui::vec2(dx, 0.0);
+                    let cp2 = p2 - egui::vec2(dx, 0.0);
                     let cubic = egui::epaint::CubicBezierShape::from_points_stroke(
                         [p1, cp1, cp2, p2],
                         false,
@@ -1615,10 +1636,15 @@ impl WorkflowEditorState {
             // Draw active connection wire during dragging/connection mode
             if let Some(from_id) = self.connecting_from {
                 if let Some(from_node) = self.nodes.iter().find(|n| n.id == from_id) {
-                    let p1 = egui::pos2(from_node.pos[0] + 200.0, from_node.pos[1] + 30.0);
+                    let p1 = if let Some(rect) = self.node_rects.get(&from_node.id) {
+                        egui::pos2(rect.max.x, rect.center().y)
+                    } else {
+                        egui::pos2(from_node.pos[0] + 200.0, from_node.pos[1] + 30.0)
+                    };
                     if let Some(pointer_pos) = ui.input(|i| i.pointer.hover_pos()) {
-                        let cp1 = p1 + egui::vec2(60.0, 0.0);
-                        let cp2 = pointer_pos - egui::vec2(60.0, 0.0);
+                        let dx = (pointer_pos.x - p1.x).abs().max(80.0) * 0.5;
+                        let cp1 = p1 + egui::vec2(dx, 0.0);
+                        let cp2 = pointer_pos - egui::vec2(dx, 0.0);
                         let cubic = egui::epaint::CubicBezierShape::from_points_stroke(
                             [p1, cp1, cp2, pointer_pos],
                             false,
@@ -1674,10 +1700,10 @@ impl WorkflowEditorState {
                 };
 
                 let window_title = match &node.status {
-                    NodeExecutionStatus::Idle => format!("⏸ Node #{} - {}", node.id, node.name),
-                    NodeExecutionStatus::Running => format!("⏳ Node #{} - {}", node.id, node.name),
-                    NodeExecutionStatus::Completed => format!("✅ Node #{} - {}", node.id, node.name),
-                    NodeExecutionStatus::Error(_) => format!("❌ Node #{} - {}", node.id, node.name),
+                    NodeExecutionStatus::Idle => format!("⏸ #{} - {}", node.id, node.name),
+                    NodeExecutionStatus::Running => format!("⏳ #{} - {}", node.id, node.name),
+                    NodeExecutionStatus::Completed => format!("✅ #{} - {}", node.id, node.name),
+                    NodeExecutionStatus::Error(_) => format!("❌ #{} - {}", node.id, node.name),
                 };
 
                 let win_res = egui::Window::new(window_title)
@@ -1962,6 +1988,7 @@ impl WorkflowEditorState {
 
                 if let Some(win_res) = win_res {
                     pos = win_res.response.rect.min;
+                    self.node_rects.insert(node_id, win_res.response.rect);
                 }
 
                 node.pos = [pos.x, pos.y];

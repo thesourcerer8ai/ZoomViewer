@@ -430,7 +430,7 @@ impl AppWindow {
                 return;
             }
             w.make_current();
-            let mut state_guard = hex_egui_state_draw.lock().unwrap();
+            let mut state_guard = hex_egui_state_draw.lock().unwrap_or_else(|e| e.into_inner());
             if state_guard.is_none() {
                 *state_guard = Some(fltk_egui::init(w));
             }
@@ -439,7 +439,7 @@ impl AppWindow {
                 let ppp = state.pixels_per_point();
 
                 let (main_prov_opt, raw_prov_opt) = {
-                    let wf = workflow_for_hex.lock().unwrap();
+                    let wf = workflow_for_hex.lock().unwrap_or_else(|e| e.into_inner());
                     match wf.build_hex_providers() {
                         Ok((main_p, raw_p)) => (Some(main_p), raw_p),
                         Err(_) => (None, None),
@@ -453,7 +453,7 @@ impl AppWindow {
                     // already translated by get_upstream_search_results).
                     // Fall back to the standalone search tab results otherwise.
                     let wf_results = {
-                        let wf = workflow_for_hex.lock().unwrap();
+                        let wf = workflow_for_hex.lock().unwrap_or_else(|e| e.into_inner());
                         wf.get_upstream_search_results()
                     };
                     if let Some((results, pat_len)) = wf_results {
@@ -475,7 +475,7 @@ impl AppWindow {
                 };
 
                 let full_output = hex_egui_ctx_draw.run(raw_input, |ctx| {
-                    let mut ht = hex_tab_draw.lock().unwrap();
+                    let mut ht = hex_tab_draw.lock().unwrap_or_else(|e| e.into_inner());
                     ht.show_ui(
                         ctx,
                         main_prov_opt.as_ref(),

@@ -380,7 +380,10 @@ impl HexTabState {
             HexDisplayMode::AsciiOnly => 1.0 * char_w + 1.5,                  // "X"
         };
 
-        let bytes_per_row = ((content_w / width_per_byte).floor() as usize).clamp(8, page_length as usize);
+        let bytes_per_row = ((content_w / width_per_byte).floor() as usize).clamp(
+            8_usize.min(page_length as usize),
+            page_length as usize,
+        );
 
         // Clamp offsets
         self.current_page = self.current_page.min(total_pages.saturating_sub(1));
