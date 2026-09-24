@@ -558,6 +558,188 @@ impl DumpDataProvider for SearchFilteredDataProvider {
     }
 }
 
+/// A provider that outputs one fixed-size page per individual search result.
+///
+/// Page layout (all pages have identical size = `bytes_before + pattern_len + bytes_after`):
+///
+/// ```text
+/// [ bytes_before bytes of source ][ pattern_len bytes of source ][ bytes_after bytes of source ]
+/// ```
+///
+/// If the match is within `bytes_before` bytes of the source start, the leading
+/// region is zero-padded so that **the match always begins at offset `bytes_before`
+/// inside every output page**.  Likewise, if the match ends within `bytes_after`
+/// bytes of the source end, the trailing region is zero-padded.  This guarantees
+/// that all pages are exactly the same size and all matches are perfectly aligned.
+pub struct SearchContextDataProvider {
+    source: Arc<Mutex<dyn DumpDataProvider>>,
+    /// Absolute byte offsets of each match in the source
+    match_offsets: Vec<u64>,
+    /// Number of source bytes added before each match
+    bytes_before: u64,
+    /// Number of source bytes added after each match
+    bytes_after: u64,
+    /// Length of the search pattern in bytes
+    pattern_len: u64,
+    /// Total source size (for bounds checking / zero-padding)
+    source_size: u64,
+    metadata: FileMetadata,
+    identity: String,
+}
+
+impl SearchContextDataProvider {
+    /// Create a new `SearchContextDataProvider`.
+    ///
+    /// # Arguments
+    /// * `source`        – Upstream data provider.
+    /// * `match_offsets` – Absolute byte offset of every match (one entry per result).
+    /// * `bytes_before`  – Context bytes to include before each match (zero-padded at source boundary).
+    /// * `bytes_after`   – Context bytes to include after each match (zero-padded at source boundary).
+    /// * `pattern_len`   – Length of the search pattern in bytes.
+    /// * `search_pattern`– Human-readable pattern string (used for cache identity only).
+    pub fn new(
+        source: Arc<Mutex<dyn DumpDataProvider>>,
+        match_offsets: Vec<u64>,
+        bytes_before: u64,
+        bytes_after: u64,
+        pattern_len: u64,
+        search_pattern: String,
+    ) -> Self {
+        let (_page_length, block_size, src_size, src_identity) = {
+            let guard = source.lock();
+            let m = guard.get_metadata();
+            (m.page_length, m.block_size, m.size, guard.cache_identity())
+        };
+
+        // Every output page has the same size.
+        let page_size = bytes_before + pattern_len + bytes_after;
+        // Clamp to at least 1 so FileMetadata arithmetic doesn't panic on an
+        // empty provider.
+        let page_size_clamped = page_size.max(1) as u32;
+
+        let total_pages = match_offsets.len() as u64;
+        let total_size = total_pages * page_size.max(1);
+
+        let mut hasher = DefaultHasher::new();
+        "SEARCH_CONTEXT".hash(&mut hasher);
+        src_identity.hash(&mut hasher);
+        search_pattern.hash(&mut hasher);
+        match_offsets.hash(&mut hasher);
+        bytes_before.hash(&mut hasher);
+        bytes_after.hash(&mut hasher);
+        pattern_len.hash(&mut hasher);
+        let identity = format!("context_{:016x}", hasher.finish());
+
+        let metadata = FileMetadata::new(
+            format!("search://context/{}", identity),
+            total_size,
+            page_size_clamped,
+            block_size,
+        );
+
+        Self {
+            source,
+            match_offsets,
+            bytes_before,
+            bytes_after,
+            pattern_len,
+            source_size: src_size,
+            metadata,
+            identity,
+        }
+    }
+}
+
+impl DumpDataProvider for SearchContextDataProvider {
+    fn read_bytes(&mut self, offset: u64, length: u32) -> Result<Vec<u8>> {
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+
+        let page_size = (self.bytes_before + self.pattern_len + self.bytes_after).max(1);
+        let total_size = self.metadata.size;
+
+        if offset >= total_size {
+            return Ok(vec![0u8; length as usize]);
+        }
+
+        let mut buffer = vec![0u8; length as usize];
+        let readable_end = (offset + length as u64).min(total_size);
+
+        // Which output pages does this request span?
+        let first_page = offset / page_size;
+        let last_page = (readable_end - 1) / page_size;
+
+        for page_idx in first_page..=last_page {
+            if (page_idx as usize) >= self.match_offsets.len() {
+                break;
+            }
+
+            let match_abs = self.match_offsets[page_idx as usize];
+
+            // Source window: [src_win_start, src_win_end)
+            // The match starts at offset `bytes_before` inside this output page.
+            let src_win_start = match_abs.saturating_sub(self.bytes_before);
+            let src_win_end = (match_abs + self.pattern_len + self.bytes_after).min(self.source_size);
+
+            // Within the output page, `in_page_zero_start` is the position at
+            // which actual source data begins.  If the match is close to the
+            // source start we can't fill all of `bytes_before`, so the first
+            // few bytes of the page stay zero (already initialised).
+            let leading_pad = self.bytes_before.saturating_sub(match_abs);
+            // Offset of this page's first byte in the output stream
+            let page_out_start = page_idx * page_size;
+            let page_out_end = page_out_start + page_size;
+
+            // Overlap of this output page with the requested [offset, readable_end)
+            let seg_out_start = offset.max(page_out_start);
+            let seg_out_end = readable_end.min(page_out_end);
+            if seg_out_end <= seg_out_start {
+                continue;
+            }
+
+            // For each byte in [seg_out_start, seg_out_end) of the output stream,
+            // determine whether it comes from the source or is zero-padded.
+            let in_page_start = seg_out_start - page_out_start; // offset within output page
+            let in_page_end = seg_out_end - page_out_start;
+
+            // Read the real source segment in one call to minimise lock overhead.
+            // Source data covers in-page positions [leading_pad, leading_pad + (src_win_end - src_win_start)).
+            let src_data_start_in_page = leading_pad;
+            let src_data_len = src_win_end.saturating_sub(src_win_start);
+
+            // Clamp to the intersection with [in_page_start, in_page_end)
+            let copy_src_in_page_start = in_page_start.max(src_data_start_in_page);
+            let copy_src_in_page_end = in_page_end.min(src_data_start_in_page + src_data_len);
+
+            if copy_src_in_page_end > copy_src_in_page_start && src_data_len > 0 {
+                // Translate back to source offset
+                let read_offset_in_src = src_win_start + (copy_src_in_page_start - src_data_start_in_page);
+                let read_len = (copy_src_in_page_end - copy_src_in_page_start) as u32;
+
+                if read_len > 0 {
+                    let src_bytes = self.source.lock().read_bytes(read_offset_in_src, read_len)?;
+                    let dest_start = (seg_out_start - offset + (copy_src_in_page_start - in_page_start)) as usize;
+                    let copy_len = src_bytes.len().min(read_len as usize);
+                    buffer[dest_start..dest_start + copy_len]
+                        .copy_from_slice(&src_bytes[..copy_len]);
+                }
+            }
+            // Padding regions (leading & trailing) remain 0x00 (buffer pre-filled)
+        }
+
+        Ok(buffer)
+    }
+
+    fn get_metadata(&self) -> FileMetadata {
+        self.metadata.clone()
+    }
+
+    fn cache_identity(&self) -> String {
+        self.identity.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

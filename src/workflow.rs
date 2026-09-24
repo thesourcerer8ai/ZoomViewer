@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use parking_lot::Mutex;
-use crate::data_provider::{DumpDataProvider, FileDataProvider, SearchFilteredDataProvider, XorDataProvider};
+use crate::data_provider::{DumpDataProvider, FileDataProvider, SearchContextDataProvider, SearchFilteredDataProvider, XorDataProvider};
 use crate::file_loader::FileLoader;
 use crate::types::FileMetadata;
 pub use crate::file_dialog::FileDialog;
@@ -23,6 +23,21 @@ pub enum NodeExecutionStatus {
     Running,
     Completed,
     Error(String),
+}
+
+/// Output mode for the PatternSearch workflow node
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SearchOutputMode {
+    /// Emit one output page per unique *source page* that contains at least one match.
+    /// This is the original behavior.
+    #[default]
+    AllMatchingPages,
+    /// Emit one output page per *individual match*, sized
+    /// `bytes_before + pattern_len + bytes_after`.  The match always starts at
+    /// offset `bytes_before` inside the page; regions that fall outside the
+    /// source are zero-padded so every page is the same size and every match
+    /// is aligned at the same position.
+    OnePagePerResult,
 }
 
 /// Available types of workflow processing nodes
@@ -41,6 +56,15 @@ pub enum WorkflowNodeKind {
         is_hex: bool,
         case_sensitive: bool,
         max_matches: usize,
+        /// How search results are mapped to output pages.
+        #[serde(default)]
+        output_mode: SearchOutputMode,
+        /// Bytes of source context to include *before* each match (Mode B only).
+        #[serde(default)]
+        bytes_before: u64,
+        /// Bytes of source context to include *after* each match (Mode B only).
+        #[serde(default)]
+        bytes_after: u64,
         #[serde(default)]
         results: Vec<crate::search::SearchResult>,
     },
@@ -113,6 +137,9 @@ impl WorkflowNode {
                 is_hex: false,
                 case_sensitive: true,
                 max_matches: 100,
+                output_mode: SearchOutputMode::AllMatchingPages,
+                bytes_before: 0,
+                bytes_after: 0,
                 results: Vec::new(),
             },
             status: NodeExecutionStatus::Idle,
@@ -725,23 +752,76 @@ impl WorkflowEditorState {
                     .ok_or_else(|| format!("OutputViewer node #{} has no input connected", target_node_id))?;
                 self.build_data_provider_internal(incoming.from_node, ancestors)
             }
-            WorkflowNodeKind::PatternSearch { search_pattern, results, .. } => {
+            WorkflowNodeKind::PatternSearch {
+                search_pattern,
+                is_hex,
+                case_sensitive,
+                results,
+                output_mode,
+                bytes_before,
+                bytes_after,
+                ..
+            } => {
                 let incoming = self.connections.iter()
                     .find(|c| c.to_node == target_node_id)
                     .ok_or_else(|| format!("Search node #{} has no input connected", target_node_id))?;
-                let upstream = self.build_data_provider_internal(incoming.from_node, ancestors)?;
+                let upstream_id = incoming.from_node;
 
-                let page_len = upstream.lock().get_metadata().page_length as u64;
-                let mut matching_pages: Vec<u64> = if page_len > 0 {
-                    results.iter().map(|r| r.byte_offset / page_len).collect()
-                } else {
-                    Vec::new()
-                };
-                matching_pages.sort_unstable();
-                matching_pages.dedup();
+                // Clone everything we need before the recursive call.
+                let search_pattern = search_pattern.clone();
+                let output_mode = *output_mode;
+                let bytes_before = *bytes_before;
+                let bytes_after = *bytes_after;
+                let is_hex = *is_hex;
+                let case_sensitive = *case_sensitive;
+                let results: Vec<crate::search::SearchResult> = results.clone();
 
-                let filtered = SearchFilteredDataProvider::new(upstream, matching_pages, search_pattern.clone());
-                Ok(Arc::new(Mutex::new(filtered)) as Arc<Mutex<dyn DumpDataProvider>>)
+                let upstream = self.build_data_provider_internal(upstream_id, ancestors)?;
+
+                match output_mode {
+                    SearchOutputMode::AllMatchingPages => {
+                        let page_len = upstream.lock().get_metadata().page_length as u64;
+                        let mut matching_pages: Vec<u64> = if page_len > 0 {
+                            results.iter().map(|r| r.byte_offset / page_len).collect()
+                        } else {
+                            Vec::new()
+                        };
+                        matching_pages.sort_unstable();
+                        matching_pages.dedup();
+
+                        let filtered = SearchFilteredDataProvider::new(upstream, matching_pages, search_pattern);
+                        Ok(Arc::new(Mutex::new(filtered)) as Arc<Mutex<dyn DumpDataProvider>>)
+                    }
+                    SearchOutputMode::OnePagePerResult => {
+                        let mode = if is_hex {
+                            crate::search::SearchMode::Hex
+                        } else {
+                            crate::search::SearchMode::Ascii
+                        };
+                        let pat_opts = crate::search::SearchOptions {
+                            pattern: search_pattern.clone(),
+                            mode,
+                            case_sensitive,
+                            max_matches: 1,
+                        };
+                        let pattern_len = crate::search::parse_pattern(&pat_opts)
+                            .map(|b| b.len() as u64)
+                            .unwrap_or(1);
+
+                        let match_offsets: Vec<u64> =
+                            results.iter().map(|r| r.byte_offset).collect();
+
+                        let ctx = SearchContextDataProvider::new(
+                            upstream,
+                            match_offsets,
+                            bytes_before,
+                            bytes_after,
+                            pattern_len,
+                            search_pattern,
+                        );
+                        Ok(Arc::new(Mutex::new(ctx)) as Arc<Mutex<dyn DumpDataProvider>>)
+                    }
+                }
             }
             WorkflowNodeKind::BlockArranger { .. } => {
                 let incoming = self.connections.iter()
@@ -1307,6 +1387,9 @@ impl WorkflowEditorState {
                             is_hex: false,
                             case_sensitive: true,
                             max_matches: 100,
+                            output_mode: SearchOutputMode::AllMatchingPages,
+                            bytes_before: 0,
+                            bytes_after: 0,
                             results: Vec::new(),
                         });
                         ui.close_menu();
@@ -1587,7 +1670,7 @@ impl WorkflowEditorState {
                                 ui.label("XOR Hex Pattern:");
                                 ui.text_edit_singleline(pattern_hex);
                             }
-                            WorkflowNodeKind::PatternSearch { search_pattern, is_hex, case_sensitive, max_matches, results } => {
+                            WorkflowNodeKind::PatternSearch { search_pattern, is_hex, case_sensitive, max_matches, output_mode, bytes_before, bytes_after, results } => {
                                 ui.label("Pattern:");
                                 ui.text_edit_singleline(search_pattern);
                                 ui.checkbox(is_hex, "Hex mode");
@@ -1596,6 +1679,34 @@ impl WorkflowEditorState {
                                     ui.label("Limit:");
                                     ui.add(egui::DragValue::new(max_matches));
                                 });
+
+                                ui.add_space(4.0);
+                                ui.separator();
+                                ui.label("Output mode:");
+                                ui.horizontal(|ui| {
+                                    ui.radio_value(output_mode, SearchOutputMode::AllMatchingPages, "Pages with matches");
+                                    ui.radio_value(output_mode, SearchOutputMode::OnePagePerResult, "One page per result");
+                                });
+
+                                if *output_mode == SearchOutputMode::OnePagePerResult {
+                                    ui.add_space(2.0);
+                                    ui.horizontal(|ui| {
+                                        ui.label("Bytes before:");
+                                        ui.add(
+                                            egui::DragValue::new(bytes_before)
+                                                .clamp_range(0u64..=1_000_000u64)
+                                                .speed(16.0),
+                                        );
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("Bytes after: ");
+                                        ui.add(
+                                            egui::DragValue::new(bytes_after)
+                                                .clamp_range(0u64..=1_000_000u64)
+                                                .speed(16.0),
+                                        );
+                                    });
+                                }
                                 ui.add_space(4.0);
                                 if let Some(&(prog_bytes, tot_bytes)) = active_search_info.get(&node_id) {
                                     let ratio = if tot_bytes > 0 {
@@ -1992,6 +2103,9 @@ mod tests {
             is_hex: true,
             case_sensitive: false,
             max_matches: 50,
+            output_mode: SearchOutputMode::AllMatchingPages,
+            bytes_before: 0,
+            bytes_after: 0,
             results: Vec::new(),
         });
 
