@@ -214,7 +214,7 @@ mod tests {
         let cache_path = temp_dir.path().join(".cache");
         
         let manager = CacheManager::new(&cache_path, "test.bin".to_string()).unwrap();
-        let coord = TileCoord::new(0, 5, 10);
+        let coord = TileCoord::new(1, 5, 10); // Level 0 tiles are never cached (streamed from dump)
         
         // Create a valid QOI signature (qoif magic bytes)
         let mut qoi_data = b"qoif".to_vec();
@@ -279,7 +279,7 @@ mod tests {
         let cache_path = temp_dir.path().join(".cache");
         
         let manager = CacheManager::new(&cache_path, "test.bin".to_string()).unwrap();
-        let coord = TileCoord::new(0, 5, 10);
+        let coord = TileCoord::new(1, 5, 10); // Level 0 tiles are never cached (streamed from dump)
         
         // Create valid QOI data
         let mut qoi_data = create_test_qoi_data();
@@ -307,10 +307,10 @@ mod tests {
         let mut qoi_data = create_test_qoi_data();
         qoi_data.extend_from_slice(&[0x00, 0x00, 0x00, 0x0D]);
         
-        // Save tiles at different levels
-        let coord1 = TileCoord::new(0, 5, 10);
-        let coord2 = TileCoord::new(1, 2, 5);
-        let coord3 = TileCoord::new(2, 1, 2);
+        // Save tiles at different levels (level 0 is never cached; start at 1)
+        let coord1 = TileCoord::new(1, 5, 10);
+        let coord2 = TileCoord::new(2, 2, 5);
+        let coord3 = TileCoord::new(3, 1, 2);
         
         manager.save_tile(&coord1, &qoi_data).unwrap();
         manager.save_tile(&coord2, &qoi_data).unwrap();
@@ -353,7 +353,7 @@ mod tests {
         let cache_path = temp_dir.path().join(".cache");
         
         let manager = CacheManager::new(&cache_path, "test.bin".to_string()).unwrap();
-        let coord = TileCoord::new(0, 5, 10);
+        let coord = TileCoord::new(1, 5, 10); // Level 0 tiles are never cached (streamed from dump)
         
         // Create valid QOI data
         let mut qoi_data = create_test_qoi_data();
@@ -387,8 +387,8 @@ mod tests {
         let mut qoi_data2 = create_test_qoi_data();
         qoi_data2.extend_from_slice(&[0x05, 0x06, 0x07, 0x08]);
         
-        let coord1 = TileCoord::new(0, 1, 2);
-        let coord2 = TileCoord::new(0, 3, 4);
+        let coord1 = TileCoord::new(1, 1, 2); // Level 0 tiles are never cached (streamed from dump)
+        let coord2 = TileCoord::new(1, 3, 4);
         
         // Save first tile
         manager.save_tile(&coord1, &qoi_data1).unwrap();
@@ -431,12 +431,12 @@ mod tests {
         let mut qoi_data = create_test_qoi_data();
         qoi_data.extend_from_slice(&[0x00, 0x00, 0x00, 0x0D]);
         
-        // Save multiple tiles at different levels
+        // Save multiple tiles at different levels (level 0 is never cached; start at 1)
         let tiles = vec![
-            TileCoord::new(0, 1, 2),
-            TileCoord::new(0, 3, 4),
-            TileCoord::new(1, 5, 6),
-            TileCoord::new(2, 7, 8),
+            TileCoord::new(1, 1, 2),
+            TileCoord::new(1, 3, 4),
+            TileCoord::new(2, 5, 6),
+            TileCoord::new(3, 7, 8),
         ];
         
         for coord in &tiles {
@@ -489,7 +489,7 @@ mod tests {
         let cache_path = temp_dir.path().join(".cache");
         
         let manager = CacheManager::new(&cache_path, "test.bin".to_string()).unwrap();
-        let coord = TileCoord::new(0, 5, 10);
+        let coord = TileCoord::new(1, 5, 10); // Level 0 tiles are never cached (streamed from dump)
         
         // Save QOI data that's too small (less than 8 bytes)
         let invalid_data = vec![0x89, 0x50, 0x4E];

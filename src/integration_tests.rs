@@ -208,10 +208,10 @@ mod tests {
         let metadata = file_loader.lock().get_metadata().clone();
         let task_queue = Arc::new(TaskQueue::new());
         
-        // Enqueue multiple tiles
+        // Enqueue multiple tiles (level 1 — level 0 tiles are never cached, streamed from dump)
         for i in 0..5 {
             task_queue.enqueue(TileTask::new(
-                TileCoord::new(0, i, 0),
+                TileCoord::new(1, i, 0),
                 Priority::Normal,
                 true, // is_high_resolution
             ));
@@ -242,7 +242,7 @@ mod tests {
         // Verify some tiles were generated and cached
         let mut cached_count = 0;
         for i in 0..5 {
-            if cache.tile_exists(&TileCoord::new(0, i, 0)) {
+            if cache.tile_exists(&TileCoord::new(1, i, 0)) {
                 cached_count += 1;
             }
         }
@@ -273,7 +273,8 @@ mod tests {
         
         // Step 4: Create viewport manager
         let mut viewport_manager = ViewportManager::new(metadata.clone(), task_queue.clone());
-        viewport_manager.update_viewport(0, 512.0, 384.0, 1024, 768);
+        // Use zoom level 1 — level 0 tiles are never cached (streamed from dump directly)
+        viewport_manager.update_viewport(1, 512.0, 384.0, 1024, 768);
         
         // Step 5: Enqueue visible tiles
         let visible_tiles = viewport_manager.get_visible_tiles();
@@ -298,7 +299,7 @@ mod tests {
         // Step 7: Wait for processing
         std::thread::sleep(std::time::Duration::from_secs(2));
         
-        // Step 8: Verify tiles were generated
+        // Step 8: Verify tiles were generated (check the same level-1 viewport tiles)
         let mut generated_count = 0;
         for tile in viewport_manager.get_visible_tiles() {
             if cache.tile_exists(&tile) {

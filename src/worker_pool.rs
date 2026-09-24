@@ -484,8 +484,8 @@ mod tests {
         let cache = CacheManager::new(temp_dir.path(), "test.bin".to_string()).unwrap();
         let (_temp_file, file_loader_arc, metadata) = create_test_file_loader();
 
-        // Enqueue a task
-        let coord = TileCoord::new(0, 0, 0);
+        // Enqueue a task (level 1 — level 0 tiles are never cached, streamed from dump)
+        let coord = TileCoord::new(1, 0, 0);
         let task = TileTask::new(coord, Priority::High, true);
         task_queue.enqueue(task);
 
@@ -519,11 +519,11 @@ mod tests {
         let cache = CacheManager::new(temp_dir.path(), "test.bin".to_string()).unwrap();
         let (_temp_file, file_loader_arc, metadata) = create_test_file_loader();
 
-        // Enqueue multiple tasks
+        // Enqueue multiple tasks (level 1 — level 0 tiles are never cached, streamed from dump)
         let coords = vec![
-            TileCoord::new(0, 0, 0),
-            TileCoord::new(0, 1, 0),
-            TileCoord::new(0, 0, 1),
+            TileCoord::new(1, 0, 0),
+            TileCoord::new(1, 1, 0),
+            TileCoord::new(1, 0, 1),
         ];
 
         for coord in &coords {
@@ -563,10 +563,10 @@ mod tests {
         let cache = CacheManager::new(temp_dir.path(), "test.bin".to_string()).unwrap();
         let (_temp_file, file_loader_arc, metadata) = create_test_file_loader();
 
-        // Enqueue tasks with different priorities
-        let low_coord = TileCoord::new(0, 0, 0);
-        let normal_coord = TileCoord::new(0, 1, 0);
-        let high_coord = TileCoord::new(0, 2, 0);
+        // Enqueue tasks with different priorities (level 1+ — level 0 is never cached)
+        let low_coord = TileCoord::new(1, 0, 0);
+        let normal_coord = TileCoord::new(1, 1, 0);
+        let high_coord = TileCoord::new(1, 2, 0);
 
         task_queue.enqueue(TileTask::new(low_coord, Priority::Low, true));
         task_queue.enqueue(TileTask::new(normal_coord, Priority::Normal, true));
@@ -633,8 +633,8 @@ mod tests {
         let cache = CacheManager::new(temp_dir.path(), "test.bin".to_string()).unwrap();
         let (_temp_file, file_loader_arc, metadata) = create_test_file_loader();
 
-        // Pre-cache a tile
-        let coord = TileCoord::new(0, 0, 0);
+        // Pre-cache a tile (level 1 — level 0 tiles are never cached, streamed from dump)
+        let coord = TileCoord::new(1, 0, 0);
         let png_data = vec![0x71, 0x6f, 0x69, 0x66, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x00];
         cache.save_tile(&coord, &png_data).unwrap();
 
