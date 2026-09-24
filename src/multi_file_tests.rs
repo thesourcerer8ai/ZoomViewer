@@ -22,7 +22,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_window_management_basic() {
         let mut window_manager = WindowManager::new();
         let dump_id1 = DumpId::new(1);
@@ -46,7 +45,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "known bug: tile_exists returns false after save — cache path mismatch"]
     fn test_cache_isolation_per_dump() {
         let temp_dir = TempDir::new().unwrap();
         let cache_base = temp_dir.path().join(".cache");
@@ -84,7 +83,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_state_preservation_viewport() {
         let temp_dir = TempDir::new().unwrap();
         let manager = MultiFileManager::new(temp_dir.path().join(".cache").to_string_lossy().to_string());
@@ -121,7 +119,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_multiple_dumps_independent_state() {
         let temp_dir = TempDir::new().unwrap();
         let manager = MultiFileManager::new(temp_dir.path().join(".cache").to_string_lossy().to_string());
@@ -166,7 +163,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_window_and_dump_coordination() {
         let temp_dir = TempDir::new().unwrap();
         let mut window_manager = WindowManager::new();
@@ -207,7 +203,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_close_dump_and_window() {
         let temp_dir = TempDir::new().unwrap();
         let mut window_manager = WindowManager::new();
@@ -242,7 +237,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_cache_isolation_different_filenames() {
         let temp_dir = TempDir::new().unwrap();
         let cache_base = temp_dir.path().join(".cache");
@@ -262,7 +256,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_multiple_windows_same_dump() {
         let mut window_manager = WindowManager::new();
         let dump_id = DumpId::new(1);
@@ -281,7 +274,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_dump_list_operations() {
         let temp_dir = TempDir::new().unwrap();
         let manager = MultiFileManager::new(temp_dir.path().join(".cache").to_string_lossy().to_string());
@@ -334,7 +326,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_window_list_operations() {
         let mut window_manager = WindowManager::new();
 
@@ -366,7 +357,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_per_file_worker_pool_isolation() {
         let temp_dir = TempDir::new().unwrap();
         let manager = MultiFileManager::new(temp_dir.path().join(".cache").to_string_lossy().to_string());
@@ -420,7 +410,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_per_file_cache_directory_structure() {
         let temp_dir = TempDir::new().unwrap();
         let cache_base = temp_dir.path().join(".cache");
@@ -448,7 +437,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_multi_file_viewport_independence() {
         let temp_dir = TempDir::new().unwrap();
         let manager = MultiFileManager::new(temp_dir.path().join(".cache").to_string_lossy().to_string());
@@ -504,7 +492,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_window_and_multi_file_workflow() {
         let temp_dir = TempDir::new().unwrap();
         let mut window_manager = WindowManager::new();

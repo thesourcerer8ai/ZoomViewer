@@ -510,7 +510,7 @@ mod tests {
     ///
     /// **Validates: Requirements 8.3, 8.4**
     #[test]
-    #[ignore]
+    #[ignore = "known bug: tile_exists returns false after save — cache path mismatch"]
     fn prop_cache_consistency() {
         proptest!(|(
             level in 0i32..10,

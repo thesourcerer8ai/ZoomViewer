@@ -1197,7 +1197,7 @@ mod property_tests {
     /// 3. Fragments cover exactly the bytes needed for the tile
     /// 4. Fragment boundaries align with the tile's pixel boundaries
     #[test]
-    #[ignore]
+    #[ignore = "known bug: fragments do not cover full tile height for some page/block combos"]
     fn prop_fragment_calculation() {
         proptest!(|(
             tile_x in 0u32..100,

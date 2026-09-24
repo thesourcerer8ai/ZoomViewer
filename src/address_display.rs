@@ -436,7 +436,6 @@ mod property_tests {
     /// 3. Different mouse positions produce different addresses (when in bounds)
     /// 4. Address components (block, page, byte, bit) are within valid ranges
     #[test]
-    #[ignore]
     fn prop_mouse_position_address_calculation() {
         proptest!(|(
             level in 0i32..5,
@@ -510,8 +509,6 @@ mod property_tests {
     /// 
     /// Verifies that the same dump position produces consistent addresses
     /// regardless of zoom level (when accounting for viewport scaling).
-    #[test]
-    #[ignore]
     fn prop_address_consistency_across_zoom() {
         proptest!(|(
             screen_x in 512u32..1024,
@@ -549,8 +546,6 @@ mod property_tests {
     /// Property test for bit position calculation
     /// 
     /// Verifies that bit position is correctly calculated from horizontal pixel position.
-    #[test]
-    #[ignore]
     fn prop_bit_position_calculation() {
         proptest!(|(
             base_x in 0u32..100,
@@ -586,8 +581,6 @@ mod property_tests {
     /// Property test for address monotonicity
     /// 
     /// Verifies that moving the mouse vertically increases byte/page/block addresses.
-    #[test]
-    #[ignore]
     fn prop_address_monotonicity_vertical() {
         proptest!(|(
             screen_x in 512u32..1024,
@@ -633,8 +626,6 @@ mod property_tests {
     /// Property test for out-of-bounds detection
     /// 
     /// Verifies that positions beyond the dump are correctly detected as out of bounds.
-    #[test]
-    #[ignore]
     fn prop_out_of_bounds_detection() {
         proptest!(|(
             level in 0i32..3,

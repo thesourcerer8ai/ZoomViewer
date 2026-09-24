@@ -4,5 +4,4 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc 7504277920e95e136ed171e0a8991588214c2ce1a04aad72035b0fe586bb11de # shrinks to tile_x = 0, tile_y = 0, page_length = 512, block_size = 64
-cc 6c311bc25736800127e22e6e2cc8421abe82e3002161298f927f2effe19667e3 # shrinks to tile_x = 0, tile_y = 96, page_length = 4068, block_size = 64
+cc 214723f0c267ee02e95fb918395f8ec0e036e2d82fe7bf7b0e41e3cc6f99747d # shrinks to level = 0, x = 0, y = 0, data_size = 8

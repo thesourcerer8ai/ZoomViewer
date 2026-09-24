@@ -1065,7 +1065,6 @@ mod property_tests {
     ///
     /// **Validates: Requirements 5.1, 5.2, 5.3**
     #[test]
-    #[ignore]
     fn prop_pyramid_level_organization() {
         proptest!(|(
             size in 1_000_000u64..100_000_000u64,
@@ -1122,7 +1121,6 @@ mod property_tests {
     ///
     /// **Validates: Requirements 5.4**
     #[test]
-    #[ignore]
     fn prop_pyramid_termination() {
         proptest!(|(
             size in 1_000_000u64..100_000_000u64,
@@ -1162,7 +1160,6 @@ mod property_tests {
     ///
     /// **Validates: Requirements 5.5**
     #[test]
-    #[ignore]
     fn prop_pyramid_composition_strategy() {
         proptest!(|(
             size in 1_000_000u64..100_000_000u64,
@@ -1202,7 +1199,6 @@ mod property_tests {
     ///
     /// **Validates: Requirements 5.6**
     #[test]
-    #[ignore]
     fn prop_consistent_tile_dimensions() {
         proptest!(|(
             size in 1_000_000u64..100_000_000u64,
@@ -1232,7 +1228,6 @@ mod property_tests {
     /// Property: Downscale produces half dimensions
     /// For any pixel buffer, downscaling SHALL produce a buffer with half width and height.
     #[test]
-    #[ignore]
     fn prop_downscale_dimensions() {
         proptest!(|(
             width in 4u32..512u32,

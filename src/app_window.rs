@@ -1767,7 +1767,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "FLTK requires the UI thread; passes alone but races with parallel tests"]
     fn test_app_window_creation() {
         let (_temp_file, file_loader) = create_test_file_loader();
         let metadata = file_loader.get_metadata().clone();
@@ -1783,7 +1783,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "FLTK requires the UI thread; passes alone but races with parallel tests"]
     fn test_app_window_mouse_move() {
         let (_temp_file, file_loader) = create_test_file_loader();
         let metadata = file_loader.get_metadata().clone();
@@ -1800,7 +1800,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "known bug: viewport width is 0 at test time (FLTK window not shown)"]
     fn test_app_window_initial_viewport() {
         let (_temp_file, file_loader) = create_test_file_loader();
         let metadata = file_loader.get_metadata().clone();

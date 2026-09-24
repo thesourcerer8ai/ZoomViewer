@@ -595,7 +595,6 @@ mod property_tests {
     /// For any valid tile coordinate where x = 0 (byte_x = 0), converting to byte offset and back SHALL produce an equivalent coordinate.
     /// Note: The round-trip property only holds for x = 0 because the offset only encodes the vertical position (byte_y), not the horizontal position (byte_x).
     #[test]
-    #[ignore]
     fn prop_coordinate_round_trip() {
         proptest!(|(
             level in 0i32..10,

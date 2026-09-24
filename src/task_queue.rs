@@ -467,7 +467,6 @@ mod property_tests {
     ///
     /// **Validates: Requirements 9.1, 9.6**
     #[test]
-    #[ignore]
     fn prop_priority_levels_and_ordering() {
         proptest!(|(
             high_count in 0usize..20,
@@ -534,7 +533,7 @@ mod property_tests {
     ///
     /// **Validates: Requirements 9.7**
     #[test]
-    #[ignore]
+    #[ignore = "slow: spawns up to 10 threads x 50 tasks, takes >10s"]
     fn prop_thread_safe_concurrent_access() {
         proptest!(|(
             num_threads in 2usize..10,
@@ -582,7 +581,6 @@ mod property_tests {
     /// Property: Enqueue and dequeue consistency
     /// Verify that all enqueued tasks can be dequeued
     #[test]
-    #[ignore]
     fn prop_enqueue_dequeue_consistency() {
         proptest!(|(
             tasks in prop::collection::vec(
@@ -617,7 +615,6 @@ mod property_tests {
     /// Property: Update priority maintains task
     /// Verify that updating priority doesn't lose the task
     #[test]
-    #[ignore]
     fn prop_update_priority_maintains_task() {
         proptest!(|(
             coords in prop::collection::vec(
@@ -661,7 +658,6 @@ mod property_tests {
     /// Property: Remove maintains queue integrity
     /// Verify that removing tasks doesn't corrupt the queue
     #[test]
-    #[ignore]
     fn prop_remove_maintains_integrity() {
         proptest!(|(
             all_coords in prop::collection::vec(

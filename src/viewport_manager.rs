@@ -471,7 +471,6 @@ mod property_tests {
     /// 2. No tiles outside viewport are marked visible
     /// 3. Visible tiles cover the entire viewport area
     #[test]
-    #[ignore]
     fn prop_viewport_tile_identification() {
         proptest!(|(
             level in 0i32..5,
@@ -563,7 +562,6 @@ mod property_tests {
     /// Verifies that adjacent tiles are correctly identified and do not overlap
     /// with visible tiles.
     #[test]
-    #[ignore]
     fn prop_adjacent_tiles_non_overlapping() {
         proptest!(|(
             level in 0i32..5,
@@ -612,7 +610,7 @@ mod property_tests {
     /// 
     /// Verifies that priority updates are correctly applied to the task queue
     #[test]
-    #[ignore]
+    #[ignore = "known bug: no visible/adjacent tiles found for level=2 near dump boundary"]
     fn prop_priority_updates() {
         proptest!(|(
             level in 0i32..3,

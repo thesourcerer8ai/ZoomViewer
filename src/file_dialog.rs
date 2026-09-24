@@ -341,23 +341,36 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires user input, cannot run in automated tests
     fn test_metadata_caching_integration() {
+        // Tests that open_file returns cached metadata without blocking on stdin.
+        // The stdin-blocking path (no cache) cannot be tested automatically and
+        // is exercised manually at startup when no cache exists.
         let temp_dir = TempDir::new().unwrap();
         let cache_dir = temp_dir.path().join("cache");
         std::fs::create_dir(&cache_dir).unwrap();
 
+        let file_path = create_test_file(&temp_dir, 1024);
+        let file_size = std::fs::metadata(&file_path).unwrap().len();
+        let filename = file_path.file_name().unwrap().to_str().unwrap().to_string();
+
+        // Pre-populate the cache so open_file never needs to prompt stdin.
+        let meta_mgr = crate::MetadataManager::new(&cache_dir, filename).unwrap();
+        let file_meta = FileMetadata::new(
+            file_path.to_string_lossy().to_string(),
+            file_size,
+            2048,
+            128,
+        );
+        meta_mgr.save_metadata(&file_meta).unwrap();
+
+        // Now open_file should find the cache and return immediately.
         let dialog = FileDialog::new(&cache_dir);
-
-        // Create a test file (60 GB - within valid range)
-        let file_path = create_test_file(&temp_dir, 60 * 1024 * 1024 * 1024);
-
-        // First open should fail because we can't prompt for input in tests
-        // But we can verify the file validation works
         let result = dialog.open_file(&file_path);
-        // This will fail because we can't provide stdin input in tests
-        // But the important thing is that it validates the file correctly
-        assert!(result.is_err() || result.is_ok());
+        assert!(result.is_ok(), "Should return cached metadata: {:?}", result);
+
+        let metadata = result.unwrap();
+        assert_eq!(metadata.page_length, 2048);
+        assert_eq!(metadata.block_size, 128);
     }
 
     #[test]
