@@ -2354,6 +2354,7 @@ mod tests {
             pending_xor_offer: None,
             active_searches: Arc::new(Mutex::new(HashMap::new())),
             active_fuse_mounts: Arc::new(Mutex::new(HashMap::new())),
+            node_rects: HashMap::new(),
         };
 
         // Build data provider for OutputViewer node 4
@@ -2389,6 +2390,7 @@ mod tests {
             pending_xor_offer: None,
             active_searches: Arc::new(Mutex::new(HashMap::new())),
             active_fuse_mounts: Arc::new(Mutex::new(HashMap::new())),
+            node_rects: HashMap::new(),
         };
 
         match state.build_data_provider(1) {
@@ -2440,6 +2442,7 @@ mod tests {
             pending_xor_offer: None,
             active_searches: Arc::new(Mutex::new(HashMap::new())),
             active_fuse_mounts: Arc::new(Mutex::new(HashMap::new())),
+            node_rects: HashMap::new(),
         };
 
         let exported = state.export_node_to_file(2).expect("Export should succeed");
@@ -2538,6 +2541,7 @@ mod tests {
             pending_xor_offer: None,
             active_searches: Arc::new(Mutex::new(HashMap::new())),
             active_fuse_mounts: Arc::new(Mutex::new(HashMap::new())),
+            node_rects: HashMap::new(),
         };
 
         // Insert XOR
@@ -2628,6 +2632,7 @@ mod tests {
             pending_xor_offer: None,
             active_searches: Arc::new(Mutex::new(HashMap::new())),
             active_fuse_mounts: Arc::new(Mutex::new(HashMap::new())),
+            node_rects: HashMap::new(),
         };
 
         let (main_p, raw_p) = state_simple.build_hex_providers().unwrap();
@@ -2733,6 +2738,7 @@ mod tests {
             pending_xor_offer: None,
             active_searches: Arc::new(Mutex::new(HashMap::new())),
             active_fuse_mounts: Arc::new(Mutex::new(HashMap::new())),
+            node_rects: HashMap::new(),
         };
 
         // 1. Before executing search: filtered view has 0 matching pages (suppresses all pages)
