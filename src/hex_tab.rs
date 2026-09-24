@@ -977,7 +977,7 @@ impl HexTabState {
                         );
 
                         // 2. Hex Bytes (if HexAndAscii or HexOnly)
-                        let mut ascii_chars = Vec::with_capacity(bytes_per_row);
+                        let mut ascii_chars: Vec<(char, bool)> = Vec::with_capacity(bytes_per_row);
 
                         if self.display_mode != HexDisplayMode::AsciiOnly {
                             for col_idx in 0..bytes_per_row {
@@ -1057,18 +1057,25 @@ impl HexTabState {
                                 } else {
                                     '.'
                                 };
-                                ascii_chars.push(ch);
+                                ascii_chars.push((ch, is_search));
                             }
                         } else {
-                            // ASCII Only mode
+                            // ASCII Only mode — track search state per byte
                             for col_idx in 0..bytes_per_row {
+                                let abs_col = self.col_offset_in_page + col_idx as u64;
+                                let byte_linear_offset = page_num * page_length + abs_col;
                                 let act_b = active_bytes.get(col_idx).copied().unwrap_or(0);
                                 let ch = if act_b >= 32 && act_b <= 126 {
                                     act_b as char
                                 } else {
                                     '.'
                                 };
-                                ascii_chars.push(ch);
+                                let is_search = search_pattern_len > 0
+                                    && search_results.iter().any(|r| {
+                                        byte_linear_offset >= r.byte_offset
+                                            && byte_linear_offset < r.byte_offset + search_pattern_len as u64
+                                    });
+                                ascii_chars.push((ch, is_search));
                             }
                         }
 
@@ -1077,12 +1084,29 @@ impl HexTabState {
                             if self.display_mode == HexDisplayMode::HexAndAscii {
                                 ui.label(egui::RichText::new(" | ").font(mono_font.clone()).color(Color32::DARK_GRAY));
                             }
-                            let ascii_str: String = ascii_chars.into_iter().collect();
-                            ui.label(
-                                egui::RichText::new(ascii_str)
-                                    .font(mono_font.clone())
-                                    .color(col_normal),
-                            );
+
+                            // If any character in this row is a search match, render
+                            // per-character so matches get highlighted individually.
+                            // Otherwise use a single label for speed.
+                            let any_match = ascii_chars.iter().any(|(_, m)| *m);
+                            if any_match {
+                                for (ch, is_match) in &ascii_chars {
+                                    let mut rich = egui::RichText::new(ch.to_string())
+                                        .font(mono_font.clone())
+                                        .color(if *is_match { Color32::WHITE } else { col_normal });
+                                    if *is_match {
+                                        rich = rich.background_color(col_search_bg);
+                                    }
+                                    ui.label(rich);
+                                }
+                            } else {
+                                let ascii_str: String = ascii_chars.iter().map(|(c, _)| c).collect();
+                                ui.label(
+                                    egui::RichText::new(ascii_str)
+                                        .font(mono_font.clone())
+                                        .color(col_normal),
+                                );
+                            }
                         }
                     });
                 }
