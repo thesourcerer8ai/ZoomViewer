@@ -27,6 +27,7 @@ pub mod viewport_renderer;
 pub mod app_window;
 pub mod multi_file_manager;
 pub mod window_manager;
+pub mod window_state;
 
 #[cfg(test)]
 mod multi_file_tests;
@@ -57,6 +58,7 @@ pub use viewport_renderer::ViewportRenderer;
 pub use app_window::AppWindow;
 pub use multi_file_manager::{MultiFileManager, DumpId, DumpFileState};
 pub use window_manager::{WindowManager, WindowId, WindowState};
+pub use window_state::{WindowState as WindowGeometry, WindowStateManager};
 pub mod workflow;
 pub mod data_provider;
 pub mod search;

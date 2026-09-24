@@ -2,6 +2,7 @@
 
 use crate::{
     workflow::WorkflowEditorState,
+    window_state::{WindowState as WindowGeometry, WindowStateManager},
     AddressDisplay, CacheManager, DumpDataProvider, FileMetadata, HexTabState, PanController,
     PageStructureTabState, SearchTabState, TaskQueue, TileCoord, Viewport, ViewportManager,
     ViewportRenderer, ZoomController,
@@ -114,40 +115,58 @@ impl AppWindow {
             .unwrap_or("Unknown")
             .to_string();
         
+        // Load persisted window geometry (XDG state dir).
+        let win_state_mgr = WindowStateManager::new();
+        let saved_win = win_state_mgr.load().unwrap_or_else(|e| {
+            log::warn!("Could not load window state: {} — using defaults", e);
+            WindowGeometry::default()
+        });
+        log::info!(
+            "Restoring window state: {}x{} at ({},{}) fullscreen={}",
+            saved_win.width, saved_win.height, saved_win.x, saved_win.y, saved_win.fullscreen
+        );
+
         let mut window = Window::default()
-            .with_size(1024, 768)
+            .with_size(saved_win.width, saved_win.height)
+            .with_pos(saved_win.x, saved_win.y)
             .with_label(&format!("NAND Dump Viewer - {}", filename));
 
-        let tabs = Tabs::default().with_size(1024, 768).with_pos(0, 0);
+        let tabs = Tabs::default().with_size(saved_win.width, saved_win.height).with_pos(0, 0);
+
+        // Layout constants derived from the restored window size.
+        let tab_strip_h = 30;
+        let status_bar_h = 60;
+        let tab_content_h = saved_win.height - tab_strip_h;
+        let viewport_h    = tab_content_h - status_bar_h;
 
         // --- TAB 1: NAND Dump Viewer ---
         let mut tab_viewer = Group::default()
-            .with_size(1024, 738)
-            .with_pos(0, 30)
+            .with_size(saved_win.width, tab_content_h)
+            .with_pos(0, tab_strip_h)
             .with_label("NAND Viewer\t");
 
         let mut viewport_frame = Frame::default()
-            .with_size(1024, 648)
-            .with_pos(0, 30);
+            .with_size(saved_win.width, viewport_h)
+            .with_pos(0, tab_strip_h);
         viewport_frame.set_frame(fltk::enums::FrameType::FlatBox);
 
         // Create status bar
         let mut status_bar = TextEditor::default()
-            .with_size(1024, 60)
-            .with_pos(0, 678);
+            .with_size(saved_win.width, status_bar_h)
+            .with_pos(0, tab_strip_h + viewport_h);
         status_bar.set_buffer(fltk::text::TextBuffer::default());
 
         tab_viewer.end();
 
         // --- TAB 2: Workflow Editor (embedded egui GL Canvas) ---
         let tab_workflow = Group::default()
-            .with_size(1024, 738)
-            .with_pos(0, 30)
+            .with_size(saved_win.width, tab_content_h)
+            .with_pos(0, tab_strip_h)
             .with_label("Workflow Editor\t");
 
         let mut gl_win = GlWindow::default()
-            .with_size(1024, 738)
-            .with_pos(0, 30);
+            .with_size(saved_win.width, tab_content_h)
+            .with_pos(0, tab_strip_h);
         gl_win.set_mode(fltk::enums::Mode::Opengl3);
         gl_win.end();
 
@@ -155,13 +174,13 @@ impl AppWindow {
 
         // --- TAB 3: Search (embedded egui GL Canvas) ---
         let tab_search = Group::default()
-            .with_size(1024, 738)
-            .with_pos(0, 30)
+            .with_size(saved_win.width, tab_content_h)
+            .with_pos(0, tab_strip_h)
             .with_label("Search\t");
 
         let mut gl_search = GlWindow::default()
-            .with_size(1024, 738)
-            .with_pos(0, 30);
+            .with_size(saved_win.width, tab_content_h)
+            .with_pos(0, tab_strip_h);
         gl_search.set_mode(fltk::enums::Mode::Opengl3);
         gl_search.end();
 
@@ -169,13 +188,13 @@ impl AppWindow {
 
         // --- TAB 4: Hex Viewer (embedded egui GL Canvas) ---
         let tab_hex = Group::default()
-            .with_size(1024, 738)
-            .with_pos(0, 30)
+            .with_size(saved_win.width, tab_content_h)
+            .with_pos(0, tab_strip_h)
             .with_label("Hex\t");
 
         let mut gl_hex = GlWindow::default()
-            .with_size(1024, 738)
-            .with_pos(0, 30);
+            .with_size(saved_win.width, tab_content_h)
+            .with_pos(0, tab_strip_h);
         gl_hex.set_mode(fltk::enums::Mode::Opengl3);
         gl_hex.end();
 
@@ -183,13 +202,13 @@ impl AppWindow {
 
         // --- TAB 5: Page Structure Editor (embedded egui GL Canvas) ---
         let tab_page_structure = Group::default()
-            .with_size(1024, 738)
-            .with_pos(0, 30)
+            .with_size(saved_win.width, tab_content_h)
+            .with_pos(0, tab_strip_h)
             .with_label("Page Structure\t");
 
         let mut gl_page_structure = GlWindow::default()
-            .with_size(1024, 738)
-            .with_pos(0, 30);
+            .with_size(saved_win.width, tab_content_h)
+            .with_pos(0, tab_strip_h);
         gl_page_structure.set_mode(fltk::enums::Mode::Opengl3);
         gl_page_structure.end();
 
@@ -206,6 +225,37 @@ impl AppWindow {
         window.resizable(&tabs);
         window.end();
         window.show();
+
+        // Restore fullscreen state after the window is shown.
+        if saved_win.fullscreen {
+            window.fullscreen(true);
+        }
+
+        // Save window geometry when the user closes the window via the WM (X button).
+        // This must be set via set_callback — on X11/Linux, FLTK intercepts the
+        // WM_DELETE_WINDOW protocol here, *before* dispatching Event::Close through
+        // handle(), so without this callback the close event never reaches handle().
+        {
+            let mut win_cb = window.clone();
+            win_cb.set_callback(move |w| {
+                let state = crate::window_state::WindowState {
+                    width: w.w(),
+                    height: w.h(),
+                    x: w.x(),
+                    y: w.y(),
+                    fullscreen: w.fullscreen_active(),
+                };
+                if let Err(e) = crate::window_state::WindowStateManager::new().save(&state) {
+                    log::warn!("Failed to save window state: {}", e);
+                } else {
+                    log::info!(
+                        "Saved window state: {}x{} at ({},{}) fullscreen={}",
+                        state.width, state.height, state.x, state.y, state.fullscreen
+                    );
+                }
+                fltk::app::quit();
+            });
+        }
 
         // Setup fltk-egui for workflow tab with lazy initialization on first draw
         let workflow_state = Arc::new(Mutex::new(
@@ -1369,6 +1419,24 @@ impl AppWindow {
                         false
                     }
                     fltk::enums::Event::Close => {
+                        // Capture current window geometry before quitting.
+                        // When fullscreen, win.w()/h() are the screen dimensions —
+                        // we still record them so restoring fullscreen=true works correctly.
+                        let state = WindowGeometry {
+                            width: win.w(),
+                            height: win.h(),
+                            x: win.x(),
+                            y: win.y(),
+                            fullscreen: win.fullscreen_active(),
+                        };
+                        if let Err(e) = WindowStateManager::new().save(&state) {
+                            log::warn!("Failed to save window state: {}", e);
+                        } else {
+                            log::info!(
+                                "Saved window state: {}x{} at ({},{}) fullscreen={}",
+                                state.width, state.height, state.x, state.y, state.fullscreen
+                            );
+                        }
                         fltk::app::quit();
                         true
                     }
