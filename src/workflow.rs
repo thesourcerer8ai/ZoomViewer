@@ -60,6 +60,7 @@ pub enum WorkflowNodeKind {
         mount_path: String,
         auto_mount: bool,
     },
+    Concatenate,
 }
 
 /// Data structure for a node in the workflow graph
@@ -178,6 +179,17 @@ impl WorkflowNode {
         }
     }
 
+    pub fn new_concatenate(id: usize, pos: [f32; 2]) -> Self {
+        Self {
+            id,
+            name: "Concatenate".to_string(),
+            pos,
+            kind: WorkflowNodeKind::Concatenate,
+            status: NodeExecutionStatus::Idle,
+            output_log: "No execution history".to_string(),
+        }
+    }
+
     pub fn execute(&mut self) {
         self.status = NodeExecutionStatus::Running;
         let start_time = std::time::Instant::now();
@@ -246,6 +258,10 @@ impl WorkflowNode {
                     "FUSE Mount node ready!\nMount target: {}\nAuto-mount: {}",
                     mount_path, auto_mount
                 );
+            }
+            WorkflowNodeKind::Concatenate => {
+                self.status = NodeExecutionStatus::Completed;
+                self.output_log = "Concatenate node ready.\nConnect 2 or more inputs.".to_string();
             }
         }
     }
@@ -605,6 +621,7 @@ impl WorkflowEditorState {
             WorkflowNodeKind::OutputViewer { .. } => WorkflowNode::new_output(id, pos, "Viewer"),
             WorkflowNodeKind::FileExport { .. } => WorkflowNode::new_export(id, pos),
             WorkflowNodeKind::FuseMount { .. } => WorkflowNode::new_fuse_mount(id, pos),
+            WorkflowNodeKind::Concatenate => WorkflowNode::new_concatenate(id, pos),
         };
 
         self.nodes.push(node);
@@ -655,28 +672,31 @@ impl WorkflowEditorState {
 
     /// Recursively builds a dynamic `DumpDataProvider` pipeline rooted at `target_node_id`.
     pub fn build_data_provider(&self, target_node_id: usize) -> Result<Arc<Mutex<dyn DumpDataProvider>>, String> {
-        let mut visited = HashSet::new();
-        self.build_data_provider_internal(target_node_id, &mut visited)
+        // `ancestors` tracks the nodes on the *current* path from the root down to here.
+        // This correctly detects cycles (A→B→A) while allowing the same node to be
+        // reached via independent branches (diamond-shaped DAGs like A→B→D and A→C→D).
+        let mut ancestors = HashSet::new();
+        self.build_data_provider_internal(target_node_id, &mut ancestors)
     }
 
     fn build_data_provider_internal(
         &self,
         target_node_id: usize,
-        visited: &mut HashSet<usize>,
+        ancestors: &mut HashSet<usize>,
     ) -> Result<Arc<Mutex<dyn DumpDataProvider>>, String> {
-        if !visited.insert(target_node_id) {
+        if !ancestors.insert(target_node_id) {
             return Err(format!("Cycle detected in workflow graph at node #{}", target_node_id));
         }
 
         let node = self.nodes.iter().find(|n| n.id == target_node_id)
             .ok_or_else(|| format!("Node #{} not found in workflow", target_node_id))?;
 
-        match &node.kind {
+        let result = match &node.kind {
             WorkflowNodeKind::Input { file_path, page_length, block_size } => {
                 let loader = FileLoader::new(file_path, *page_length, *block_size)
                     .map_err(|e| format!("Failed to open input file '{}': {}", file_path, e))?;
                 let provider = FileDataProvider::new(loader);
-                Ok(Arc::new(Mutex::new(provider)))
+                Ok(Arc::new(Mutex::new(provider)) as Arc<Mutex<dyn DumpDataProvider>>)
             }
             WorkflowNodeKind::XorTransform { pattern_hex } => {
                 let incoming: Vec<usize> = self.connections.iter()
@@ -690,26 +710,26 @@ impl WorkflowEditorState {
                     return Err(format!("XorTransform node #{} has no input connections", target_node_id));
                 }
 
-                let primary = self.build_data_provider_internal(incoming[0], visited)?;
+                let primary = self.build_data_provider_internal(incoming[0], ancestors)?;
                 let mut secondaries = Vec::new();
                 for &from_id in incoming.iter().skip(1).take(2) {
-                    secondaries.push(self.build_data_provider_internal(from_id, visited)?);
+                    secondaries.push(self.build_data_provider_internal(from_id, ancestors)?);
                 }
 
                 let xor_provider = XorDataProvider::new(primary, secondaries, static_pattern);
-                Ok(Arc::new(Mutex::new(xor_provider)))
+                Ok(Arc::new(Mutex::new(xor_provider)) as Arc<Mutex<dyn DumpDataProvider>>)
             }
             WorkflowNodeKind::OutputViewer { .. } => {
                 let incoming = self.connections.iter()
                     .find(|c| c.to_node == target_node_id)
                     .ok_or_else(|| format!("OutputViewer node #{} has no input connected", target_node_id))?;
-                self.build_data_provider_internal(incoming.from_node, visited)
+                self.build_data_provider_internal(incoming.from_node, ancestors)
             }
             WorkflowNodeKind::PatternSearch { search_pattern, results, .. } => {
                 let incoming = self.connections.iter()
                     .find(|c| c.to_node == target_node_id)
                     .ok_or_else(|| format!("Search node #{} has no input connected", target_node_id))?;
-                let upstream = self.build_data_provider_internal(incoming.from_node, visited)?;
+                let upstream = self.build_data_provider_internal(incoming.from_node, ancestors)?;
 
                 let page_len = upstream.lock().get_metadata().page_length as u64;
                 let mut matching_pages: Vec<u64> = if page_len > 0 {
@@ -721,27 +741,50 @@ impl WorkflowEditorState {
                 matching_pages.dedup();
 
                 let filtered = SearchFilteredDataProvider::new(upstream, matching_pages, search_pattern.clone());
-                Ok(Arc::new(Mutex::new(filtered)))
+                Ok(Arc::new(Mutex::new(filtered)) as Arc<Mutex<dyn DumpDataProvider>>)
             }
             WorkflowNodeKind::BlockArranger { .. } => {
                 let incoming = self.connections.iter()
                     .find(|c| c.to_node == target_node_id)
                     .ok_or_else(|| format!("BlockArranger node #{} has no input connected", target_node_id))?;
-                self.build_data_provider_internal(incoming.from_node, visited)
+                self.build_data_provider_internal(incoming.from_node, ancestors)
             }
             WorkflowNodeKind::FileExport { .. } => {
                 let incoming = self.connections.iter()
                     .find(|c| c.to_node == target_node_id)
                     .ok_or_else(|| format!("FileExport node #{} has no input connected", target_node_id))?;
-                self.build_data_provider_internal(incoming.from_node, visited)
+                self.build_data_provider_internal(incoming.from_node, ancestors)
             }
             WorkflowNodeKind::FuseMount { .. } => {
                 let incoming = self.connections.iter()
                     .find(|c| c.to_node == target_node_id)
                     .ok_or_else(|| format!("FuseMount node #{} has no input connected", target_node_id))?;
-                self.build_data_provider_internal(incoming.from_node, visited)
+                self.build_data_provider_internal(incoming.from_node, ancestors)
             }
-        }
+            WorkflowNodeKind::Concatenate => {
+                let incoming: Vec<usize> = self.connections.iter()
+                    .filter(|c| c.to_node == target_node_id)
+                    .map(|c| c.from_node)
+                    .collect();
+
+                if incoming.is_empty() {
+                    return Err(format!("Concatenate node #{} has no input connections", target_node_id));
+                }
+
+                let mut providers = Vec::with_capacity(incoming.len());
+                for &from_id in &incoming {
+                    providers.push(self.build_data_provider_internal(from_id, ancestors)?);
+                }
+
+                let concat_provider = crate::data_provider::ConcatenateDataProvider::new(providers);
+                Ok(Arc::new(Mutex::new(concat_provider)) as Arc<Mutex<dyn DumpDataProvider>>)
+            }
+        };
+
+        // Backtrack: remove this node from the ancestor path so sibling branches
+        // (diamond-shaped DAGs) can visit the same node without a false cycle error.
+        ancestors.remove(&target_node_id);
+        result
     }
 
     /// Build data provider for the active OutputViewer node
@@ -1299,6 +1342,10 @@ impl WorkflowEditorState {
                         });
                         ui.close_menu();
                     }
+                    if ui.button("Concatenate").clicked() {
+                        self.add_node(WorkflowNodeKind::Concatenate);
+                        ui.close_menu();
+                    }
                 });
             });
 
@@ -1629,6 +1676,33 @@ impl WorkflowEditorState {
                                         action_mount_fuse = Some(node_id);
                                     }
                                 }
+                            }
+                            WorkflowNodeKind::Concatenate => {
+                                // Count how many inputs are connected to this node
+                                let input_count = self.connections.iter()
+                                    .filter(|c| c.to_node == node_id)
+                                    .count();
+                                if input_count == 0 {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(255, 180, 60),
+                                        "⚠ No inputs connected yet.",
+                                    );
+                                    ui.label("Connect 2 or more nodes using 'Out ➔' / '📥 In'.");
+                                } else if input_count == 1 {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(255, 200, 80),
+                                        format!("⚠ {} input connected — need at least 2.", input_count),
+                                    );
+                                } else {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(100, 230, 140),
+                                        format!("✔ {} inputs connected", input_count),
+                                    );
+                                }
+                                ui.add_space(2.0);
+                                ui.label(egui::RichText::new(
+                                    "Inputs are concatenated in connection order.\nShorter inputs are zero-padded to the longest."
+                                ).italics().weak().size(11.0));
                             }
                         }
 

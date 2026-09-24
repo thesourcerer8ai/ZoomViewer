@@ -291,6 +291,147 @@ impl DumpDataProvider for XorDataProvider {
     }
 }
 
+/// A provider that concatenates 2 or more input providers sequentially.
+///
+/// Each input is zero-padded to the length of the longest input (measured in pages),
+/// so the final stream is `max_pages * page_length * num_inputs` bytes.
+/// The `page_length` and `block_size` are taken from the first (primary) input.
+/// If inputs have different `page_length` values, the primary's value is used and
+/// shorter-paged inputs are read at their native granularity within the common page window.
+pub struct ConcatenateDataProvider {
+    inputs: Vec<Arc<Mutex<dyn DumpDataProvider>>>,
+    /// Individual sizes of each input (used for zero-padding)
+    input_sizes: Vec<u64>,
+    /// The maximum number of pages across all inputs (used for padding alignment)
+    max_pages: u64,
+    metadata: FileMetadata,
+    identity: String,
+}
+
+impl ConcatenateDataProvider {
+    /// Create a new ConcatenateDataProvider from at least one input.
+    ///
+    /// # Arguments
+    /// * `inputs` – Two or more providers to concatenate. The first provider's
+    ///              `page_length` and `block_size` are used for the combined metadata.
+    ///
+    /// # Panics
+    /// Panics if `inputs` is empty.
+    pub fn new(inputs: Vec<Arc<Mutex<dyn DumpDataProvider>>>) -> Self {
+        assert!(!inputs.is_empty(), "ConcatenateDataProvider requires at least one input");
+
+        let primary_meta = inputs[0].lock().get_metadata();
+        let page_length = primary_meta.page_length;
+        let block_size = primary_meta.block_size;
+
+        // Collect per-input sizes and compute max page count
+        let input_sizes: Vec<u64> = inputs.iter()
+            .map(|p| p.lock().get_metadata().size)
+            .collect();
+
+        let max_pages: u64 = input_sizes.iter()
+            .map(|&sz| (sz + page_length as u64 - 1) / page_length as u64)
+            .max()
+            .unwrap_or(0);
+
+        // Total concatenated size = each input padded to max_pages * page_length
+        let padded_input_size = max_pages * page_length as u64;
+        let total_size = padded_input_size * inputs.len() as u64;
+
+        // Build a stable cache identity
+        let mut hasher = DefaultHasher::new();
+        "CONCATENATE_NODE".hash(&mut hasher);
+        for inp in &inputs {
+            inp.lock().cache_identity().hash(&mut hasher);
+        }
+        page_length.hash(&mut hasher);
+        block_size.hash(&mut hasher);
+        total_size.hash(&mut hasher);
+        let identity = format!("concat_{:016x}", hasher.finish());
+
+        let metadata = FileMetadata::new(
+            format!("concat://{}", identity),
+            total_size,
+            page_length,
+            block_size,
+        );
+
+        Self {
+            inputs,
+            input_sizes,
+            max_pages,
+            metadata,
+            identity,
+        }
+    }
+}
+
+impl DumpDataProvider for ConcatenateDataProvider {
+    fn read_bytes(&mut self, offset: u64, length: u32) -> Result<Vec<u8>> {
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+
+        let total_size = self.metadata.size;
+        if offset >= total_size {
+            return Ok(vec![0u8; length as usize]);
+        }
+
+        let page_len = self.metadata.page_length as u64;
+        let padded_input_size = self.max_pages * page_len;
+        let mut buffer = vec![0u8; length as usize];
+
+        // Clamp readable range to valid data
+        let readable_end = (offset + length as u64).min(total_size);
+
+        // Determine which input slots overlap with [offset, readable_end)
+        let first_input = (offset / padded_input_size) as usize;
+        let last_input = ((readable_end.saturating_sub(1)) / padded_input_size) as usize;
+
+        for input_idx in first_input..=last_input {
+            if input_idx >= self.inputs.len() {
+                break;
+            }
+
+            let slot_start = input_idx as u64 * padded_input_size;
+            let slot_end = slot_start + padded_input_size;
+
+            // Segment within this slot that overlaps with the requested range
+            let seg_start = offset.max(slot_start);
+            let seg_end = readable_end.min(slot_end);
+            if seg_end <= seg_start {
+                continue;
+            }
+
+            let in_slot_offset = seg_start - slot_start; // offset within this input's padded region
+            let seg_len = (seg_end - seg_start) as u32;
+            let input_size = self.input_sizes[input_idx];
+
+            // How much of this segment actually has real data?
+            if in_slot_offset < input_size {
+                let readable = ((input_size - in_slot_offset).min(seg_len as u64)) as u32;
+                let bytes = self.inputs[input_idx].lock().read_bytes(in_slot_offset, readable)?;
+
+                let dest_start = (seg_start - offset) as usize;
+                let copy_len = bytes.len().min(readable as usize);
+                buffer[dest_start..dest_start + copy_len].copy_from_slice(&bytes[..copy_len]);
+                // Remainder of seg (in_slot_offset + readable .. seg_end) stays 0x00 (already zeroed)
+            }
+            // If in_slot_offset >= input_size the whole segment is padding — already 0x00
+        }
+
+        Ok(buffer)
+    }
+
+    fn get_metadata(&self) -> FileMetadata {
+        self.metadata.clone()
+    }
+
+    fn cache_identity(&self) -> String {
+        self.identity.clone()
+    }
+}
+
 /// A provider that outputs a filtered sequential view containing only the pages that have search results.
 /// All other pages without search results in them are suppressed.
 pub struct SearchFilteredDataProvider {
