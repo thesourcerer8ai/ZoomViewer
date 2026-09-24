@@ -1268,6 +1268,20 @@ impl WorkflowEditorState {
         }
     }
 
+    pub fn cancel_all_searches(&mut self) {
+        let searches = self.active_searches.lock();
+        for search in searches.values() {
+            search.cancel_flag.store(true, Ordering::Relaxed);
+        }
+        let count = searches.len();
+        drop(searches);
+        if count > 0 {
+            self.status_message = format!("Stopping {} active search(es)...", count);
+        } else {
+            self.status_message = "No active searches to stop.".to_string();
+        }
+    }
+
     /// Poll completed background searches and update nodes
     pub fn poll_active_searches(&mut self, ctx: &egui::Context) {
         let mut completed = Vec::new();
@@ -1507,6 +1521,10 @@ impl WorkflowEditorState {
                 }
                 if ui.button("⚡ Run Selected").clicked() {
                     self.run_selected_node();
+                }
+                let has_active = !self.active_searches.lock().is_empty();
+                if ui.add_enabled(has_active, egui::Button::new("⏹ Stop All")).clicked() {
+                    self.cancel_all_searches();
                 }
                 ui.separator();
                 ui.menu_button("➕ Add Node", |ui| {
