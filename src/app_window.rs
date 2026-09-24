@@ -397,7 +397,18 @@ impl AppWindow {
                 };
 
                 let (search_results_clone, pattern_len) = {
-                    if let Ok(st) = search_tab_for_hex.try_lock() {
+                    // Prefer results from an upstream PatternSearch workflow node if
+                    // the active output pipeline contains one with results. This makes
+                    // the hex viewer highlight the node's matches (with virtual offsets
+                    // already translated by get_upstream_search_results).
+                    // Fall back to the standalone search tab results otherwise.
+                    let wf_results = {
+                        let wf = workflow_for_hex.lock().unwrap();
+                        wf.get_upstream_search_results()
+                    };
+                    if let Some((results, pat_len)) = wf_results {
+                        (results, pat_len)
+                    } else if let Ok(st) = search_tab_for_hex.try_lock() {
                         let pat_bytes = crate::search::parse_pattern(&st.options).unwrap_or_default();
                         (st.results.clone(), pat_bytes.len())
                     } else {

@@ -893,6 +893,143 @@ impl WorkflowEditorState {
     }
 
     /// Build data providers for the Hex Viewer.
+    /// Walk upstream from the active OutputViewer and find the first PatternSearch node.
+    ///
+    /// Returns `Some((virtual_results, pattern_len))` where `virtual_results` contains
+    /// `SearchResult` values with **output-stream byte offsets** (i.e. offsets into the
+    /// virtual provider that the hex viewer is actually reading):
+    ///
+    /// * `AllMatchingPages` – offsets are the real source offsets (the filtered provider
+    ///   maps source pages 1-to-1, so offsets are identical to the stored results).
+    /// * `OnePagePerResult` – each output page has size `bytes_before + pat_len +
+    ///   bytes_after`, and the match always starts at `bytes_before` inside that page.
+    ///   Virtual offset for result `i` = `i * page_size + bytes_before`.
+    ///
+    /// Returns `None` when there is no active output or no upstream PatternSearch node
+    /// with results.
+    pub fn get_upstream_search_results(&self) -> Option<(Vec<crate::search::SearchResult>, usize)> {
+        let output_id = self.get_active_output_node_id()?;
+
+        // Walk upstream until we find a PatternSearch node
+        let mut current_id = output_id;
+        let mut visited = std::collections::HashSet::new();
+
+        let search_node = loop {
+            if !visited.insert(current_id) {
+                return None; // cycle guard
+            }
+            let node = self.nodes.iter().find(|n| n.id == current_id)?;
+            if matches!(node.kind, WorkflowNodeKind::PatternSearch { .. }) {
+                break node;
+            }
+            // Follow the single upstream connection
+            let incoming = self.connections.iter().find(|c| c.to_node == current_id)?;
+            current_id = incoming.from_node;
+        };
+
+        let (search_pattern, is_hex, case_sensitive, results, output_mode, bytes_before, bytes_after) =
+            match &search_node.kind {
+                WorkflowNodeKind::PatternSearch {
+                    search_pattern,
+                    is_hex,
+                    case_sensitive,
+                    results,
+                    output_mode,
+                    bytes_before,
+                    bytes_after,
+                    ..
+                } => (search_pattern, *is_hex, *case_sensitive, results, *output_mode, *bytes_before, *bytes_after),
+                _ => return None,
+            };
+
+        if results.is_empty() {
+            return None;
+        }
+
+        // Determine pattern byte length
+        let mode = if is_hex {
+            crate::search::SearchMode::Hex
+        } else {
+            crate::search::SearchMode::Ascii
+        };
+        let pat_opts = crate::search::SearchOptions {
+            pattern: search_pattern.clone(),
+            mode,
+            case_sensitive,
+            max_matches: 1,
+        };
+        let pattern_len = crate::search::parse_pattern(&pat_opts)
+            .map(|b| b.len())
+            .unwrap_or(1);
+
+        let virtual_results = match output_mode {
+            SearchOutputMode::AllMatchingPages => {
+                // The SearchFilteredDataProvider re-maps pages sequentially but keeps
+                // each page at the same *intra-page* offset.  A result at source byte
+                // offset `src_off` sits in source page `src_page = src_off / page_len`,
+                // and the filtered view assigns that page the index equal to its
+                // position in the deduplicated sorted matching_pages list.
+                //
+                // Build the same dedup-sorted page list the provider uses, find each
+                // result's filtered page index, then reconstruct the virtual offset.
+                let page_len = {
+                    // Peek at the upstream provider's page length via the stored
+                    // node connections (no need to rebuild the whole provider).
+                    // Walk upstream from the search node to the first Input node.
+                    let mut up_id = current_id; // current_id == search_node.id here
+                    let mut pl: Option<u64> = None;
+                    let mut v2 = std::collections::HashSet::new();
+                    loop {
+                        if !v2.insert(up_id) { break; }
+                        if let Some(inc) = self.connections.iter().find(|c| c.to_node == up_id) {
+                            up_id = inc.from_node;
+                            if let Some(n) = self.nodes.iter().find(|n| n.id == up_id) {
+                                if let WorkflowNodeKind::Input { page_length, .. } = n.kind {
+                                    pl = Some(page_length as u64);
+                                    break;
+                                }
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    pl.unwrap_or(1)
+                };
+
+                // Build deduplicated, sorted matching page list (same as SearchFilteredDataProvider)
+                let mut src_pages: Vec<u64> = results.iter().map(|r| r.byte_offset / page_len).collect();
+                src_pages.sort_unstable();
+                src_pages.dedup();
+
+                results.iter().map(|r| {
+                    let src_page = r.byte_offset / page_len;
+                    let in_page = r.byte_offset % page_len;
+                    // Binary search for this page in the filtered list
+                    let filtered_page = src_pages.partition_point(|&p| p < src_page) as u64;
+                    let virtual_offset = filtered_page * page_len + in_page;
+                    crate::search::SearchResult {
+                        byte_offset: virtual_offset,
+                        ..r.clone()
+                    }
+                }).collect()
+            }
+
+            SearchOutputMode::OnePagePerResult => {
+                // Page size in the virtual stream
+                let page_size = bytes_before + pattern_len as u64 + bytes_after;
+                results.iter().enumerate().map(|(i, r)| {
+                    let virtual_offset = i as u64 * page_size + bytes_before;
+                    crate::search::SearchResult {
+                        byte_offset: virtual_offset,
+                        ..r.clone()
+                    }
+                }).collect()
+            }
+        };
+
+        Some((virtual_results, pattern_len))
+    }
+
     /// Returns (active_output_provider, Option<raw_primary_input_provider>).
     /// When an XorTransform node is present in the active output pipeline,
     /// the raw primary input provider is also returned to allow raw vs XOR diff visualization.
