@@ -66,6 +66,7 @@ pub mod search_tab;
 pub mod hex_tab;
 pub mod fuse_node;
 pub mod page_structure_tab;
+pub mod pattern_writer_tab;
 
 pub use data_provider::{DumpDataProvider, FileDataProvider, SearchFilteredDataProvider, XorDataProvider};
 pub use search::{SearchResult, SearchOptions, SearchMode, search_provider, search_provider_with_sender, export_results_to_file};
@@ -73,5 +74,6 @@ pub use search_tab::SearchTabState;
 pub use hex_tab::{HexTabState, HexDiffMode};
 pub use fuse_node::{ActiveFuseMount, InodeKind, parse_inode, default_mount_dir_for_node};
 pub use page_structure_tab::PageStructureTabState;
+pub use pattern_writer_tab::PatternWriterTabState;
 
 pub use workflow::{WorkflowEditorState, WorkflowNode, WorkflowNodeKind};

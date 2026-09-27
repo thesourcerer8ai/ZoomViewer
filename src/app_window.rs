@@ -4,8 +4,8 @@ use crate::{
     workflow::WorkflowEditorState,
     window_state::{WindowState as WindowGeometry, WindowStateManager},
     AddressDisplay, CacheManager, DumpDataProvider, FileMetadata, HexTabState, PanController,
-    PageStructureTabState, SearchTabState, TaskQueue, TileCoord, Viewport, ViewportManager,
-    ViewportRenderer, ZoomController,
+    PageStructureTabState, PatternWriterTabState, SearchTabState, TaskQueue, TileCoord, Viewport,
+    ViewportManager, ViewportRenderer, ZoomController,
 };
 use fltk::{
     app::MouseWheel,
@@ -41,6 +41,8 @@ pub struct AppWindow {
     pub hex_tab_state: Arc<Mutex<HexTabState>>,
     /// Page structure editor tab state (shared with hex tab and workflow)
     pub page_structure_tab_state: Arc<Mutex<PageStructureTabState>>,
+    /// Pattern writer tab state
+    pub pattern_writer_tab_state: Arc<Mutex<PatternWriterTabState>>,
     /// Frame to display the viewport image
     viewport_frame: Arc<Mutex<Frame>>,
     /// Viewport manager for tile identification
@@ -213,6 +215,20 @@ impl AppWindow {
         gl_page_structure.end();
 
         tab_page_structure.end();
+
+        // --- TAB 6: Pattern Writer (embedded egui GL Canvas) ---
+        let tab_pattern_writer = Group::default()
+            .with_size(saved_win.width, tab_content_h)
+            .with_pos(0, tab_strip_h)
+            .with_label("Pattern Writer\t");
+
+        let mut gl_pattern_writer = GlWindow::default()
+            .with_size(saved_win.width, tab_content_h)
+            .with_pos(0, tab_strip_h);
+        gl_pattern_writer.set_mode(fltk::enums::Mode::Opengl3);
+        gl_pattern_writer.end();
+
+        tab_pattern_writer.end();
 
         tabs.end();
 
@@ -599,6 +615,74 @@ impl AppWindow {
         });
         gl_page_structure.set_visible_focus();
 
+        // Setup fltk-egui for pattern writer tab
+        let pattern_writer_state = Arc::new(Mutex::new(PatternWriterTabState::new()));
+        let pw_egui_state: Arc<Mutex<Option<(Painter, EguiState)>>> = Arc::new(Mutex::new(None));
+        let pw_egui_ctx = egui::Context::default();
+        pw_egui_ctx.set_fonts(chakra_font_definitions());
+
+        let pw_tab_draw = pattern_writer_state.clone();
+        let pw_egui_state_draw = pw_egui_state.clone();
+        let pw_egui_ctx_draw = pw_egui_ctx.clone();
+
+        gl_pattern_writer.draw(move |w| {
+            if !w.shown() {
+                return;
+            }
+            w.make_current();
+            let mut state_guard = pw_egui_state_draw.lock().unwrap();
+            if state_guard.is_none() {
+                *state_guard = Some(fltk_egui::init(w));
+            }
+            if let Some((painter, state)) = state_guard.as_mut() {
+                let raw_input = state.take_input();
+                let ppp = state.pixels_per_point();
+
+                let full_output = pw_egui_ctx_draw.run(raw_input, |ctx| {
+                    let mut pw = pw_tab_draw.lock().unwrap();
+                    pw.show_ui(ctx);
+                });
+
+                state.fuse_output(w, full_output.platform_output);
+                let clipped_primitives = pw_egui_ctx_draw.tessellate(full_output.shapes, full_output.pixels_per_point);
+
+                painter.paint_and_update_textures(
+                    [w.width() as u32, w.height() as u32],
+                    ppp,
+                    &clipped_primitives,
+                    &full_output.textures_delta,
+                );
+                w.swap_buffers();
+            }
+        });
+
+        let pw_egui_handle = pw_egui_state.clone();
+        let mut gl_pw_handle = gl_pattern_writer.clone();
+        gl_pw_handle.handle(move |w, ev| {
+            if let Ok(mut state_guard) = pw_egui_handle.try_lock() {
+                if let Some((_, state)) = state_guard.as_mut() {
+                    state.fuse_input(w, ev);
+                }
+            }
+            match ev {
+                Event::Push => {
+                    let _ = w.take_focus();
+                    w.redraw();
+                    true
+                }
+                Event::Focus | Event::Unfocus => {
+                    w.redraw();
+                    true
+                }
+                Event::Drag | Event::Move | Event::Released | Event::KeyDown | Event::KeyUp | Event::MouseWheel | Event::Resize => {
+                    w.redraw();
+                    true
+                }
+                _ => false,
+            }
+        });
+        gl_pattern_writer.set_visible_focus();
+
         // Create viewport manager
         let viewport_manager = Arc::new(Mutex::new(ViewportManager::new(
             metadata.clone(),
@@ -612,6 +696,7 @@ impl AppWindow {
         let mut gl_search_switch = gl_search.clone();
         let mut gl_hex_switch = gl_hex.clone();
         let mut gl_page_structure_switch = gl_page_structure.clone();
+        let mut gl_pattern_writer_switch = gl_pattern_writer.clone();
         let hex_tab_switch = hex_tab_state.clone();
         let viewport_manager_tab_switch = viewport_manager.clone();
         let metadata_tab_switch = metadata.clone();
@@ -621,6 +706,7 @@ impl AppWindow {
             gl_search_switch.redraw();
             gl_hex_switch.redraw();
             gl_page_structure_switch.redraw();
+            gl_pattern_writer_switch.redraw();
             // Set keyboard focus to the appropriate GL window when its tab becomes active.
             if let Some(active) = tabs_for_cb.value() {
                 let lbl = active.label();
@@ -683,6 +769,8 @@ impl AppWindow {
                             }
                         }
                     }
+                } else if trimmed.starts_with("Pattern") {
+                    gl_pattern_writer_switch.set_visible_focus();
                 }
             }
         });
@@ -740,6 +828,7 @@ impl AppWindow {
             search_tab_state: search_tab_state.clone(),
             hex_tab_state: hex_tab_state.clone(),
             page_structure_tab_state: page_structure_state.clone(),
+            pattern_writer_tab_state: pattern_writer_state.clone(),
             viewport_frame: viewport_frame_arc.clone(),
             viewport_manager: viewport_manager.clone(),
             zoom_controller: zoom_controller.clone(),
@@ -998,6 +1087,7 @@ impl AppWindow {
         let mut tab_viewer_timer = tab_viewer.clone();
         let mut gl_search_timer = gl_search.clone();
         let mut gl_hex_timer = gl_hex.clone();
+        let mut gl_pattern_writer_timer = gl_pattern_writer.clone();
         let fltk_tile_cache_timer = app_window.fltk_tile_cache.clone();
         let initial_identity = file_loader.as_ref().map(|fl| fl.lock().cache_identity()).unwrap_or_default();
         let current_identity_timer = Arc::new(Mutex::new(initial_identity));
@@ -1115,6 +1205,7 @@ impl AppWindow {
                             }
                             tab_viewer_timer.activate();
                             gl_hex_timer.redraw();
+                            gl_pattern_writer_timer.redraw();
                             need_redraw = true;
                         }
                     }
