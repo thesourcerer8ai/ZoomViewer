@@ -85,6 +85,21 @@ pub enum WorkflowNodeKind {
         auto_mount: bool,
     },
     Concatenate,
+    /// NAND reader node — connected to a physical NAND controller over serial.
+    /// Carries the device settings so the workflow can show its configuration
+    /// and link to the NAND Reader tab.
+    NandReader {
+        /// Serial device path, e.g. "/dev/ttyUSB0".
+        device_path: String,
+        /// Dump output filename.
+        dump_filename: String,
+        /// Page size in bytes.
+        page_size: u32,
+        /// Pages per block.
+        pages_per_block: u32,
+        /// Number of blocks.
+        num_blocks: u32,
+    },
 }
 
 /// Data structure for a node in the workflow graph
@@ -217,6 +232,25 @@ impl WorkflowNode {
         }
     }
 
+    pub fn new_nand_reader(id: usize, pos: [f32; 2]) -> Self {
+        // Try to inherit last-used settings from the persisted NandReaderSettings
+        let saved = crate::nand_reader_tab::NandReaderSettings::load();
+        Self {
+            id,
+            name: "NAND Reader".to_string(),
+            pos,
+            kind: WorkflowNodeKind::NandReader {
+                device_path: saved.device_path,
+                dump_filename: saved.dump_filename,
+                page_size: saved.page_size,
+                pages_per_block: saved.pages_per_block,
+                num_blocks: saved.num_blocks,
+            },
+            status: NodeExecutionStatus::Idle,
+            output_log: "Connect the NAND Reader tab to start.".to_string(),
+        }
+    }
+
     pub fn execute(&mut self) {
         self.status = NodeExecutionStatus::Running;
         let start_time = std::time::Instant::now();
@@ -289,6 +323,13 @@ impl WorkflowNode {
             WorkflowNodeKind::Concatenate => {
                 self.status = NodeExecutionStatus::Completed;
                 self.output_log = "Concatenate node ready.\nConnect 2 or more inputs.".to_string();
+            }
+            WorkflowNodeKind::NandReader { device_path, dump_filename, .. } => {
+                self.status = NodeExecutionStatus::Idle;
+                self.output_log = format!(
+                    "NAND Reader node.\nDevice: {}\nDump file: {}\nUse the 'NAND Reader' tab to connect and dump.",
+                    device_path, dump_filename
+                );
             }
         }
     }
@@ -655,6 +696,7 @@ impl WorkflowEditorState {
             WorkflowNodeKind::FileExport { .. } => WorkflowNode::new_export(id, pos),
             WorkflowNodeKind::FuseMount { .. } => WorkflowNode::new_fuse_mount(id, pos),
             WorkflowNodeKind::Concatenate => WorkflowNode::new_concatenate(id, pos),
+            WorkflowNodeKind::NandReader { .. } => WorkflowNode::new_nand_reader(id, pos),
         };
 
         self.nodes.push(node);
@@ -864,6 +906,17 @@ impl WorkflowEditorState {
 
                 let concat_provider = crate::data_provider::ConcatenateDataProvider::new(providers);
                 Ok(Arc::new(Mutex::new(concat_provider)) as Arc<Mutex<dyn DumpDataProvider>>)
+            }
+            WorkflowNodeKind::NandReader { dump_filename, page_size, pages_per_block, .. } => {
+                // The NAND reader node exposes the dump file it wrote as a read-only provider.
+                // page_size is the page length; pages_per_block is used as the block_size.
+                if dump_filename.trim().is_empty() {
+                    return Err(format!("NandReader node #{} has no dump filename set", target_node_id));
+                }
+                let loader = FileLoader::new(dump_filename, *page_size, *pages_per_block)
+                    .map_err(|e| format!("Failed to open dump file '{}': {}", dump_filename, e))?;
+                let provider = FileDataProvider::new(loader);
+                Ok(Arc::new(Mutex::new(provider)) as Arc<Mutex<dyn DumpDataProvider>>)
             }
         };
 
@@ -1590,6 +1643,16 @@ impl WorkflowEditorState {
                         self.add_node(WorkflowNodeKind::Concatenate);
                         ui.close_menu();
                     }
+                    if ui.button("NAND Reader").clicked() {
+                        self.add_node(WorkflowNodeKind::NandReader {
+                            device_path: String::new(),
+                            dump_filename: "01_01.dump".to_string(),
+                            page_size: 4096,
+                            pages_per_block: 64,
+                            num_blocks: 1024,
+                        });
+                        ui.close_menu();
+                    }
                 });
             });
 
@@ -1995,6 +2058,55 @@ impl WorkflowEditorState {
                                 ui.label(egui::RichText::new(
                                     "Inputs are concatenated in connection order.\nShorter inputs are zero-padded to the longest."
                                 ).italics().weak().size(11.0));
+                            }
+                            WorkflowNodeKind::NandReader {
+                                device_path,
+                                dump_filename,
+                                page_size,
+                                pages_per_block,
+                                num_blocks,
+                            } => {
+                                // Read-only summary — editing is done in the NAND Reader tab.
+                                ui.horizontal(|ui| {
+                                    ui.label("Device:");
+                                    if device_path.is_empty() {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(255, 180, 60),
+                                            "not set — configure in NAND Reader tab",
+                                        );
+                                    } else {
+                                        ui.monospace(device_path.as_str());
+                                    }
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Dump file:");
+                                    ui.monospace(dump_filename.as_str());
+                                });
+                                ui.horizontal(|ui| {
+                                    ui.label("Page size:");
+                                    ui.monospace(format!("{} B", page_size));
+                                    ui.label("  Pages/block:");
+                                    ui.monospace(format!("{}", pages_per_block));
+                                    ui.label("  Blocks:");
+                                    ui.monospace(format!("{}", num_blocks));
+                                });
+                                let total_mb = *page_size as f64
+                                    * *pages_per_block as f64
+                                    * *num_blocks as f64
+                                    / (1024.0 * 1024.0);
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(160, 200, 255),
+                                    format!("Total: {:.1} MB", total_mb),
+                                );
+                                ui.add_space(2.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Switch to the 'NAND Reader' tab to connect,\nscan chips and start a dump.",
+                                    )
+                                    .italics()
+                                    .weak()
+                                    .size(11.0),
+                                );
                             }
                         }
 
