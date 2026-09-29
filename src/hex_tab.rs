@@ -634,7 +634,7 @@ impl HexTabState {
                     .show_ui(ui, |ui| {
                         for rec in page_records {
                             let is_active = self.col_offset_in_page >= rec.start && self.col_offset_in_page <= rec.stop;
-                            let label = format!("{} (0x{:X}..0x{:X}, {} B)", rec.name, rec.start, rec.stop, rec.stop - rec.start + 1);
+                            let label = format!("{} (0x{:X}..0x{:X} / {}..{}, {} B)", rec.name, rec.start, rec.stop, rec.start, rec.stop, rec.stop - rec.start + 1);
                             if ui.selectable_label(is_active, label).clicked() {
                                 self.col_offset_in_page = rec.start.min(max_col);
                             }
@@ -716,14 +716,15 @@ impl HexTabState {
             ));
             ui.separator();
             ui.label(format!(
-                "Col: 0x{:04X}..0x{:04X} ({} B visible) / PageLen: {}",
+                "Col: 0x{:04X}..0x{:04X} ({} B visible) / PageLen: 0x{:X} ({})",
                 self.col_offset_in_page,
                 (self.col_offset_in_page + bytes_per_row as u64).min(meta.page_length as u64),
                 bytes_per_row,
+                meta.page_length,
                 meta.page_length
             ));
             ui.separator();
-            ui.label(format!("Linear: 0x{:08X} / 0x{:08X}", cur_linear, meta.size));
+            ui.label(format!("Linear: 0x{:08X} ({}) / 0x{:08X} ({})", cur_linear, cur_linear, meta.size, meta.size));
 
             if let Some(seg) = HexTabState::find_segment_at_column(self.col_offset_in_page, page_records) {
                 ui.separator();
@@ -733,7 +734,7 @@ impl HexTabState {
                     PageSegmentKind::SpareArea => Color32::from_rgb(255, 215, 0),
                     PageSegmentKind::Other => Color32::LIGHT_GRAY,
                 };
-                ui.colored_label(seg_color, format!("Region: {} (0x{:X}..0x{:X})", seg.name, seg.start, seg.stop));
+                ui.colored_label(seg_color, format!("Region: {} (0x{:X}..0x{:X} / {}..{})", seg.name, seg.start, seg.stop, seg.start, seg.stop));
             }
 
             if has_xor_diff {
@@ -973,11 +974,15 @@ impl HexTabState {
                     ui.horizontal(|ui| {
                         // 1. Prefix: Block, Page, Offset
                         let prefix_str = format!("B:{:04} P:{:03} +{:04X} | ", block_idx, page_in_block, self.col_offset_in_page);
-                        ui.label(
+                        let prefix_label = ui.label(
                             egui::RichText::new(prefix_str)
                                 .font(mono_font.clone())
                                 .color(col_page_header),
                         );
+                        prefix_label.on_hover_text(format!(
+                            "Block {}, In-Block Page {}, Col offset 0x{:04X} ({})",
+                            block_idx, page_in_block, self.col_offset_in_page, self.col_offset_in_page
+                        ));
 
                         // 2. Hex Bytes (if HexAndAscii or HexOnly)
                         let mut ascii_chars: Vec<(char, bool)> = Vec::with_capacity(bytes_per_row);

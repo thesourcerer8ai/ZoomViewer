@@ -377,6 +377,46 @@ pub fn parse_hex_bytes(s: &str) -> Vec<u8> {
     bytes
 }
 
+/// Parse a string that is either a plain decimal integer or a hex value prefixed
+/// with "0x" / "0X". Returns `None` if neither format parses successfully.
+fn parse_dec_or_hex(s: &str) -> Option<u64> {
+    let trimmed = s.trim();
+    if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        trimmed.parse::<u64>().ok()
+    }
+}
+
+/// A `DragValue` for a `u32` field that:
+/// * Displays the current value as `0xHEX (dec)` in the widget.
+/// * Accepts typed input in both decimal (`4096`) and hex (`0x1000`) form.
+/// * Still supports click-and-drag to increment/decrement.
+fn hex_drag_u32(value: &mut u32, speed: f64) -> egui::DragValue<'_> {
+    egui::DragValue::new(value)
+        .speed(speed)
+        .custom_formatter(|n, _| format!("0x{:X} ({})", n as u64, n as u64))
+        .custom_parser(|s| parse_dec_or_hex(s).map(|v| v as f64))
+}
+
+/// A `DragValue` for a `u64` field that:
+/// * Displays the current value as `0xHEX (dec)`.
+/// * Accepts typed input in both decimal and hex (`0x…`) form.
+fn hex_drag_u64(value: &mut u64, speed: f64) -> egui::DragValue<'_> {
+    egui::DragValue::new(value)
+        .speed(speed)
+        .custom_formatter(|n, _| format!("0x{:X} ({})", n as u64, n as u64))
+        .custom_parser(|s| parse_dec_or_hex(s).map(|v| v as f64))
+}
+
+/// A `DragValue` for a `usize` field with hex display and hex/decimal input.
+fn hex_drag_usize(value: &mut usize, speed: f64) -> egui::DragValue<'_> {
+    egui::DragValue::new(value)
+        .speed(speed)
+        .custom_formatter(|n, _| format!("0x{:X} ({})", n as u64, n as u64))
+        .custom_parser(|s| parse_dec_or_hex(s).map(|v| v as f64))
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Metadata helpers for Input nodes
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1934,9 +1974,9 @@ impl WorkflowEditorState {
                                 ui.separator();
                                 ui.horizontal(|ui| {
                                     ui.label("Page:");
-                                    let page_drag = ui.add(egui::DragValue::new(page_length).speed(64));
+                                    let page_drag = ui.add(hex_drag_u32(page_length, 64.0));
                                     ui.label("Block:");
-                                    let block_drag = ui.add(egui::DragValue::new(block_size).speed(16));
+                                    let block_drag = ui.add(hex_drag_u32(block_size, 16.0));
                                     if (page_drag.lost_focus() && page_drag.changed())
                                         || (block_drag.lost_focus() && block_drag.changed())
                                     {
@@ -1994,7 +2034,7 @@ impl WorkflowEditorState {
                                 ui.checkbox(case_sensitive, "Case sensitive");
                                 ui.horizontal(|ui| {
                                     ui.label("Limit:");
-                                    ui.add(egui::DragValue::new(max_matches));
+                                    ui.add(hex_drag_usize(max_matches, 1.0));
                                 });
 
                                 ui.add_space(4.0);
@@ -2010,17 +2050,15 @@ impl WorkflowEditorState {
                                     ui.horizontal(|ui| {
                                         ui.label("Bytes before:");
                                         ui.add(
-                                            egui::DragValue::new(bytes_before)
-                                                .clamp_range(0u64..=1_000_000u64)
-                                                .speed(16.0),
+                                            hex_drag_u64(bytes_before, 16.0)
+                                                .clamp_range(0u64..=1_000_000u64),
                                         );
                                     });
                                     ui.horizontal(|ui| {
                                         ui.label("Bytes after: ");
                                         ui.add(
-                                            egui::DragValue::new(bytes_after)
-                                                .clamp_range(0u64..=1_000_000u64)
-                                                .speed(16.0),
+                                            hex_drag_u64(bytes_after, 16.0)
+                                                .clamp_range(0u64..=1_000_000u64),
                                         );
                                     });
                                 }
@@ -2057,13 +2095,13 @@ impl WorkflowEditorState {
                             WorkflowNodeKind::BlockArranger { grid_width, grid_height, stripe_width } => {
                                 ui.horizontal(|ui| {
                                     ui.label("Cols:");
-                                    ui.add(egui::DragValue::new(grid_width));
+                                    ui.add(hex_drag_u32(grid_width, 1.0));
                                     ui.label("Rows:");
-                                    ui.add(egui::DragValue::new(grid_height));
+                                    ui.add(hex_drag_u32(grid_height, 1.0));
                                 });
                                 ui.horizontal(|ui| {
                                     ui.label("Stripe:");
-                                    ui.add(egui::DragValue::new(stripe_width).speed(128));
+                                    ui.add(hex_drag_u32(stripe_width, 128.0));
                                 });
                             }
                             WorkflowNodeKind::OutputViewer { name } => {
@@ -2136,15 +2174,13 @@ impl WorkflowEditorState {
                                 ui.horizontal(|ui| {
                                     ui.label("Every");
                                     ui.add(
-                                        egui::DragValue::new(modulo)
-                                            .clamp_range(1u64..=100_000u64)
-                                            .speed(1.0),
+                                        hex_drag_u64(modulo, 1.0)
+                                            .clamp_range(1u64..=100_000u64),
                                     );
                                     ui.label("th page, starting at offset");
                                     ui.add(
-                                        egui::DragValue::new(offset)
-                                            .clamp_range(0u64..=100_000u64)
-                                            .speed(1.0),
+                                        hex_drag_u64(offset, 1.0)
+                                            .clamp_range(0u64..=100_000u64),
                                     );
                                 });
                                 ui.add_space(2.0);
