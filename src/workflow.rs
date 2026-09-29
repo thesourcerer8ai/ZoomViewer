@@ -85,6 +85,14 @@ pub enum WorkflowNodeKind {
         auto_mount: bool,
     },
     Concatenate,
+    /// Modulo page filter — emits every Nth page starting at the Mth page (0-indexed).
+    /// For example N=3, M=0 yields pages 0, 3, 6, 9, …
+    ModuloPageFilter {
+        /// Keep every Nth page (step size). Must be ≥ 1.
+        modulo: u64,
+        /// Index of the first page to keep (0-indexed offset within each period).
+        offset: u64,
+    },
     /// NAND reader node — connected to a physical NAND controller over serial.
     /// Carries the device settings so the workflow can show its configuration
     /// and link to the NAND Reader tab.
@@ -232,6 +240,20 @@ impl WorkflowNode {
         }
     }
 
+    pub fn new_modulo_page_filter(id: usize, pos: [f32; 2]) -> Self {
+        Self {
+            id,
+            name: "Modulo Page Filter".to_string(),
+            pos,
+            kind: WorkflowNodeKind::ModuloPageFilter {
+                modulo: 3,
+                offset: 0,
+            },
+            status: NodeExecutionStatus::Idle,
+            output_log: "No execution history".to_string(),
+        }
+    }
+
     pub fn new_nand_reader(id: usize, pos: [f32; 2]) -> Self {
         // Try to inherit last-used settings from the persisted NandReaderSettings
         let saved = crate::nand_reader_tab::NandReaderSettings::load();
@@ -323,6 +345,13 @@ impl WorkflowNode {
             WorkflowNodeKind::Concatenate => {
                 self.status = NodeExecutionStatus::Completed;
                 self.output_log = "Concatenate node ready.\nConnect 2 or more inputs.".to_string();
+            }
+            WorkflowNodeKind::ModuloPageFilter { modulo, offset } => {
+                self.status = NodeExecutionStatus::Completed;
+                self.output_log = format!(
+                    "Modulo Page Filter ready.\nKeeping every {}th page starting at offset {}.",
+                    modulo, offset
+                );
             }
             WorkflowNodeKind::NandReader { device_path, dump_filename, .. } => {
                 self.status = NodeExecutionStatus::Idle;
@@ -696,6 +725,7 @@ impl WorkflowEditorState {
             WorkflowNodeKind::FileExport { .. } => WorkflowNode::new_export(id, pos),
             WorkflowNodeKind::FuseMount { .. } => WorkflowNode::new_fuse_mount(id, pos),
             WorkflowNodeKind::Concatenate => WorkflowNode::new_concatenate(id, pos),
+            WorkflowNodeKind::ModuloPageFilter { .. } => WorkflowNode::new_modulo_page_filter(id, pos),
             WorkflowNodeKind::NandReader { .. } => WorkflowNode::new_nand_reader(id, pos),
         };
 
@@ -906,6 +936,16 @@ impl WorkflowEditorState {
 
                 let concat_provider = crate::data_provider::ConcatenateDataProvider::new(providers);
                 Ok(Arc::new(Mutex::new(concat_provider)) as Arc<Mutex<dyn DumpDataProvider>>)
+            }
+            WorkflowNodeKind::ModuloPageFilter { modulo, offset } => {
+                let incoming = self.connections.iter()
+                    .find(|c| c.to_node == target_node_id)
+                    .ok_or_else(|| format!("ModuloPageFilter node #{} has no input connected", target_node_id))?;
+                let upstream = self.build_data_provider_internal(incoming.from_node, ancestors)?;
+                let modulo = *modulo;
+                let offset = *offset;
+                let provider = crate::data_provider::ModuloPageFilterDataProvider::new(upstream, modulo, offset);
+                Ok(Arc::new(Mutex::new(provider)) as Arc<Mutex<dyn DumpDataProvider>>)
             }
             WorkflowNodeKind::NandReader { dump_filename, page_size, pages_per_block, .. } => {
                 // The NAND reader node exposes the dump file it wrote as a read-only provider.
@@ -1643,6 +1683,13 @@ impl WorkflowEditorState {
                         self.add_node(WorkflowNodeKind::Concatenate);
                         ui.close_menu();
                     }
+                    if ui.button("Modulo Page Filter").clicked() {
+                        self.add_node(WorkflowNodeKind::ModuloPageFilter {
+                            modulo: 3,
+                            offset: 0,
+                        });
+                        ui.close_menu();
+                    }
                     if ui.button("NAND Reader").clicked() {
                         self.add_node(WorkflowNodeKind::NandReader {
                             device_path: String::new(),
@@ -1766,6 +1813,32 @@ impl WorkflowEditorState {
                     .filter_map(|(&id, m)| if m.is_mounted.load(Ordering::SeqCst) { Some(id) } else { None })
                     .collect()
             };
+
+            // Pre-compute page counts for ModuloPageFilter nodes to avoid re-borrowing self
+            // inside the node window closure. Maps node_id -> (output_pages, total_source_pages).
+            let modulo_page_counts: HashMap<usize, (u64, u64)> = self.nodes.iter()
+                .filter_map(|n| {
+                    if let WorkflowNodeKind::ModuloPageFilter { modulo: _, offset: _ } = n.kind {
+                        let provider = self.build_data_provider(n.id).ok()?;
+                        let guard = provider.lock();
+                        let meta = guard.get_metadata();
+                        let out_pages = if meta.page_length > 0 { meta.size / meta.page_length as u64 } else { 0 };
+                        // total source pages: walk upstream
+                        let total_src = self.connections.iter()
+                            .find(|c| c.to_node == n.id)
+                            .and_then(|c| self.build_data_provider(c.from_node).ok())
+                            .map(|p| {
+                                let g = p.lock();
+                                let m = g.get_metadata();
+                                if m.page_length > 0 { m.size / m.page_length as u64 } else { 0 }
+                            })
+                            .unwrap_or(0);
+                        Some((n.id, (out_pages, total_src)))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
 
             for node in &mut self.nodes {
                 let node_id = node.id;
@@ -2057,6 +2130,33 @@ impl WorkflowEditorState {
                                 ui.add_space(2.0);
                                 ui.label(egui::RichText::new(
                                     "Inputs are concatenated in connection order.\nShorter inputs are zero-padded to the longest."
+                                ).italics().weak().size(11.0));
+                            }
+                            WorkflowNodeKind::ModuloPageFilter { modulo, offset } => {
+                                ui.horizontal(|ui| {
+                                    ui.label("Every");
+                                    ui.add(
+                                        egui::DragValue::new(modulo)
+                                            .clamp_range(1u64..=100_000u64)
+                                            .speed(1.0),
+                                    );
+                                    ui.label("th page, starting at offset");
+                                    ui.add(
+                                        egui::DragValue::new(offset)
+                                            .clamp_range(0u64..=100_000u64)
+                                            .speed(1.0),
+                                    );
+                                });
+                                ui.add_space(2.0);
+                                if let Some(&(out_pages, total)) = modulo_page_counts.get(&node_id) {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(100, 230, 140),
+                                        format!("→ {} of {} input pages selected", out_pages, total),
+                                    );
+                                }
+                                ui.add_space(2.0);
+                                ui.label(egui::RichText::new(
+                                    "Keeps pages at indices: offset, offset+N, offset+2N, …"
                                 ).italics().weak().size(11.0));
                             }
                             WorkflowNodeKind::NandReader {

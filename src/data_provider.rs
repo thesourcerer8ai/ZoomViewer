@@ -432,6 +432,129 @@ impl DumpDataProvider for ConcatenateDataProvider {
     }
 }
 
+/// A provider that keeps only every Nth page of the source, starting at the Mth page (0-indexed).
+///
+/// Given `modulo = N` and `offset = M`, the output pages correspond to source pages
+/// `M, M+N, M+2N, …` (any source page index that satisfies `(page_index - M) % N == 0`
+/// **and** `page_index >= M`).
+///
+/// The output metadata has the same `page_length` and `block_size` as the source;
+/// only the total page/size count is reduced.
+pub struct ModuloPageFilterDataProvider {
+    source: Arc<Mutex<dyn DumpDataProvider>>,
+    /// Original absolute page indices that are exposed (pre-computed, sorted ascending).
+    selected_pages: Vec<u64>,
+    metadata: FileMetadata,
+    identity: String,
+}
+
+impl ModuloPageFilterDataProvider {
+    /// Create a new `ModuloPageFilterDataProvider`.
+    ///
+    /// # Arguments
+    /// * `source`  – Upstream provider.
+    /// * `modulo`  – Step N: keep every Nth page.  Clamped to ≥ 1.
+    /// * `offset`  – First page index M to include (0-indexed into the source).
+    pub fn new(source: Arc<Mutex<dyn DumpDataProvider>>, modulo: u64, offset: u64) -> Self {
+        let modulo = modulo.max(1);
+
+        let (page_length, block_size, total_source_pages, src_identity) = {
+            let guard = source.lock();
+            let m = guard.get_metadata();
+            let total = if m.page_length > 0 { m.size / m.page_length as u64 } else { 0 };
+            (m.page_length, m.block_size, total, guard.cache_identity())
+        };
+
+        // Build the list of selected source page indices.
+        let selected_pages: Vec<u64> = (offset..total_source_pages)
+            .step_by(modulo as usize)
+            .collect();
+
+        let total_out_pages = selected_pages.len() as u64;
+        let total_size = total_out_pages * page_length as u64;
+
+        let mut hasher = DefaultHasher::new();
+        "MODULO_PAGE_FILTER".hash(&mut hasher);
+        src_identity.hash(&mut hasher);
+        modulo.hash(&mut hasher);
+        offset.hash(&mut hasher);
+        page_length.hash(&mut hasher);
+        block_size.hash(&mut hasher);
+        let identity = format!("modulo_{:016x}", hasher.finish());
+
+        let metadata = FileMetadata::new(
+            format!("modulo://filtered/{}", identity),
+            total_size,
+            page_length,
+            block_size,
+        );
+
+        Self { source, selected_pages, metadata, identity }
+    }
+
+    /// Number of pages emitted by this filter.
+    pub fn output_page_count(&self) -> u64 {
+        self.selected_pages.len() as u64
+    }
+
+    /// Translate an output page index to the original source page index.
+    pub fn source_page(&self, output_page: u64) -> Option<u64> {
+        self.selected_pages.get(output_page as usize).copied()
+    }
+}
+
+impl DumpDataProvider for ModuloPageFilterDataProvider {
+    fn read_bytes(&mut self, offset: u64, length: u32) -> Result<Vec<u8>> {
+        if length == 0 || offset >= self.metadata.size {
+            return Ok(vec![0u8; length as usize]);
+        }
+
+        let total_size = self.metadata.size;
+        let page_len = self.metadata.page_length as u64;
+        let mut buffer = vec![0u8; length as usize];
+
+        let readable_end = (offset + length as u64).min(total_size);
+        let start_op = offset / page_len;          // first output page touched
+        let end_op = (readable_end - 1) / page_len; // last  output page touched
+
+        for op in start_op..=end_op {
+            if (op as usize) >= self.selected_pages.len() {
+                break;
+            }
+            let src_page = self.selected_pages[op as usize];
+            let out_page_start = op * page_len;
+            let out_page_end = (op + 1) * page_len;
+
+            let seg_start = offset.max(out_page_start);
+            let seg_end = readable_end.min(out_page_end);
+            if seg_end <= seg_start {
+                continue;
+            }
+
+            let in_page_offset = seg_start - out_page_start;
+            let seg_len = (seg_end - seg_start) as u32;
+            let src_offset = src_page * page_len + in_page_offset;
+
+            let page_bytes = self.source.lock().read_bytes(src_offset, seg_len)?;
+
+            let dest_start = (seg_start - offset) as usize;
+            let copy_len = page_bytes.len().min(seg_len as usize);
+            buffer[dest_start..dest_start + copy_len]
+                .copy_from_slice(&page_bytes[..copy_len]);
+        }
+
+        Ok(buffer)
+    }
+
+    fn get_metadata(&self) -> FileMetadata {
+        self.metadata.clone()
+    }
+
+    fn cache_identity(&self) -> String {
+        self.identity.clone()
+    }
+}
+
 /// A provider that outputs a filtered sequential view containing only the pages that have search results.
 /// All other pages without search results in them are suppressed.
 pub struct SearchFilteredDataProvider {
