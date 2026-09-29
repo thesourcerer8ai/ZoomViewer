@@ -1184,6 +1184,7 @@ impl AppWindow {
         let mut gl_search_timer = gl_search.clone();
         let mut gl_hex_timer = gl_hex.clone();
         let mut gl_pattern_writer_timer = gl_pattern_writer.clone();
+        let mut gl_win_timer = gl_win.clone();
         let fltk_tile_cache_timer = app_window.fltk_tile_cache.clone();
         let initial_identity = file_loader.as_ref().map(|fl| fl.lock().cache_identity()).unwrap_or_default();
         let current_identity_timer = Arc::new(Mutex::new(initial_identity));
@@ -1338,6 +1339,11 @@ impl AppWindow {
                     frame.redraw();
                 }
             }
+
+            // Always redraw the workflow editor so egui animations (progress bars,
+            // spinners, search progress, etc.) advance at a steady frame rate even
+            // when the mouse is idle.
+            gl_win_timer.redraw();
 
             // Repeat timer
             fltk::app::repeat_timeout3(0.05, handle);
