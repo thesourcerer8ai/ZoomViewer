@@ -217,8 +217,8 @@ pub fn search_provider_with_sender(
                 let page = if page_length > 0 { offset_in_block / page_length } else { 0 };
                 let offset_in_page = if page_length > 0 { offset_in_block % page_length } else { 0 };
 
-                // Extract preview snippet (up to 16 bytes starting at match)
-                let preview_len = pat_len.max(16).min(combined.len() - i);
+                // Extract preview snippet (up to 19 bytes starting at match)
+                let preview_len = pat_len.max(19).min(combined.len() - i);
                 let snippet = &combined[i..i + preview_len];
                 let (preview_hex, preview_ascii) = generate_previews(snippet);
 
