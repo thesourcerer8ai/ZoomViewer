@@ -110,6 +110,18 @@ pub enum WorkflowNodeKind {
         /// Number of blocks.
         num_blocks: u32,
     },
+    /// Block selector — forwards only the blocks whose indices match the
+    /// user-specified `blocks` spec (single numbers, comma-separated lists,
+    /// and/or ranges like `3-200`).  Blocks are emitted contiguously in
+    /// ascending order.
+    ///
+    /// When `blocks` is empty and the node is connected to an upstream node,
+    /// it is automatically filled with `"0-<MAXBLOCK>"`.
+    BlockSelector {
+        /// Human-readable block spec, e.g. `"0-199"`, `"0,5,10-20"`, `"0xFF"`.
+        /// Empty means "pass through everything" (filled on first connection).
+        blocks: String,
+    },
     /// Automated pattern healing node.
     ///
     /// Reads every 512-byte DATA sub-block from the upstream provider (using
@@ -298,6 +310,19 @@ impl WorkflowNode {
         }
     }
 
+    pub fn new_block_selector(id: usize, pos: [f32; 2]) -> Self {
+        Self {
+            id,
+            name: "Block Selector".to_string(),
+            pos,
+            kind: WorkflowNodeKind::BlockSelector {
+                blocks: String::new(),
+            },
+            status: NodeExecutionStatus::Idle,
+            output_log: "Connect an upstream node and set the block range.".to_string(),
+        }
+    }
+
     pub fn execute(&mut self) {
         self.status = NodeExecutionStatus::Running;
         let start_time = std::time::Instant::now();
@@ -389,6 +414,15 @@ impl WorkflowNode {
                 self.status = NodeExecutionStatus::Completed;
                 self.output_log = "Pattern Healing node ready.\nConnect an upstream node and view output to start healing.".to_string();
             }
+            WorkflowNodeKind::BlockSelector { blocks } => {
+                self.status = NodeExecutionStatus::Completed;
+                let spec = if blocks.trim().is_empty() {
+                    "all blocks (connect upstream to auto-fill range)".to_string()
+                } else {
+                    format!("blocks: {}", blocks)
+                };
+                self.output_log = format!("Block Selector ready.\nSelected: {}", spec);
+            }
         }
     }
 }
@@ -404,6 +438,69 @@ pub fn parse_hex_bytes(s: &str) -> Vec<u8> {
         }
     }
     bytes
+}
+
+/// Parse a block-selection spec string into a sorted, deduplicated list of block indices.
+///
+/// Accepts:
+/// * Single numbers in decimal or hex (`0`, `5`, `0xFF`)
+/// * Comma-separated lists (`0,5,10`)
+/// * Ranges (`3-200`, `0x10-0x20`)
+/// * Any combination: `"0,3-10,0xFF"`
+///
+/// `max_block` is the inclusive upper bound (used to clamp open-ended specs and
+/// to validate that requested indices exist).  Pass `u64::MAX` to skip clamping.
+///
+/// Returns `None` if the string is empty or contains no parseable tokens.
+pub fn parse_block_spec(spec: &str, max_block: u64) -> Option<Vec<u64>> {
+    if spec.trim().is_empty() {
+        return None;
+    }
+    let mut result: Vec<u64> = Vec::new();
+    for token in spec.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        if let Some(dash_pos) = find_range_dash(token) {
+            let start_str = token[..dash_pos].trim();
+            let end_str = token[dash_pos + 1..].trim();
+            if let (Some(start), Some(end)) = (parse_dec_or_hex(start_str), parse_dec_or_hex(end_str)) {
+                let end_clamped = end.min(max_block);
+                if start <= end_clamped {
+                    for b in start..=end_clamped {
+                        result.push(b);
+                    }
+                }
+            }
+        } else if let Some(val) = parse_dec_or_hex(token) {
+            if val <= max_block {
+                result.push(val);
+            }
+        }
+    }
+    if result.is_empty() {
+        return None;
+    }
+    result.sort_unstable();
+    result.dedup();
+    Some(result)
+}
+
+/// Find the position of the `-` separator in a range token like `"3-200"` or `"0x10-0x20"`.
+/// We skip any leading `-` that is part of a hex prefix, and avoid treating the `-` in `0x…`
+/// as a range separator by only searching after the first digit group.
+fn find_range_dash(token: &str) -> Option<usize> {
+    let bytes = token.as_bytes();
+    // We want the first `-` that is NOT immediately after `0x`/`0X` and NOT at position 0.
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'-' && i > 0 {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Parse a string that is either a plain decimal integer or a hex value prefixed
@@ -813,6 +910,7 @@ impl WorkflowEditorState {
             WorkflowNodeKind::ModuloPageFilter { .. } => WorkflowNode::new_modulo_page_filter(id, pos),
             WorkflowNodeKind::NandReader { .. } => WorkflowNode::new_nand_reader(id, pos),
             WorkflowNodeKind::PatternHealing => WorkflowNode::new_pattern_healing(id, pos),
+            WorkflowNodeKind::BlockSelector { .. } => WorkflowNode::new_block_selector(id, pos),
         };
 
         self.nodes.push(node);
@@ -1086,6 +1184,34 @@ impl WorkflowEditorState {
                 };
                 provider.stats = stats_arc;
 
+                Ok(Arc::new(Mutex::new(provider)) as Arc<Mutex<dyn DumpDataProvider>>)
+            }
+            WorkflowNodeKind::BlockSelector { blocks } => {
+                let incoming = self.connections.iter()
+                    .find(|c| c.to_node == target_node_id)
+                    .ok_or_else(|| format!("BlockSelector node #{} has no input connected", target_node_id))?;
+                let upstream = self.build_data_provider_internal(incoming.from_node, ancestors)?;
+
+                // Determine the total block count from the upstream provider.
+                let total_blocks = {
+                    let guard = upstream.lock();
+                    let m = guard.get_metadata();
+                    m.total_blocks
+                };
+
+                let max_block = total_blocks.saturating_sub(1);
+
+                // If spec is empty, pass through all blocks.
+                let spec = if blocks.trim().is_empty() {
+                    format!("0-{}", max_block)
+                } else {
+                    blocks.clone()
+                };
+
+                let selected = parse_block_spec(&spec, max_block)
+                    .unwrap_or_else(|| (0..=max_block).collect());
+
+                let provider = crate::data_provider::BlockSelectorDataProvider::new(upstream, selected, spec);
                 Ok(Arc::new(Mutex::new(provider)) as Arc<Mutex<dyn DumpDataProvider>>)
             }
         };
@@ -1833,6 +1959,12 @@ impl WorkflowEditorState {
                         self.add_node(WorkflowNodeKind::PatternHealing);
                         ui.close_menu();
                     }
+                    if ui.button("Block Selector").clicked() {
+                        self.add_node(WorkflowNodeKind::BlockSelector {
+                            blocks: String::new(),
+                        });
+                        ui.close_menu();
+                    }
                 });
             });
 
@@ -1967,6 +2099,28 @@ impl WorkflowEditorState {
                             })
                             .unwrap_or(0);
                         Some((n.id, (out_pages, total_src)))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // Pre-compute block counts for BlockSelector nodes.
+            // Maps node_id -> (selected_blocks, total_source_blocks).
+            let block_selector_counts: HashMap<usize, (u64, u64)> = self.nodes.iter()
+                .filter_map(|n| {
+                    if let WorkflowNodeKind::BlockSelector { .. } = n.kind {
+                        // total source blocks from upstream
+                        let total_src = self.connections.iter()
+                            .find(|c| c.to_node == n.id)
+                            .and_then(|c| self.build_data_provider(c.from_node).ok())
+                            .map(|p| p.lock().get_metadata().total_blocks)
+                            .unwrap_or(0);
+                        // selected block count from built provider
+                        let selected = self.build_data_provider(n.id).ok()
+                            .map(|p| p.lock().get_metadata().total_blocks)
+                            .unwrap_or(0);
+                        Some((n.id, (selected, total_src)))
                     } else {
                         None
                     }
@@ -2434,6 +2588,56 @@ impl WorkflowEditorState {
                                     .italics().weak().size(11.0),
                                 );
                             }
+                            WorkflowNodeKind::BlockSelector { blocks } => {
+                                ui.label("Blocks:");
+                                let resp = ui.text_edit_singleline(blocks);
+
+                                // Parse feedback
+                                if blocks.trim().is_empty() {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(255, 200, 80),
+                                        "⚠ Empty — will pass all blocks (auto-filled on connect).",
+                                    );
+                                } else {
+                                    // Quick parse to check validity (use u64::MAX as a loose upper bound)
+                                    let _ = resp; // keep borrow happy
+                                    let total_src = block_selector_counts.get(&node_id)
+                                        .map(|&(_, t)| t)
+                                        .unwrap_or(u64::MAX);
+                                    let max_bound = if total_src == 0 { u64::MAX } else { total_src.saturating_sub(1) };
+                                    match parse_block_spec(blocks, max_bound) {
+                                        Some(_) => {
+                                            if let Some(&(sel, total)) = block_selector_counts.get(&node_id) {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(100, 230, 140),
+                                                    format!("✔ {} of {} source blocks selected", sel, total),
+                                                );
+                                            } else {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(100, 230, 140),
+                                                    "✔ Valid spec (connect upstream to see counts)",
+                                                );
+                                            }
+                                        }
+                                        None => {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(220, 80, 80),
+                                                "✘ Could not parse — use e.g. \"0-199\" or \"0,5,10-20\"",
+                                            );
+                                        }
+                                    }
+                                }
+
+                                ui.add_space(2.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Accepts: single numbers (hex/dec), ranges (3-200),\n\
+                                         comma-separated lists, or any combination.\n\
+                                         Example: \"0,5,10-20,0xFF\"",
+                                    )
+                                    .italics().weak().size(11.0),
+                                );
+                            }
                         }
 
                         ui.separator();
@@ -2623,6 +2827,30 @@ impl WorkflowEditorState {
                 if !self.connections.iter().any(|c| c.from_node == src_id && c.to_node == tgt_id) {
                     self.connections.push(NodeConnection { from_node: src_id, to_node: tgt_id });
                     self.status_message = format!("Connected Node #{} ➔ Node #{}", src_id, tgt_id);
+
+                    // Auto-fill the blocks spec for a BlockSelector node whose field is still empty.
+                    // Check first (immutable borrow), then mutate (mutable borrow).
+                    let should_autofill = self.nodes.iter().any(|n| {
+                        n.id == tgt_id && matches!(&n.kind, WorkflowNodeKind::BlockSelector { blocks } if blocks.trim().is_empty())
+                    });
+                    if should_autofill {
+                        // Build the upstream provider before borrowing nodes mutably.
+                        let total_blocks = self.build_data_provider(src_id)
+                            .ok()
+                            .map(|p| p.lock().get_metadata().total_blocks)
+                            .unwrap_or(0);
+                        if total_blocks > 0 {
+                            if let Some(tgt_node) = self.nodes.iter_mut().find(|n| n.id == tgt_id) {
+                                if let WorkflowNodeKind::BlockSelector { blocks } = &mut tgt_node.kind {
+                                    *blocks = format!("0-{}", total_blocks - 1);
+                                    self.status_message = format!(
+                                        "Connected Node #{} ➔ Node #{} — auto-filled blocks: 0-{}",
+                                        src_id, tgt_id, total_blocks - 1
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
                 self.connecting_from = None;
             }

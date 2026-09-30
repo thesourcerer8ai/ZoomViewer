@@ -863,6 +863,146 @@ impl DumpDataProvider for SearchContextDataProvider {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// BlockSelectorDataProvider
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A provider that forwards only the blocks whose indices are in `selected_blocks`,
+/// emitting them contiguously in ascending order.
+///
+/// A "block" is `block_size × page_length` bytes in the upstream stream.
+/// The output metadata has the same `page_length` and `block_size` as the source;
+/// only the total block / page / size count is reduced.
+pub struct BlockSelectorDataProvider {
+    source: Arc<Mutex<dyn DumpDataProvider>>,
+    /// Sorted, deduplicated list of source block indices to expose.
+    selected_blocks: Vec<u64>,
+    /// Human-readable block spec string (used for the cache identity).
+    block_spec: String,
+    metadata: FileMetadata,
+    identity: String,
+    /// Number of bytes per block in the upstream source.
+    block_bytes: u64,
+}
+
+impl BlockSelectorDataProvider {
+    /// Create a new `BlockSelectorDataProvider`.
+    ///
+    /// # Arguments
+    /// * `source`          – Upstream provider.
+    /// * `selected_blocks` – Sorted, deduplicated list of block indices to keep.
+    /// * `block_spec`      – Original spec string (used only for cache identity).
+    pub fn new(
+        source: Arc<Mutex<dyn DumpDataProvider>>,
+        selected_blocks: Vec<u64>,
+        block_spec: String,
+    ) -> Self {
+        let (page_length, block_size, src_identity) = {
+            let g = source.lock();
+            let m = g.get_metadata();
+            (m.page_length, m.block_size, g.cache_identity())
+        };
+
+        let block_bytes = (page_length as u64) * (block_size as u64);
+        let total_out_blocks = selected_blocks.len() as u64;
+        let total_size = total_out_blocks * block_bytes;
+
+        let mut hasher = DefaultHasher::new();
+        "BLOCK_SELECTOR".hash(&mut hasher);
+        src_identity.hash(&mut hasher);
+        block_spec.hash(&mut hasher);
+        selected_blocks.hash(&mut hasher);
+        page_length.hash(&mut hasher);
+        block_size.hash(&mut hasher);
+        let identity = format!("blksel_{:016x}", hasher.finish());
+
+        let metadata = FileMetadata::new(
+            format!("blocksel://{}", identity),
+            total_size,
+            page_length,
+            block_size,
+        );
+
+        Self {
+            source,
+            selected_blocks,
+            block_spec,
+            metadata,
+            identity,
+            block_bytes,
+        }
+    }
+
+    /// Number of blocks emitted by this selector.
+    pub fn output_block_count(&self) -> u64 {
+        self.selected_blocks.len() as u64
+    }
+
+    /// Map an output block index to the corresponding source block index.
+    pub fn source_block(&self, output_block: u64) -> Option<u64> {
+        self.selected_blocks.get(output_block as usize).copied()
+    }
+
+    /// Return the human-readable block spec string.
+    pub fn block_spec(&self) -> &str {
+        &self.block_spec
+    }
+}
+
+impl DumpDataProvider for BlockSelectorDataProvider {
+    fn read_bytes(&mut self, offset: u64, length: u32) -> Result<Vec<u8>> {
+        if length == 0 || self.block_bytes == 0 || offset >= self.metadata.size {
+            return Ok(vec![0u8; length as usize]);
+        }
+
+        let total_size = self.metadata.size;
+        let bb = self.block_bytes;
+        let mut buffer = vec![0u8; length as usize];
+
+        let readable_end = (offset + length as u64).min(total_size);
+
+        // Which output block range do we need?
+        let start_ob = offset / bb;
+        let end_ob = (readable_end.saturating_sub(1)) / bb;
+
+        for ob in start_ob..=end_ob {
+            if ob as usize >= self.selected_blocks.len() {
+                break;
+            }
+            let src_block = self.selected_blocks[ob as usize];
+            let out_block_start = ob * bb;
+            let out_block_end = out_block_start + bb;
+
+            let seg_start = offset.max(out_block_start);
+            let seg_end = readable_end.min(out_block_end);
+            if seg_end <= seg_start {
+                continue;
+            }
+
+            // Offset within this block
+            let in_block_off = seg_start - out_block_start;
+            let seg_len = (seg_end - seg_start) as u32;
+            let src_offset = src_block * bb + in_block_off;
+
+            let bytes = self.source.lock().read_bytes(src_offset, seg_len)?;
+
+            let dest_start = (seg_start - offset) as usize;
+            let copy_len = bytes.len().min(seg_len as usize);
+            buffer[dest_start..dest_start + copy_len].copy_from_slice(&bytes[..copy_len]);
+        }
+
+        Ok(buffer)
+    }
+
+    fn get_metadata(&self) -> FileMetadata {
+        self.metadata.clone()
+    }
+
+    fn cache_identity(&self) -> String {
+        self.identity.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1013,5 +1153,45 @@ mod tests {
 
         let read = filtered.read_bytes(0, 100).unwrap();
         assert_eq!(read, vec![0u8; 100]);
+    }
+
+    // ── BlockSelectorDataProvider tests ───────────────────────────────────────
+
+    #[test]
+    fn test_block_selector_basic() {
+        use crate::workflow::parse_block_spec;
+        // page_length=512, block_size=64 → one block = 32 768 bytes.
+        // 4 blocks → 4 × 32 768 = 131 072 bytes total.
+        const PAGE: usize = 512;
+        const BLK_PAGES: usize = 64;
+        const BLOCK: usize = PAGE * BLK_PAGES; // 32 768
+        const N_BLOCKS: usize = 4;
+        let mut data = vec![0u8; BLOCK * N_BLOCKS];
+        for blk in 0u8..N_BLOCKS as u8 {
+            let start = blk as usize * BLOCK;
+            data[start..start + BLOCK].fill(blk + 1);
+        }
+        let mut temp = NamedTempFile::new().unwrap();
+        temp.write_all(&data).unwrap();
+        temp.flush().unwrap();
+        let loader = FileLoader::new(temp.path(), PAGE as u32, BLK_PAGES as u32).unwrap();
+        let source = Arc::new(Mutex::new(FileDataProvider::new(loader)));
+
+        // Select only blocks 0 and 2 (max valid index = 3)
+        let selected = parse_block_spec("0,2", 3).unwrap();
+        let mut provider = BlockSelectorDataProvider::new(source, selected, "0,2".to_string());
+
+        let meta = provider.get_metadata();
+        // 2 selected blocks × 32 768 bytes = 65 536 bytes
+        assert_eq!(meta.size, (2 * BLOCK) as u64);
+        assert_eq!(meta.total_blocks, 2);
+
+        // First BLOCK bytes = block 0 content (0x01)
+        let b0 = provider.read_bytes(0, BLOCK as u32).unwrap();
+        assert!(b0.iter().all(|&b| b == 0x01), "block 0 should be 0x01");
+
+        // Second BLOCK bytes = block 2 content (0x03)
+        let b2 = provider.read_bytes(BLOCK as u64, BLOCK as u32).unwrap();
+        assert!(b2.iter().all(|&b| b == 0x03), "block 2 should be 0x03");
     }
 }
