@@ -14,6 +14,8 @@ use parking_lot::Mutex;
 use crate::data_provider::{DumpDataProvider, FileDataProvider, SearchContextDataProvider, SearchFilteredDataProvider, XorDataProvider};
 use crate::file_loader::FileLoader;
 use crate::types::FileMetadata;
+use crate::pattern_healing::{DataSegment, PatternHealingDataProvider};
+use crate::page_structure_tab::{PageStructureTabState, SegmentKind};
 pub use crate::file_dialog::FileDialog;
 
 /// Status of node execution
@@ -108,6 +110,18 @@ pub enum WorkflowNodeKind {
         /// Number of blocks.
         num_blocks: u32,
     },
+    /// Automated pattern healing node.
+    ///
+    /// Reads every 512-byte DATA sub-block from the upstream provider (using
+    /// the DATA segments from the shared `PageStructureTabState`) and attempts
+    /// to heal it via:
+    ///  • Fill detection (>90 % of 0x00 / 0xFF / 0x77)
+    ///  • LBA / `|Block#` sector regeneration with majority-voted address
+    ///  • P00000 ECC pattern regeneration with the special bit taken from the
+    ///    raw upstream data
+    ///
+    /// All non-DATA bytes (ECC, SA, …) are passed through unchanged.
+    PatternHealing,
 }
 
 /// Data structure for a node in the workflow graph
@@ -273,6 +287,17 @@ impl WorkflowNode {
         }
     }
 
+    pub fn new_pattern_healing(id: usize, pos: [f32; 2]) -> Self {
+        Self {
+            id,
+            name: "Pattern Healing".to_string(),
+            pos,
+            kind: WorkflowNodeKind::PatternHealing,
+            status: NodeExecutionStatus::Idle,
+            output_log: "Connect an upstream node to start healing.".to_string(),
+        }
+    }
+
     pub fn execute(&mut self) {
         self.status = NodeExecutionStatus::Running;
         let start_time = std::time::Instant::now();
@@ -359,6 +384,10 @@ impl WorkflowNode {
                     "NAND Reader node.\nDevice: {}\nDump file: {}\nUse the 'NAND Reader' tab to connect and dump.",
                     device_path, dump_filename
                 );
+            }
+            WorkflowNodeKind::PatternHealing => {
+                self.status = NodeExecutionStatus::Completed;
+                self.output_log = "Pattern Healing node ready.\nConnect an upstream node and view output to start healing.".to_string();
             }
         }
     }
@@ -607,8 +636,18 @@ pub struct WorkflowEditorState {
     /// connection wires from actual node edges instead of fixed offsets (not persisted)
     #[serde(skip, default)]
     pub node_rects: HashMap<usize, egui::Rect>,
+    /// Shared page structure state — used by PatternHealing nodes to know which
+    /// byte ranges within each page are DATA segments (not persisted)
+    #[serde(skip, default)]
+    pub page_structure: Option<Arc<std::sync::Mutex<PageStructureTabState>>>,
+    /// Cached healing statistics per node_id (not persisted)
+    #[serde(skip, default)]
+    pub healing_stats_cache: HashMap<usize, crate::pattern_healing::HealingStats>,
+    /// Live shared healing stats arcs, keyed by node_id.
+    /// The PatternHealingDataProvider writes into these; the UI reads from them.
+    #[serde(skip, default)]
+    pub healing_stats: Arc<Mutex<HashMap<usize, Arc<Mutex<crate::pattern_healing::HealingStats>>>>>,
 }
-
 impl Default for WorkflowEditorState {
     fn default() -> Self {
         Self::new(None)
@@ -668,6 +707,9 @@ impl WorkflowEditorState {
                     active_searches: Arc::new(Mutex::new(HashMap::new())),
                     active_fuse_mounts: Arc::new(Mutex::new(HashMap::new())),
                     node_rects: HashMap::new(),
+                    page_structure: None,
+                    healing_stats_cache: HashMap::new(),
+                    healing_stats: Arc::new(Mutex::new(HashMap::new())),
                 };
             }
         }
@@ -693,6 +735,9 @@ impl WorkflowEditorState {
             active_searches: Arc::new(Mutex::new(HashMap::new())),
             active_fuse_mounts: Arc::new(Mutex::new(HashMap::new())),
             node_rects: HashMap::new(),
+            page_structure: None,
+            healing_stats_cache: HashMap::new(),
+            healing_stats: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -767,6 +812,7 @@ impl WorkflowEditorState {
             WorkflowNodeKind::Concatenate => WorkflowNode::new_concatenate(id, pos),
             WorkflowNodeKind::ModuloPageFilter { .. } => WorkflowNode::new_modulo_page_filter(id, pos),
             WorkflowNodeKind::NandReader { .. } => WorkflowNode::new_nand_reader(id, pos),
+            WorkflowNodeKind::PatternHealing => WorkflowNode::new_pattern_healing(id, pos),
         };
 
         self.nodes.push(node);
@@ -996,6 +1042,50 @@ impl WorkflowEditorState {
                 let loader = FileLoader::new(dump_filename, *page_size, *pages_per_block)
                     .map_err(|e| format!("Failed to open dump file '{}': {}", dump_filename, e))?;
                 let provider = FileDataProvider::new(loader);
+                Ok(Arc::new(Mutex::new(provider)) as Arc<Mutex<dyn DumpDataProvider>>)
+            }
+            WorkflowNodeKind::PatternHealing => {
+                let incoming = self.connections.iter()
+                    .find(|c| c.to_node == target_node_id)
+                    .ok_or_else(|| format!("PatternHealing node #{} has no input connected", target_node_id))?;
+                let upstream = self.build_data_provider_internal(incoming.from_node, ancestors)?;
+
+                // Build the DataSegment list from the shared PageStructureTabState.
+                // If no page structure is set, or it has no DATA segments, pass an empty
+                // list — the provider will fall back to whole-page healing for 512-byte pages.
+                let data_segments: Vec<DataSegment> = if let Some(ps_arc) = &self.page_structure {
+                    let ps = ps_arc.lock().unwrap();
+                    let page_len = upstream.lock().get_metadata().page_length as u32;
+                    let mut segs = Vec::new();
+                    let mut offset: u32 = 0;
+                    for seg in &ps.segments {
+                        let seg_end = offset + seg.size;
+                        if seg.kind == SegmentKind::Data && seg.size >= 512 {
+                            // Only include segments that are large enough for at least one 512-byte block
+                            // and lie within the page boundary.
+                            let clamped_end = seg_end.min(page_len);
+                            if clamped_end > offset {
+                                segs.push(DataSegment { start: offset, end: clamped_end });
+                            }
+                        }
+                        offset = seg_end;
+                    }
+                    segs
+                } else {
+                    Vec::new()
+                };
+
+                let mut provider = PatternHealingDataProvider::new(upstream, data_segments);
+
+                // Wire up shared stats so the UI can read them without rebuilding the provider.
+                let stats_arc = {
+                    let mut map = self.healing_stats.lock();
+                    map.entry(target_node_id)
+                        .or_insert_with(|| Arc::new(Mutex::new(crate::pattern_healing::HealingStats::default())))
+                        .clone()
+                };
+                provider.stats = stats_arc;
+
                 Ok(Arc::new(Mutex::new(provider)) as Arc<Mutex<dyn DumpDataProvider>>)
             }
         };
@@ -1416,8 +1506,7 @@ impl WorkflowEditorState {
     }
 
     /// Poll completed background searches and update nodes
-    pub fn poll_active_searches(&mut self, ctx: &egui::Context) {
-        let mut completed = Vec::new();
+    pub fn poll_active_searches(&mut self, ctx: &egui::Context) {        let mut completed = Vec::new();
         let mut any_running = false;
 
         {
@@ -1738,6 +1827,10 @@ impl WorkflowEditorState {
                             pages_per_block: 64,
                             num_blocks: 1024,
                         });
+                        ui.close_menu();
+                    }
+                    if ui.button("Pattern Healing").clicked() {
+                        self.add_node(WorkflowNodeKind::PatternHealing);
                         ui.close_menu();
                     }
                 });
@@ -2244,6 +2337,103 @@ impl WorkflowEditorState {
                                     .size(11.0),
                                 );
                             }
+                            WorkflowNodeKind::PatternHealing => {
+                                // Show current page structure segments (read-only summary)
+                                let has_structure = self.page_structure.as_ref().map(|ps| {
+                                    let g = ps.lock().unwrap();
+                                    !g.segments.is_empty()
+                                }).unwrap_or(false);
+
+                                if has_structure {
+                                    if let Some(ps_arc) = &self.page_structure {
+                                        let ps = ps_arc.lock().unwrap();
+                                        let data_segs: Vec<_> = ps.segments.iter()
+                                            .filter(|s| s.kind == crate::page_structure_tab::SegmentKind::Data)
+                                            .collect();
+                                        if data_segs.is_empty() {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(255, 180, 60),
+                                                "⚠ No DATA segments defined in Page Structure tab.",
+                                            );
+                                        } else {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(100, 230, 140),
+                                                format!("✔ {} DATA segment(s) from page structure", data_segs.len()),
+                                            );
+                                        }
+                                        drop(ps);
+                                    }
+                                } else {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(255, 180, 60),
+                                        "⚠ No page structure set — will heal whole 512-byte pages.",
+                                    );
+                                    ui.label(
+                                        egui::RichText::new("Define segments in the 'Page Structure' tab.")
+                                            .italics().weak().size(11.0),
+                                    );
+                                }
+
+                                ui.add_space(4.0);
+
+                                // Show live healing statistics
+                                let live_stats: Option<crate::pattern_healing::HealingStats> = {
+                                    let map = self.healing_stats.lock();
+                                    map.get(&node_id).map(|a| a.lock().clone())
+                                };
+                                if let Some(stats) = live_stats {
+                                    ui.separator();
+                                    ui.label(egui::RichText::new("Healing Statistics").strong());
+                                    ui.add_space(2.0);
+                                    egui::Grid::new(format!("healing_stats_{}", node_id))
+                                        .num_columns(2)
+                                        .spacing([8.0, 2.0])
+                                        .striped(true)
+                                        .show(ui, |ui| {
+                                            ui.label("DATA areas:");
+                                            ui.label(format!("{}", stats.total_data_areas));
+                                            ui.end_row();
+                                            ui.label("Fill 0x00:");
+                                            ui.colored_label(egui::Color32::from_rgb(100, 200, 255), format!("{}", stats.healed_fill_00));
+                                            ui.end_row();
+                                            ui.label("Fill 0xFF:");
+                                            ui.colored_label(egui::Color32::from_rgb(100, 200, 255), format!("{}", stats.healed_fill_ff));
+                                            ui.end_row();
+                                            ui.label("Fill 0x77:");
+                                            ui.colored_label(egui::Color32::from_rgb(100, 200, 255), format!("{}", stats.healed_fill_77));
+                                            ui.end_row();
+                                            ui.label("LBA |Block#:");
+                                            ui.colored_label(egui::Color32::from_rgb(100, 230, 140), format!("{}", stats.healed_lba));
+                                            ui.end_row();
+                                            ui.label("P00000 ECC:");
+                                            ui.colored_label(egui::Color32::from_rgb(100, 230, 140), format!("{}", stats.healed_p00000));
+                                            ui.end_row();
+                                            ui.label("Untouched:");
+                                            ui.label(format!("{}", stats.untouched));
+                                            ui.end_row();
+                                            ui.label(egui::RichText::new("Total healed:").strong());
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(80, 220, 120),
+                                                format!("{}", stats.total_healed()),
+                                            );
+                                            ui.end_row();
+                                        });
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new("Statistics update as pages are read.")
+                                            .italics().weak().size(11.0),
+                                    );
+                                }
+
+                                ui.add_space(2.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Healing runs on-the-fly as pages are requested.\n\
+                                         Non-DATA bytes (ECC, SA) are passed through unchanged.",
+                                    )
+                                    .italics().weak().size(11.0),
+                                );
+                            }
                         }
 
                         ui.separator();
@@ -2603,6 +2793,9 @@ mod tests {
             active_searches: Arc::new(Mutex::new(HashMap::new())),
             active_fuse_mounts: Arc::new(Mutex::new(HashMap::new())),
             node_rects: HashMap::new(),
+            page_structure: None,
+            healing_stats_cache: HashMap::new(),
+            healing_stats: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // Build data provider for OutputViewer node 4
@@ -2639,6 +2832,9 @@ mod tests {
             active_searches: Arc::new(Mutex::new(HashMap::new())),
             active_fuse_mounts: Arc::new(Mutex::new(HashMap::new())),
             node_rects: HashMap::new(),
+            page_structure: None,
+            healing_stats_cache: HashMap::new(),
+            healing_stats: Arc::new(Mutex::new(HashMap::new())),
         };
 
         match state.build_data_provider(1) {
@@ -2691,6 +2887,9 @@ mod tests {
             active_searches: Arc::new(Mutex::new(HashMap::new())),
             active_fuse_mounts: Arc::new(Mutex::new(HashMap::new())),
             node_rects: HashMap::new(),
+            page_structure: None,
+            healing_stats_cache: HashMap::new(),
+            healing_stats: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let exported = state.export_node_to_file(2).expect("Export should succeed");
@@ -2790,6 +2989,9 @@ mod tests {
             active_searches: Arc::new(Mutex::new(HashMap::new())),
             active_fuse_mounts: Arc::new(Mutex::new(HashMap::new())),
             node_rects: HashMap::new(),
+            page_structure: None,
+            healing_stats_cache: HashMap::new(),
+            healing_stats: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // Insert XOR
@@ -2881,6 +3083,9 @@ mod tests {
             active_searches: Arc::new(Mutex::new(HashMap::new())),
             active_fuse_mounts: Arc::new(Mutex::new(HashMap::new())),
             node_rects: HashMap::new(),
+            page_structure: None,
+            healing_stats_cache: HashMap::new(),
+            healing_stats: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let (main_p, raw_p) = state_simple.build_hex_providers().unwrap();
@@ -2987,6 +3192,9 @@ mod tests {
             active_searches: Arc::new(Mutex::new(HashMap::new())),
             active_fuse_mounts: Arc::new(Mutex::new(HashMap::new())),
             node_rects: HashMap::new(),
+            page_structure: None,
+            healing_stats_cache: HashMap::new(),
+            healing_stats: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // 1. Before executing search: filtered view has 0 matching pages (suppresses all pages)

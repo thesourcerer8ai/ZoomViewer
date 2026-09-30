@@ -132,8 +132,16 @@ pub struct PageStructureTabState {
     drag_segment: Option<usize>,
 }
 
-impl Default for PageStructureTabState {
-    fn default() -> Self {
+impl std::fmt::Debug for PageStructureTabState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PageStructureTabState")
+            .field("segments", &self.segments.len())
+            .field("target_page_size", &self.target_page_size)
+            .finish()
+    }
+}
+
+impl Default for PageStructureTabState {    fn default() -> Self {
         Self::new()
     }
 }

@@ -443,6 +443,8 @@ impl AppWindow {
 
         // Setup page structure state early so it can be shared with the hex tab draw closure
         let page_structure_state = Arc::new(Mutex::new(PageStructureTabState::new()));
+        // Share the page structure with the workflow so PatternHealing nodes can read DATA segments
+        workflow_state.lock().unwrap().page_structure = Some(page_structure_state.clone());
 
         // Setup fltk-egui for hex tab
         let hex_tab_state = Arc::new(Mutex::new(HexTabState::new()));
