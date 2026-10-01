@@ -16,7 +16,7 @@ use std::time::SystemTime;
 #[cfg(unix)]
 use fuser::{
     spawn_mount2, BackgroundSession, FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData,
-    ReplyDirectory, ReplyEntry, ReplyXattr, Request,
+    ReplyDirectory, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyXattr, Request,
 };
 #[cfg(unix)]
 use libc::{ENOENT, ERANGE};
@@ -135,6 +135,8 @@ pub struct DumpFuseFs {
 impl DumpFuseFs {
     pub fn new(provider: Arc<Mutex<dyn DumpDataProvider>>) -> Self {
         let meta = provider.lock().get_metadata();
+        log::info!("FUSE mount: size={} total_blocks={} total_pages={} page_length={} block_size={}",
+            meta.size, meta.total_blocks, meta.total_pages, meta.page_length, meta.block_size);
         let meta_json = serde_json::to_vec_pretty(&meta).unwrap_or_default();
         Self {
             provider,
@@ -167,7 +169,7 @@ impl DumpFuseFs {
             InodeKind::DumpBin => Some(FileAttr {
                 ino,
                 size: self.meta.size,
-                blocks: (self.meta.size + 511) / 512,
+                blocks: self.meta.size.saturating_add(511) / 512,
                 atime: ttl_time,
                 mtime: ttl_time,
                 ctime: ttl_time,
@@ -382,8 +384,11 @@ impl Filesystem for DumpFuseFs {
             self.meta.total_blocks,
         );
         if let Some(attr) = self.file_attr_for_kind(kind, ino) {
+            log::debug!("getattr ino={} kind={:?} size={} blocks={}", ino, kind, attr.size, attr.blocks);
             reply.attr(&Duration::from_secs(1), &attr);
         } else {
+            log::warn!("getattr ino={} → ENOENT (kind={:?}, total_blocks={}, total_pages={})",
+                ino, kind, self.meta.total_blocks, self.meta.total_pages);
             reply.error(ENOENT);
         }
     }
@@ -455,6 +460,49 @@ impl Filesystem for DumpFuseFs {
         }
     }
 
+    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        let kind = parse_inode(
+            ino,
+            self.meta.block_size,
+            self.meta.total_pages,
+            self.meta.total_blocks,
+        );
+        match kind {
+            InodeKind::DumpBin | InodeKind::MetaJson
+            | InodeKind::BlockPage { .. } | InodeKind::FlatPage(_) => {
+                // Read-only filesystem — reject any write flags.
+                if flags & libc::O_WRONLY != 0 || flags & libc::O_RDWR != 0 {
+                    reply.error(libc::EACCES);
+                } else {
+                    reply.opened(0, 0);
+                }
+            }
+            _ => reply.error(ENOENT),
+        }
+    }
+
+    /// Report filesystem statistics.
+    ///
+    /// This is called by file managers before they open a file to check whether
+    /// there is enough space to cache/display it.  Without this implementation
+    /// fuser returns all-zeros, which causes Nautilus/Thunar to refuse opening
+    /// very large virtual files.  We report the total virtual data size as the
+    /// "total blocks" figure and 0 free space (read-only source).
+    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
+        let bsize: u32 = 4096;
+        let blocks = self.meta.size.saturating_add((bsize as u64) - 1) / (bsize as u64);
+        reply.statfs(
+            blocks,   // total data blocks
+            0,        // free blocks (read-only)
+            0,        // free blocks available to unprivileged users
+            self.meta.total_pages.saturating_add(3), // total inodes (rough estimate)
+            0,        // free inodes
+            bsize,    // filesystem block size
+            255,      // maximum filename length
+            0,        // filesystem fragment size (unused on Linux)
+        );
+    }
+
     fn readdir(
         &mut self,
         _req: &Request<'_>,
@@ -513,7 +561,11 @@ impl Filesystem for DumpFuseFs {
                     0
                 };
 
-                for b in start_block..self.meta.total_blocks {
+                // Cap the listed blocks to prevent hanging on very large virtual
+                // filesystems (e.g. Block Permutation with large N).  All blocks are
+                // still individually addressable via direct lookup ("blocks/block_N").
+                let max_listed_blocks = self.meta.total_blocks.min(1000);
+                for b in start_block..max_listed_blocks {
                     let next_offset = 2 + (b as i64) + 1;
                     let name = format!("block_{:04}", b);
                     let b_ino = inode_for_block_dir(b);
@@ -641,7 +693,12 @@ impl Filesystem for DumpFuseFs {
         );
 
         if !matches!(kind, InodeKind::Root | InodeKind::DumpBin) {
-            reply.size(0);
+            // No xattrs on these inodes.
+            if size == 0 {
+                reply.size(0);
+            } else {
+                reply.data(b"");
+            }
             return;
         }
 
@@ -693,20 +750,44 @@ impl ActiveFuseMount {
         provider: Arc<Mutex<dyn DumpDataProvider>>,
         mount_path: &Path,
     ) -> Result<Self, String> {
-        // Ensure directory exists
-        if !mount_path.exists() {
-            std::fs::create_dir_all(mount_path)
-                .map_err(|e| format!("Failed to create mount directory '{}': {}", mount_path.display(), e))?;
-        } else {
-            // Attempt cleanup of any previous dead mount on this path
+        // Helper: attempt every available unmount method, ignoring errors.
+        let try_unmount = |path: &Path| {
+            // fusermount3 — standard on modern Linux (FUSE3).
             let _ = std::process::Command::new("fusermount3")
-                .arg("-u")
-                .arg("-z")
-                .arg(mount_path)
+                .args(["-u", "-z"])
+                .arg(path)
                 .output();
+            // fusermount — older systems / FUSE2 fallback.
+            let _ = std::process::Command::new("fusermount")
+                .args(["-u", "-z"])
+                .arg(path)
+                .output();
+            // umount -l — lazy detach as last resort.
+            let _ = std::process::Command::new("umount")
+                .arg("-l")
+                .arg(path)
+                .output();
+        };
+
+        // Ensure mount directory exists.  A stale FUSE mount point may cause
+        // path.exists() to return false even though the directory entry is
+        // present, so create_dir_all can return EEXIST.  We treat that as
+        // success after clearing any stale mount.
+        match std::fs::create_dir_all(mount_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Directory entry exists — could be a stale mount.  Clear it.
+                try_unmount(mount_path);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "Failed to create mount directory '{}': {}",
+                    mount_path.display(), e
+                ));
+            }
         }
 
-        let fs = DumpFuseFs::new(provider);
         let options = [
             MountOption::RO,
             MountOption::FSName("zoomviewer".to_string()),
@@ -714,9 +795,36 @@ impl ActiveFuseMount {
             MountOption::NoAtime,
         ];
 
-        match spawn_mount2(fs, mount_path, &options) {
+        // Keep a clone of the Arc so we can build a second DumpFuseFs for the retry.
+        let provider_retry = provider.clone();
+
+        match spawn_mount2(DumpFuseFs::new(provider), mount_path, &options) {
             Ok(session) => {
                 log::info!("Mounted FUSE filesystem at '{}'", mount_path.display());
+                return Ok(Self {
+                    mount_path: mount_path.to_path_buf(),
+                    is_mounted: Arc::new(AtomicBool::new(true)),
+                    status: "Mounted and ready".to_string(),
+                    error: None,
+                    session: Some(session),
+                });
+            }
+            Err(first_err) => {
+                log::warn!(
+                    "Initial mount failed at '{}' ({}), attempting to clear stale mount…",
+                    mount_path.display(),
+                    first_err
+                );
+                try_unmount(mount_path);
+                // Brief pause so the kernel releases the mount point.
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+        }
+
+        // Retry once after clearing the stale mount.
+        match spawn_mount2(DumpFuseFs::new(provider_retry), mount_path, &options) {
+            Ok(session) => {
+                log::info!("Mounted FUSE filesystem at '{}' (after clearing stale mount)", mount_path.display());
                 Ok(Self {
                     mount_path: mount_path.to_path_buf(),
                     is_mounted: Arc::new(AtomicBool::new(true)),
@@ -726,7 +834,13 @@ impl ActiveFuseMount {
                 })
             }
             Err(e) => {
-                let err_msg = format!("Failed to mount FUSE filesystem at '{}': {}", mount_path.display(), e);
+                let err_msg = format!(
+                    "Failed to mount FUSE filesystem at '{}': {}. \
+                    Try running: fusermount3 -u \"{}\"",
+                    mount_path.display(),
+                    e,
+                    mount_path.display()
+                );
                 log::error!("{}", err_msg);
                 Err(err_msg)
             }

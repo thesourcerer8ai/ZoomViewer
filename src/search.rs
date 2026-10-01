@@ -454,7 +454,7 @@ mod tests {
         let progress = Arc::new(AtomicU64::new(0));
         let (tx, rx) = std::sync::mpsc::channel();
 
-        let res = search_provider_with_sender(provider, &options, cancel, progress, Some(tx)).unwrap();
+        let res = search_provider_with_sender(provider, &options, cancel, progress, 0, 0, Some(tx)).unwrap();
         assert_eq!(res.len(), 3);
 
         // Verify matches were streamed into rx in real-time

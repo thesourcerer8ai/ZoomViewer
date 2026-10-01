@@ -2867,7 +2867,7 @@ impl WorkflowEditorState {
                                 ui.add_space(4.0);
                                 ui.colored_label(
                                     egui::Color32::from_rgb(255, 180, 60),
-                                    "⚠ Output = 2^N − 1 blocks. Use only with small N.",
+                                    "⚠ Output = N×(N+1)/2 blocks. Use only with small N.",
                                 );
                             }
                         }
@@ -3156,6 +3156,23 @@ impl WorkflowEditorState {
     }
 }
 
+impl Drop for WorkflowEditorState {
+    fn drop(&mut self) {
+        // Unmount all active FUSE nodes when the workflow is dropped (application exit).
+        // active_fuse_mounts uses Arc<Mutex<...>> so we can't move out, but we can
+        // drain the map in place and call unmount() on each entry.
+        let mut mounts = self.active_fuse_mounts.lock();
+        if !mounts.is_empty() {
+            log::info!("Unmounting {} active FUSE filesystem(s) on shutdown…", mounts.len());
+            for (node_id, mount) in mounts.iter_mut() {
+                log::info!("  Unmounting FUSE node #{} at '{}'", node_id, mount.mount_path.display());
+                mount.unmount();
+            }
+            mounts.clear();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3194,6 +3211,7 @@ mod tests {
             bytes_before: 0,
             bytes_after: 0,
             results: Vec::new(),
+            resume_from_offset: None,
         });
 
         assert_eq!(state.nodes.len(), count_before + 1);
