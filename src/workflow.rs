@@ -2153,9 +2153,14 @@ impl WorkflowEditorState {
                                 limit_note
                             )
                         } else {
+                            let pages_searched = if page_len > 0 { scan_offset / page_len } else { 0 };
+                            let total_pages    = if page_len > 0 { total_bytes  / page_len } else { 0 };
                             format!(
-                                "{} Completed!\nMatches found: {} across {} pages{}",
-                                node_label, match_count, unique_pages, limit_note
+                                "{} Completed!\nMatches: {} in {} pages\nSearched {} of {} pages ({:.1}%){}",
+                                node_label, match_count, unique_pages,
+                                pages_searched, total_pages,
+                                if total_pages > 0 { pages_searched as f64 / total_pages as f64 * 100.0 } else { 0.0 },
+                                limit_note
                             )
                         };
                         self.status_message = format!(
