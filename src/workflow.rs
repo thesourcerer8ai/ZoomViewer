@@ -1752,7 +1752,11 @@ impl WorkflowEditorState {
                     search.live_match_count += 1;
                 }
                 if let Ok(res) = search.rx.try_recv() {
-                    completed.push((node_id, res, search.prior_result_count));
+                    // Capture the scan offset and cancelled flag at the moment the
+                    // thread finished, so we can set resume_from_offset correctly.
+                    let scan_offset = search.progress_bytes.load(Ordering::Relaxed);
+                    let was_cancelled = search.cancel_flag.load(Ordering::Relaxed);
+                    completed.push((node_id, res, search.prior_result_count, scan_offset, was_cancelled));
                 }
             }
         }
@@ -1761,7 +1765,7 @@ impl WorkflowEditorState {
             ctx.request_repaint();
         }
 
-        for (node_id, res, _prior_count) in completed {
+        for (node_id, res, _prior_count, scan_offset, was_cancelled) in completed {
             self.active_searches.lock().remove(&node_id);
             let page_len = match self.connections.iter().find(|c| c.to_node == node_id) {
                 Some(c) => self.build_data_provider(c.from_node).map(|p| p.lock().get_metadata().page_length as u64).unwrap_or(512),
@@ -1784,10 +1788,15 @@ impl WorkflowEditorState {
                             node_res.extend(new_results);
                             match_count = node_res.len();
                             hit_limit = match_count >= *max_matches;
-                            // If we hit the limit, record where to resume from next time.
-                            // Otherwise clear the resume point (search reached end of data).
+
+                            // Determine where to resume from:
+                            //  • Limit hit → byte after the last match offset
+                            //  • Cancelled  → the scan offset where the thread stopped
+                            //  • Reached end → no resume point
                             *resume_from_offset = if hit_limit {
                                 last_offset.map(|o| o + 1)
+                            } else if was_cancelled {
+                                Some(scan_offset)
                             } else {
                                 None
                             };
@@ -1806,7 +1815,9 @@ impl WorkflowEditorState {
                         } else { 0 };
 
                         node.status = NodeExecutionStatus::Completed;
-                        let limit_note = if hit_limit {
+                        let limit_note = if was_cancelled {
+                            "\n⏹ Search stopped — click ▶ Continue to resume from here."
+                        } else if hit_limit {
                             "\n⚠ Limit reached — increase limit and click ▶ Continue to find more."
                         } else {
                             "\n✔ Search reached end of data."
@@ -2508,7 +2519,7 @@ impl WorkflowEditorState {
                                         if limit_hit {
                                             ui.colored_label(
                                                 egui::Color32::from_rgb(255, 200, 80),
-                                                "Limit reached — increase limit to find more.",
+                                                "Limit reached — increase limit or click ▶ Continue.",
                                             );
                                         }
                                     }
@@ -2525,7 +2536,7 @@ impl WorkflowEditorState {
                                         }
                                         // Show Continue only when there's a resume point.
                                         if can_continue {
-                                            if ui.button("▶ Continue").on_hover_text("Keep existing results and continue searching from where the limit was reached").clicked() {
+                                            if ui.button("▶ Continue").on_hover_text("Keep existing results and continue searching from where it was stopped or the limit was reached").clicked() {
                                                 action_run_search = Some(node_id);
                                             }
                                         }
