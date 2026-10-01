@@ -134,6 +134,22 @@ pub enum WorkflowNodeKind {
     ///
     /// All non-DATA bytes (ECC, SA, …) are passed through unchanged.
     PatternHealing,
+    /// Block permutation node — enumerates every non-empty subset of the
+    /// upstream blocks and emits them as a single concatenated stream.
+    ///
+    /// For N source blocks the output contains `2^N - 1` blocks total.
+    ///
+    /// **Unordered** (`ordered = false`): subsets are grouped by size, so all
+    /// singletons come first, then all pairs, then all triples, …
+    /// Example (N=4): `0 1 2 3 | 0 1  0 2  0 3  1 2  1 3  2 3 | …`
+    ///
+    /// **Ordered** (`ordered = true`): subsets are emitted in strict
+    /// lexicographic order, grouping by leading element first.
+    /// Example (N=4): `0  0 1  0 1 2  0 1 2 3  0 1 3  0 2  …`
+    BlockPermutation {
+        /// `true` → lexicographic / ordered mode; `false` → size-grouped mode.
+        ordered: bool,
+    },
 }
 
 /// Data structure for a node in the workflow graph
@@ -339,6 +355,18 @@ impl WorkflowNode {
         }
     }
 
+    pub fn new_block_permutation(id: usize, pos: [f32; 2]) -> Self {
+        Self {
+            id,
+            name: "Block Permutation".to_string(),
+            pos,
+            kind: WorkflowNodeKind::BlockPermutation { ordered: false },
+            status: NodeExecutionStatus::Idle,
+            output_log: "Connect an upstream node to enumerate block subsets.".to_string(),
+            collapsed: false,
+        }
+    }
+
     pub fn execute(&mut self) {
         self.status = NodeExecutionStatus::Running;
         let start_time = std::time::Instant::now();
@@ -438,6 +466,14 @@ impl WorkflowNode {
                     format!("blocks: {}", blocks)
                 };
                 self.output_log = format!("Block Selector ready.\nSelected: {}", spec);
+            }
+            WorkflowNodeKind::BlockPermutation { ordered } => {
+                self.status = NodeExecutionStatus::Completed;
+                let mode = if *ordered { "ordered (lexicographic)" } else { "unordered (size-grouped)" };
+                self.output_log = format!(
+                    "Block Permutation ready.\nMode: {}\nConnect an upstream node to enumerate all subsets.\n⚠ Output size = 2^N − 1 blocks.",
+                    mode
+                );
             }
         }
     }
@@ -927,6 +963,7 @@ impl WorkflowEditorState {
             WorkflowNodeKind::NandReader { .. } => WorkflowNode::new_nand_reader(id, pos),
             WorkflowNodeKind::PatternHealing => WorkflowNode::new_pattern_healing(id, pos),
             WorkflowNodeKind::BlockSelector { .. } => WorkflowNode::new_block_selector(id, pos),
+            WorkflowNodeKind::BlockPermutation { .. } => WorkflowNode::new_block_permutation(id, pos),
         };
 
         self.nodes.push(node);
@@ -1228,6 +1265,14 @@ impl WorkflowEditorState {
                     .unwrap_or_else(|| (0..=max_block).collect());
 
                 let provider = crate::data_provider::BlockSelectorDataProvider::new(upstream, selected, spec);
+                Ok(Arc::new(Mutex::new(provider)) as Arc<Mutex<dyn DumpDataProvider>>)
+            }
+            WorkflowNodeKind::BlockPermutation { ordered } => {
+                let incoming = self.connections.iter()
+                    .find(|c| c.to_node == target_node_id)
+                    .ok_or_else(|| format!("BlockPermutation node #{} has no input connected", target_node_id))?;
+                let upstream = self.build_data_provider_internal(incoming.from_node, ancestors)?;
+                let provider = crate::data_provider::BlockPermutationDataProvider::new(upstream, *ordered);
                 Ok(Arc::new(Mutex::new(provider)) as Arc<Mutex<dyn DumpDataProvider>>)
             }
         };
@@ -1981,6 +2026,10 @@ impl WorkflowEditorState {
                         });
                         ui.close_menu();
                     }
+                    if ui.button("Block Permutation").clicked() {
+                        self.add_node(WorkflowNodeKind::BlockPermutation { ordered: false });
+                        ui.close_menu();
+                    }
                 });
             });
 
@@ -2653,6 +2702,34 @@ impl WorkflowEditorState {
                                          Example: \"0,5,10-20,0xFF\"",
                                     )
                                     .italics().weak().size(11.0),
+                                );
+                            }
+                            WorkflowNodeKind::BlockPermutation { ordered } => {
+                                ui.checkbox(ordered, "Ordered (lexicographic)");
+
+                                ui.add_space(4.0);
+                                if *ordered {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Subsets in strict lexicographic order:\n\
+                                             0  0,1  0,1,2  0,1,2,3  0,1,3  0,2  …",
+                                        )
+                                        .italics().weak().size(11.0),
+                                    );
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Subsets grouped by size (singletons first):\n\
+                                             0  1  2  3 | 0,1  0,2  0,3  1,2  … | …",
+                                        )
+                                        .italics().weak().size(11.0),
+                                    );
+                                }
+
+                                ui.add_space(4.0);
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(255, 180, 60),
+                                    "⚠ Output = 2^N − 1 blocks. Use only with small N.",
                                 );
                             }
                         }

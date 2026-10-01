@@ -1195,3 +1195,225 @@ mod tests {
         assert!(b2.iter().all(|&b| b == 0x03), "block 2 should be 0x03");
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BlockPermutationDataProvider
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Generates all permutations of source blocks as a single concatenated byte stream.
+///
+/// Given N source blocks the provider enumerates every ordered selection of
+/// increasing length from 1 up to N and emits the corresponding blocks
+/// back-to-back.
+///
+/// Two ordering modes are supported:
+///
+/// **Unordered** (`ordered = false`) — length increases first, then blocks
+/// within each length group cycle together.  For N = 4 blocks the output is:
+/// ```text
+/// [0][1][2][3][0,1][0,2][0,3][1,2][1,3][2,3][0,1,2][0,1,3][0,2,3][1,2,3][0,1,2,3]
+/// ```
+/// Blocks are therefore sorted in the way the user described:
+/// `0 1 2 3 | 0 1  0 2  0 3 | …`
+///
+/// **Ordered** (`ordered = true`) — blocks are grouped by their leading index
+/// first, so all combinations that start with 0 come before those starting
+/// with 1, and so on.  For N = 4 blocks the output is:
+/// ```text
+/// [0][0,1][0,1,2][0,1,2,3][0,1,3][0,2][0,2,3][0,3][1][1,2][1,2,3][1,3][2][2,3][3]
+/// ```
+///
+/// The total number of output blocks equals `2^N - 1` (all non-empty subsets).
+/// Each output block is exactly `block_bytes` bytes long (same as the source).
+pub struct BlockPermutationDataProvider {
+    source: Arc<Mutex<dyn DumpDataProvider>>,
+    /// The permutation table: each entry is a source block index.
+    /// Entry `i` tells us which source block occupies output block `i`.
+    permutation: Vec<u64>,
+    metadata: FileMetadata,
+    identity: String,
+    /// Number of bytes per block.
+    block_bytes: u64,
+}
+
+impl BlockPermutationDataProvider {
+    /// Create a new `BlockPermutationDataProvider`.
+    ///
+    /// # Arguments
+    /// * `source`  – Upstream provider.
+    /// * `ordered` – `true` for "ordered" (group by leading index), `false`
+    ///               for "unordered" (cycle together within each length).
+    pub fn new(source: Arc<Mutex<dyn DumpDataProvider>>, ordered: bool) -> Self {
+        let (page_length, block_size, total_blocks, src_identity) = {
+            let g = source.lock();
+            let m = g.get_metadata();
+            (m.page_length, m.block_size, m.total_blocks, g.cache_identity())
+        };
+
+        let block_bytes = (page_length as u64) * (block_size as u64);
+        let n = total_blocks as usize;
+
+        // Build the permutation table: for every non-empty subset of {0..n-1}
+        // determine which output position it occupies and flatten the subsets
+        // into a sequence of individual source block indices.
+        let permutation = if ordered {
+            Self::build_ordered(n)
+        } else {
+            Self::build_unordered(n)
+        };
+
+        let out_blocks = permutation.len() as u64;
+        let total_size = out_blocks * block_bytes;
+
+        let mut hasher = DefaultHasher::new();
+        "BLOCK_PERMUTATION".hash(&mut hasher);
+        src_identity.hash(&mut hasher);
+        ordered.hash(&mut hasher);
+        total_blocks.hash(&mut hasher);
+        page_length.hash(&mut hasher);
+        block_size.hash(&mut hasher);
+        let identity = format!("blkperm_{:016x}", hasher.finish());
+
+        let metadata = FileMetadata::new(
+            format!("blkperm://{}", identity),
+            total_size,
+            page_length,
+            block_size,
+        );
+
+        Self {
+            source,
+            permutation,
+            metadata,
+            identity,
+            block_bytes,
+        }
+    }
+
+    /// Unordered: group subsets by size; within each size group emit the
+    /// subsets in lexicographic order and lay their members sequentially.
+    ///
+    /// Example N=4:
+    ///   length 1: [0][1][2][3]
+    ///   length 2: [0,1][0,2][0,3][1,2][1,3][2,3]
+    ///   length 3: [0,1,2][0,1,3][0,2,3][1,2,3]
+    ///   length 4: [0,1,2,3]
+    fn build_unordered(n: usize) -> Vec<u64> {
+        let mut result = Vec::new();
+        for len in 1..=n {
+            // Generate all combinations of `len` items from 0..n in lex order.
+            let mut combo = (0..len).collect::<Vec<usize>>();
+            loop {
+                for &idx in &combo {
+                    result.push(idx as u64);
+                }
+                // Advance to next combination.
+                let mut i = len;
+                loop {
+                    if i == 0 {
+                        // All combinations for this length exhausted.
+                        break;
+                    }
+                    i -= 1;
+                    if combo[i] < n - (len - i) {
+                        combo[i] += 1;
+                        for j in (i + 1)..len {
+                            combo[j] = combo[j - 1] + 1;
+                        }
+                        break;
+                    }
+                    if i == 0 {
+                        break;
+                    }
+                }
+                // Check whether we've just exhausted this length.
+                if combo[0] > n - len {
+                    break;
+                }
+            }
+        }
+        result
+    }
+
+    /// Ordered: sort subsets by their first element, then recursively.
+    /// This is equivalent to lexicographic order on the subsets themselves
+    /// as tuples.
+    ///
+    /// Example N=4 (lex order of all non-empty subsets):
+    ///   {0},{0,1},{0,1,2},{0,1,2,3},{0,1,3},{0,2},{0,2,3},{0,3},
+    ///   {1},{1,2},{1,2,3},{1,3},{2},{2,3},{3}
+    fn build_ordered(n: usize) -> Vec<u64> {
+        // Generate all 2^n - 1 non-empty subsets in lexicographic order.
+        // A subset is represented as a sorted Vec<usize>.
+        let total = (1usize << n).saturating_sub(1);
+        let mut subsets: Vec<Vec<usize>> = Vec::with_capacity(total);
+        for mask in 1u64..(1u64 << n) {
+            let subset: Vec<usize> = (0..n).filter(|&b| mask & (1 << b) != 0).collect();
+            subsets.push(subset);
+        }
+        // Sort lexicographically.
+        subsets.sort();
+        // Flatten.
+        subsets.into_iter().flatten().map(|x| x as u64).collect()
+    }
+
+    /// Total number of output blocks.
+    pub fn output_block_count(&self) -> u64 {
+        // The permutation table has one entry per output-block slot.
+        // Divide by the number of entries per block to get block count
+        // — but actually each entry IS one block.  The permutation maps
+        // output block i → source block index.
+        self.permutation.len() as u64
+    }
+}
+
+impl DumpDataProvider for BlockPermutationDataProvider {
+    fn read_bytes(&mut self, offset: u64, length: u32) -> Result<Vec<u8>> {
+        if length == 0 || self.block_bytes == 0 || offset >= self.metadata.size {
+            return Ok(vec![0u8; length as usize]);
+        }
+
+        let total_size = self.metadata.size;
+        let bb = self.block_bytes;
+        let mut buffer = vec![0u8; length as usize];
+
+        let readable_end = (offset + length as u64).min(total_size);
+        let start_ob = offset / bb;
+        let end_ob = (readable_end.saturating_sub(1)) / bb;
+
+        for ob in start_ob..=end_ob {
+            if ob as usize >= self.permutation.len() {
+                break;
+            }
+            let src_block = self.permutation[ob as usize];
+            let out_block_start = ob * bb;
+            let out_block_end = out_block_start + bb;
+
+            let seg_start = offset.max(out_block_start);
+            let seg_end = readable_end.min(out_block_end);
+            if seg_end <= seg_start {
+                continue;
+            }
+
+            let in_block_off = seg_start - out_block_start;
+            let seg_len = (seg_end - seg_start) as u32;
+            let src_offset = src_block * bb + in_block_off;
+
+            let bytes = self.source.lock().read_bytes(src_offset, seg_len)?;
+
+            let dest_start = (seg_start - offset) as usize;
+            let copy_len = bytes.len().min(seg_len as usize);
+            buffer[dest_start..dest_start + copy_len].copy_from_slice(&bytes[..copy_len]);
+        }
+
+        Ok(buffer)
+    }
+
+    fn get_metadata(&self) -> FileMetadata {
+        self.metadata.clone()
+    }
+
+    fn cache_identity(&self) -> String {
+        self.identity.clone()
+    }
+}
