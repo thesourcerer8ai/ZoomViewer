@@ -148,7 +148,7 @@ impl Default for PageStructureTabState {    fn default() -> Self {
 
 impl PageStructureTabState {
     pub fn new() -> Self {
-        Self {
+        let mut s = Self {
             segments: Vec::new(),
             target_page_size: 0,
             case_file_path: "download.case".to_string(),
@@ -157,7 +157,14 @@ impl PageStructureTabState {
             case_xml_cache: String::new(),
             xml_dirty: true,
             drag_segment: None,
+        };
+        // Auto-load download.case from the current working directory if it exists
+        if std::path::Path::new("download.case").is_file() {
+            s.load_case_file();
+            s.status_msg = "Auto-loaded download.case".to_string();
+            s.status_is_error = false;
         }
+        s
     }
 
     // ── Derived data ──────────────────────────────────────────────────────────

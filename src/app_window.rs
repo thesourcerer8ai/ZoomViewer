@@ -794,8 +794,12 @@ impl AppWindow {
         let hex_tab_switch = hex_tab_state.clone();
         let viewport_manager_tab_switch = viewport_manager.clone();
         let metadata_tab_switch = metadata.clone();
+        // Tracks which tab was active before the current switch so we can avoid
+        // overwriting the Hex Tab position when coming back from unrelated tabs
+        // (e.g. Page Structure) that don't affect NAND viewer position.
+        let mut previous_tab_label = String::new();
 
-        tabs_switch.set_callback(move |_| {
+        tabs_switch.set_callback(move |tabs_cb| {
             gl_win_switch.redraw();
             gl_search_switch.redraw();
             gl_hex_switch.redraw();
@@ -814,27 +818,33 @@ impl AppWindow {
                     gl_page_structure_switch.set_visible_focus();
                 } else if trimmed.starts_with("Hex") {
                     gl_hex_switch.set_visible_focus();
-                    // Synchronize NAND viewer position to Hex Tab
-                    let pl = metadata_tab_switch.page_length as u64;
-                    let bs = metadata_tab_switch.block_size as u64;
-                    let gh = metadata_tab_switch.grid_height as u64;
-                    if pl > 0 && bs > 0 && gh > 0 {
-                        if let Ok(vm) = viewport_manager_tab_switch.try_lock() {
-                            let vp = vm.get_viewport();
-                            let scale = 2.0_f64.powi(vp.level);
-                            let pixel_x_l0 = (vp.center_x * scale).max(0.0) as u64;
-                            let pixel_y_l0 = (vp.center_y * scale).max(0.0) as u64;
-                            let block_width_pixels = pl * 8;
-                            let block_height_pixels = bs;
-                            let block_x = pixel_x_l0 / block_width_pixels;
-                            let block_y = pixel_y_l0 / block_height_pixels;
-                            let block = block_x * gh + block_y;
-                            let page = pixel_y_l0 % block_height_pixels;
-                            let byte_in_page = (pixel_x_l0 % block_width_pixels) / 8;
-                            let block_stride = pl * bs;
-                            let offset = block * block_stride + page * pl + byte_in_page;
-                            if let Ok(mut ht) = hex_tab_switch.try_lock() {
-                                ht.pending_jump_offset = Some(offset);
+                    // Only synchronize NAND viewer → Hex Tab when we are actually coming
+                    // FROM the NAND Viewer tab.  When switching back from Page Structure
+                    // (or any other tab), preserve the current Hex Tab position.
+                    let came_from_nand = previous_tab_label.trim().starts_with("NAND Viewer")
+                        || previous_tab_label.trim().starts_with("NAND\t");
+                    if came_from_nand {
+                        let pl = metadata_tab_switch.page_length as u64;
+                        let bs = metadata_tab_switch.block_size as u64;
+                        let gh = metadata_tab_switch.grid_height as u64;
+                        if pl > 0 && bs > 0 && gh > 0 {
+                            if let Ok(vm) = viewport_manager_tab_switch.try_lock() {
+                                let vp = vm.get_viewport();
+                                let scale = 2.0_f64.powi(vp.level);
+                                let pixel_x_l0 = (vp.center_x * scale).max(0.0) as u64;
+                                let pixel_y_l0 = (vp.center_y * scale).max(0.0) as u64;
+                                let block_width_pixels = pl * 8;
+                                let block_height_pixels = bs;
+                                let block_x = pixel_x_l0 / block_width_pixels;
+                                let block_y = pixel_y_l0 / block_height_pixels;
+                                let block = block_x * gh + block_y;
+                                let page = pixel_y_l0 % block_height_pixels;
+                                let byte_in_page = (pixel_x_l0 % block_width_pixels) / 8;
+                                let block_stride = pl * bs;
+                                let offset = block * block_stride + page * pl + byte_in_page;
+                                if let Ok(mut ht) = hex_tab_switch.try_lock() {
+                                    ht.pending_jump_offset = Some(offset);
+                                }
                             }
                         }
                     }
@@ -869,7 +879,9 @@ impl AppWindow {
                 } else if trimmed.starts_with("NAND Reader") {
                     gl_nand_reader_switch.set_visible_focus();
                 }
+                previous_tab_label = lbl.to_string();
             }
+            let _ = tabs_cb; // suppress unused warning
         });
 
         // Create zoom controller
@@ -1186,6 +1198,8 @@ impl AppWindow {
         let mut gl_search_timer = gl_search.clone();
         let mut gl_hex_timer = gl_hex.clone();
         let mut gl_pattern_writer_timer = gl_pattern_writer.clone();
+        let mut gl_page_structure_timer = gl_page_structure.clone();
+        let mut gl_nand_reader_timer = gl_nand_reader.clone();
         let mut gl_win_timer = gl_win.clone();
         let fltk_tile_cache_timer = app_window.fltk_tile_cache.clone();
         let initial_identity = file_loader.as_ref().map(|fl| fl.lock().cache_identity()).unwrap_or_default();
@@ -1302,6 +1316,13 @@ impl AppWindow {
                                 vm.update_viewport(0, center_x, center_y, 1024, 648);
                                 vm.update_task_priorities();
                             }
+                            // Reset Hex Tab to the beginning when a new OutputViewer is shown
+                            if let Ok(mut ht) = hex_tab_timer.try_lock() {
+                                ht.current_page = 0;
+                                ht.col_offset_in_page = 0;
+                                ht.pending_jump_offset = None;
+                                ht.goto_address_input = "0x00000000".to_string();
+                            }
                             tab_viewer_timer.activate();
                             gl_hex_timer.redraw();
                             gl_pattern_writer_timer.redraw();
@@ -1342,10 +1363,17 @@ impl AppWindow {
                 }
             }
 
-            // Always redraw the workflow editor so egui animations (progress bars,
-            // spinners, search progress, etc.) advance at a steady frame rate even
-            // when the mouse is idle.
+            // Always redraw all egui-based GL tabs so their animations, drag
+            // interactions, text cursors, and progress indicators advance at a
+            // steady 20 Hz frame rate even when the mouse is idle.  Without this,
+            // each tab freezes as soon as the user stops moving the mouse because
+            // FLTK only delivers events on mouse activity.
             gl_win_timer.redraw();
+            gl_search_timer.redraw();
+            gl_hex_timer.redraw();
+            gl_page_structure_timer.redraw();
+            gl_pattern_writer_timer.redraw();
+            gl_nand_reader_timer.redraw();
 
             // Repeat timer
             fltk::app::repeat_timeout3(0.05, handle);

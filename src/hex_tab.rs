@@ -658,11 +658,18 @@ impl HexTabState {
             ui.separator();
 
             // Go to Address or Page
-            ui.label("Go:");
+            ui.label("Go:").on_hover_text(
+                "Navigate to an address. Supported formats:\n\
+                 • 0x1A2B3C  — linear byte offset (hex)\n\
+                 • 1234567   — linear byte offset (decimal)\n\
+                 • p512      — page number\n\
+                 • b5p3+0x10 — block 5, page 3, offset 0x10\n\
+                 • 5/3/0x10  — block/page/offset (hex or dec)"
+            );
             let resp = ui.add(
                 egui::TextEdit::singleline(&mut self.goto_address_input)
                     .desired_width(95.0)
-                    .hint_text("0x... or p123"),
+                    .hint_text("0x… p… b/p/off"),
             );
             if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) || ui.button("Go").clicked() {
                 self.handle_goto(meta);
@@ -1654,6 +1661,15 @@ impl HexTabState {
     fn handle_goto(&mut self, meta: &FileMetadata) {
         let input = self.goto_address_input.trim();
 
+        // Block+Page+Offset formats:
+        //   "b<block>p<page>+<offset>"  e.g. "b5p3+0x10" or "b5p3+16"
+        //   "<block>/<page>/<offset>"   e.g. "5/3/0x10"  or "5/3/16"
+        if let Some(linear) = Self::parse_block_page_offset(input, meta) {
+            self.goto_error = None;
+            self.jump_to_linear_offset(linear, meta);
+            return;
+        }
+
         // Check if input is a page number, e.g. "p120" or "page 120"
         if let Some(page_str) = input.strip_prefix('p').or_else(|| input.strip_prefix('P')) {
             if let Ok(p) = page_str.trim().parse::<u64>() {
@@ -1678,8 +1694,61 @@ impl HexTabState {
             self.goto_error = None;
             self.jump_to_linear_offset(offset, meta);
         } else {
-            self.goto_error = Some("Invalid input (use 0x..., dec, or p<num>)".to_string());
+            self.goto_error = Some("Invalid input (use 0x..., dec, p<num>, b<B>p<P>+<off>, or B/P/off)".to_string());
         }
+    }
+
+    /// Parse Block+Page+Offset address formats:
+    ///
+    /// - `b<block>p<page>+<offset>`  e.g. `b5p3+0x10`  (offset within page, hex or dec)
+    /// - `b<block>p<page>`           e.g. `b5p3`        (offset defaults to 0)
+    /// - `<block>/<page>/<offset>`   e.g. `5/3/0x10` or `5/3/16`
+    /// - `<block>/<page>`            e.g. `5/3`         (offset defaults to 0)
+    fn parse_block_page_offset(input: &str, meta: &FileMetadata) -> Option<u64> {
+        let parse_int = |s: &str| -> Option<u64> {
+            let s = s.trim();
+            if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                u64::from_str_radix(h, 16).ok()
+            } else {
+                s.parse::<u64>().ok()
+            }
+        };
+
+        // Format: b<block>p<page>+<offset>  or  b<block>p<page>
+        let lower = input.to_ascii_lowercase();
+        if lower.starts_with('b') {
+            // strip leading 'b'
+            let rest = &input[1..];
+            // find 'p' separator
+            if let Some(p_pos) = rest.to_ascii_lowercase().find('p') {
+                let block_str = &rest[..p_pos];
+                let after_p = &rest[p_pos + 1..];
+                let block = parse_int(block_str)?;
+                // optional "+<offset>"
+                let (page, off_in_page) = if let Some(plus_pos) = after_p.find('+') {
+                    let page = parse_int(&after_p[..plus_pos])?;
+                    let off = parse_int(&after_p[plus_pos + 1..])?;
+                    (page, off)
+                } else {
+                    (parse_int(after_p)?, 0)
+                };
+                let linear = HexTabState::nand_coords_to_offset(block, page, off_in_page, meta);
+                return Some(linear.min(meta.size.saturating_sub(1)));
+            }
+        }
+
+        // Format: <block>/<page>/<offset>  or  <block>/<page>
+        let parts: Vec<&str> = input.split('/').collect();
+        if parts.len() == 2 || parts.len() == 3 {
+            // Must have at least two numeric parts
+            let block = parse_int(parts[0])?;
+            let page = parse_int(parts[1])?;
+            let off_in_page = if parts.len() == 3 { parse_int(parts[2])? } else { 0 };
+            let linear = HexTabState::nand_coords_to_offset(block, page, off_in_page, meta);
+            return Some(linear.min(meta.size.saturating_sub(1)));
+        }
+
+        None
     }
 
     /// Convert linear byte offset to NAND block, page, and offset inside page
