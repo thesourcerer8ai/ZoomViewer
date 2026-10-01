@@ -145,6 +145,10 @@ pub struct WorkflowNode {
     pub kind: WorkflowNodeKind,
     pub status: NodeExecutionStatus,
     pub output_log: String,
+    /// Whether the node window is collapsed (title bar only).
+    /// Defaults to `false` so existing workflow files load without the field.
+    #[serde(default)]
+    pub collapsed: bool,
 }
 
 impl WorkflowNode {
@@ -160,6 +164,7 @@ impl WorkflowNode {
             },
             status: NodeExecutionStatus::Idle,
             output_log: "No execution history".to_string(),
+            collapsed: false,
         }
     }
 
@@ -173,6 +178,7 @@ impl WorkflowNode {
             },
             status: NodeExecutionStatus::Idle,
             output_log: "No execution history".to_string(),
+            collapsed: false,
         }
     }
 
@@ -193,6 +199,7 @@ impl WorkflowNode {
             },
             status: NodeExecutionStatus::Idle,
             output_log: "No execution history".to_string(),
+            collapsed: false,
         }
     }
 
@@ -208,6 +215,7 @@ impl WorkflowNode {
             },
             status: NodeExecutionStatus::Idle,
             output_log: "No execution history".to_string(),
+            collapsed: false,
         }
     }
 
@@ -221,6 +229,7 @@ impl WorkflowNode {
             },
             status: NodeExecutionStatus::Idle,
             output_log: "Connected to ZoomViewer".to_string(),
+            collapsed: false,
         }
     }
 
@@ -235,6 +244,7 @@ impl WorkflowNode {
             },
             status: NodeExecutionStatus::Idle,
             output_log: "Ready to export".to_string(),
+            collapsed: false,
         }
     }
 
@@ -252,6 +262,7 @@ impl WorkflowNode {
             },
             status: NodeExecutionStatus::Idle,
             output_log: "Ready to mount virtual filesystem".to_string(),
+            collapsed: false,
         }
     }
 
@@ -263,6 +274,7 @@ impl WorkflowNode {
             kind: WorkflowNodeKind::Concatenate,
             status: NodeExecutionStatus::Idle,
             output_log: "No execution history".to_string(),
+            collapsed: false,
         }
     }
 
@@ -277,6 +289,7 @@ impl WorkflowNode {
             },
             status: NodeExecutionStatus::Idle,
             output_log: "No execution history".to_string(),
+            collapsed: false,
         }
     }
 
@@ -296,6 +309,7 @@ impl WorkflowNode {
             },
             status: NodeExecutionStatus::Idle,
             output_log: "Connect the NAND Reader tab to start.".to_string(),
+            collapsed: false,
         }
     }
 
@@ -307,6 +321,7 @@ impl WorkflowNode {
             kind: WorkflowNodeKind::PatternHealing,
             status: NodeExecutionStatus::Idle,
             output_log: "Connect an upstream node to start healing.".to_string(),
+            collapsed: false,
         }
     }
 
@@ -320,6 +335,7 @@ impl WorkflowNode {
             },
             status: NodeExecutionStatus::Idle,
             output_log: "Connect an upstream node and set the block range.".to_string(),
+            collapsed: false,
         }
     }
 
@@ -2147,9 +2163,10 @@ impl WorkflowEditorState {
                     NodeExecutionStatus::Error(_) => format!("❌ #{} - {}", node.id, node.name),
                 };
 
-                let win_res = egui::Window::new(window_title)
+                let win_res = egui::Window::new(&window_title)
                     .current_pos(pos)
                     .default_size([200.0, 140.0])
+                    .default_open(!node.collapsed)
                     .frame(egui::Frame::window(ui.style()).stroke(egui::Stroke::new(2.0, stroke_color)))
                     .show(ctx, |ui| {
                         ui.horizontal(|ui| {
@@ -2649,6 +2666,13 @@ impl WorkflowEditorState {
                 if let Some(win_res) = win_res {
                     pos = win_res.response.rect.min;
                     self.node_rects.insert(node_id, win_res.response.rect);
+                    // Read back the collapsed state from egui's internal CollapsingState.
+                    // The window stores it under area_id.with("collapsing") where area_id = Id::new(title).
+                    let collapsing_id = egui::Id::new(&window_title).with("collapsing");
+                    let is_open = egui::collapsing_header::CollapsingState::load_with_default_open(
+                        ctx, collapsing_id, !node.collapsed,
+                    ).is_open();
+                    node.collapsed = !is_open;
                 }
 
                 node.pos = [pos.x, pos.y];
@@ -3100,6 +3124,7 @@ mod tests {
                     },
                     status: NodeExecutionStatus::Idle,
                     output_log: String::new(),
+                    collapsed: false,
                 },
             ],
             connections: vec![
