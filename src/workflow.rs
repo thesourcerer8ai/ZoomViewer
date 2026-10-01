@@ -2027,7 +2027,9 @@ impl WorkflowEditorState {
         for (node_id, res, _prior_count, scan_offset, was_cancelled, total_bytes) in completed {
             self.active_searches.lock().remove(&node_id);
             let page_len = match self.connections.iter().find(|c| c.to_node == node_id) {
-                Some(c) => self.build_data_provider(c.from_node).map(|p| p.lock().get_metadata().page_length as u64).unwrap_or(512),
+                Some(c) => self.build_data_provider(c.from_node)
+                    .map(|p| p.lock().get_metadata().page_length as u64)
+                    .unwrap_or(512),
                 None => 512,
             };
             // For SectorPatternSearch log writing: gather page/block sizes and log path before the mutable borrow.
@@ -2141,10 +2143,14 @@ impl WorkflowEditorState {
                             "\n✔ Search reached end of data."
                         };
                         node.output_log = if matches!(node.kind, WorkflowNodeKind::SectorPatternSearch { .. }) {
-                            let total_pages = if page_len > 0 { total_bytes / page_len } else { 0 };
+                            let pages_searched = if page_len > 0 { scan_offset / page_len } else { 0 };
+                            let total_pages    = if page_len > 0 { total_bytes  / page_len } else { 0 };
                             format!(
-                                "{} Completed!\nMatches found: {} across {} pages out of {} pages{}",
-                                node_label, match_count, unique_pages, total_pages, limit_note
+                                "{} Completed!\nMatches: {} in {} pages\nSearched {} of {} pages ({:.1}%){}",
+                                node_label, match_count, unique_pages,
+                                pages_searched, total_pages,
+                                if total_pages > 0 { pages_searched as f64 / total_pages as f64 * 100.0 } else { 0.0 },
+                                limit_note
                             )
                         } else {
                             format!(
