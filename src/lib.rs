@@ -69,6 +69,7 @@ pub mod page_structure_tab;
 pub mod pattern_writer_tab;
 pub mod nand_reader_tab;
 pub mod pattern_healing;
+pub mod sector_pattern_search;
 
 pub use data_provider::{DumpDataProvider, FileDataProvider, SearchFilteredDataProvider, XorDataProvider};
 pub use search::{SearchResult, SearchOptions, SearchMode, search_provider, search_provider_with_sender, export_results_to_file};
@@ -79,5 +80,6 @@ pub use page_structure_tab::PageStructureTabState;
 pub use pattern_writer_tab::PatternWriterTabState;
 pub use nand_reader_tab::NandReaderTabState;
 pub use pattern_healing::{PatternHealingDataProvider, DataSegment as HealingDataSegment, HealingStats};
+pub use sector_pattern_search::{SectorPatternMatch, search_sector_patterns, all_targets, write_log_file as write_sector_log};
 
 pub use workflow::{WorkflowEditorState, WorkflowNode, WorkflowNodeKind};

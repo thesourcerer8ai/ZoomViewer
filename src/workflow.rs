@@ -156,6 +156,24 @@ pub enum WorkflowNodeKind {
         /// `true` → lexicographic / ordered mode; `false` → size-grouped mode.
         ordered: bool,
     },
+    /// Sector Pattern Search node — scans every 512-byte DATA sub-sector for
+    /// any of 11 precomputed XOR-combination signatures of the five base NAND
+    /// sector types (|Block, P00000, Fill00, Fill77, FillFF).
+    ///
+    /// Outputs matching pages (like PatternSearch) and optionally writes a
+    /// log file in the same format as the Search tab.
+    SectorPatternSearch {
+        /// Log file path.  Empty = no file written.  `.csv` suffix → CSV.
+        log_path: String,
+        /// Stop after this many matches (0 = unlimited).
+        max_matches: usize,
+        #[serde(default)]
+        results: Vec<crate::sector_pattern_search::SectorPatternMatch>,
+        /// Byte offset at which the next run should resume.
+        /// `None` = start from the beginning.
+        #[serde(default)]
+        resume_from_offset: Option<u64>,
+    },
 }
 
 /// Data structure for a node in the workflow graph
@@ -374,6 +392,23 @@ impl WorkflowNode {
         }
     }
 
+    pub fn new_sector_pattern_search(id: usize, pos: [f32; 2]) -> Self {
+        Self {
+            id,
+            name: "Sector Pattern Search".to_string(),
+            pos,
+            kind: WorkflowNodeKind::SectorPatternSearch {
+                log_path: String::new(),
+                max_matches: 10_000,
+                results: Vec::new(),
+                resume_from_offset: None,
+            },
+            status: NodeExecutionStatus::Idle,
+            output_log: "Connect an upstream node and configure the Page Structure tab.".to_string(),
+            collapsed: false,
+        }
+    }
+
     pub fn execute(&mut self) {
         self.status = NodeExecutionStatus::Running;
         let start_time = std::time::Instant::now();
@@ -480,6 +515,13 @@ impl WorkflowNode {
                 self.output_log = format!(
                     "Block Permutation ready.\nMode: {}\nConnect an upstream node to enumerate all subsets.\n⚠ Output size = 2^N − 1 blocks.",
                     mode
+                );
+            }
+            WorkflowNodeKind::SectorPatternSearch { max_matches, .. } => {
+                self.status = NodeExecutionStatus::Completed;
+                self.output_log = format!(
+                    "Sector Pattern Search ready.\nSearches 11 targets × 27 probe positions per sector.\nLimit: {} matches.\nConnect an upstream node and run.",
+                    if *max_matches == 0 { "unlimited".to_string() } else { max_matches.to_string() }
                 );
             }
         }
@@ -977,6 +1019,7 @@ impl WorkflowEditorState {
             WorkflowNodeKind::PatternHealing => WorkflowNode::new_pattern_healing(id, pos),
             WorkflowNodeKind::BlockSelector { .. } => WorkflowNode::new_block_selector(id, pos),
             WorkflowNodeKind::BlockPermutation { .. } => WorkflowNode::new_block_permutation(id, pos),
+            WorkflowNodeKind::SectorPatternSearch { .. } => WorkflowNode::new_sector_pattern_search(id, pos),
         };
 
         self.nodes.push(node);
@@ -1288,6 +1331,31 @@ impl WorkflowEditorState {
                 let provider = crate::data_provider::BlockPermutationDataProvider::new(upstream, *ordered);
                 Ok(Arc::new(Mutex::new(provider)) as Arc<Mutex<dyn DumpDataProvider>>)
             }
+            WorkflowNodeKind::SectorPatternSearch { results, .. } => {
+                let incoming = self.connections.iter()
+                    .find(|c| c.to_node == target_node_id)
+                    .ok_or_else(|| format!("SectorPatternSearch node #{} has no input connected", target_node_id))?;
+                let upstream = self.build_data_provider_internal(incoming.from_node, ancestors)?;
+
+                // Filter to pages that contain at least one matching sector,
+                // exactly like PatternSearch in AllMatchingPages mode.
+                let page_len = upstream.lock().get_metadata().page_length as u64;
+                let results = results.clone();
+                let mut matching_pages: Vec<u64> = if page_len > 0 {
+                    results.iter().map(|r| r.page).collect()
+                } else {
+                    Vec::new()
+                };
+                matching_pages.sort_unstable();
+                matching_pages.dedup();
+
+                let filtered = SearchFilteredDataProvider::new(
+                    upstream,
+                    matching_pages,
+                    "sector_pattern_search".to_string(),
+                );
+                Ok(Arc::new(Mutex::new(filtered)) as Arc<Mutex<dyn DumpDataProvider>>)
+            }
         };
 
         // Backtrack: remove this node from the ancestor path so sibling branches
@@ -1348,13 +1416,65 @@ impl WorkflowEditorState {
                 return None; // cycle guard
             }
             let node = self.nodes.iter().find(|n| n.id == current_id)?;
-            if matches!(node.kind, WorkflowNodeKind::PatternSearch { .. }) {
+            if matches!(node.kind, WorkflowNodeKind::PatternSearch { .. } | WorkflowNodeKind::SectorPatternSearch { .. }) {
                 break node;
             }
             // Follow the single upstream connection
             let incoming = self.connections.iter().find(|c| c.to_node == current_id)?;
             current_id = incoming.from_node;
         };
+
+        // ── SectorPatternSearch: convert stored SectorPatternMatch results to
+        // SearchResult with virtual page-filtered offsets for the hex highlighter.
+        if let WorkflowNodeKind::SectorPatternSearch { results, .. } = &search_node.kind {
+            if results.is_empty() {
+                return None;
+            }
+            // The filtered provider re-maps matching source pages to sequential indices,
+            // same as PatternSearch/AllMatchingPages.  We need to map each result's
+            // source page to its position in the dedup-sorted matching_pages list.
+            let page_len = {
+                let mut up_id = search_node.id;
+                let mut pl: Option<u64> = None;
+                let mut v2 = std::collections::HashSet::new();
+                loop {
+                    if !v2.insert(up_id) { break; }
+                    if let Some(inc) = self.connections.iter().find(|c| c.to_node == up_id) {
+                        up_id = inc.from_node;
+                        if let Some(n) = self.nodes.iter().find(|n| n.id == up_id) {
+                            if let WorkflowNodeKind::Input { page_length, .. } = n.kind {
+                                pl = Some(page_length as u64);
+                                break;
+                            }
+                        }
+                    } else { break; }
+                }
+                pl.unwrap_or(512)
+            };
+
+            let mut src_pages: Vec<u64> = results.iter().map(|r| r.page).collect();
+            src_pages.sort_unstable();
+            src_pages.dedup();
+
+            // Each match highlights SECTOR_SIZE (512) bytes starting at offset_in_page
+            // within the filtered page.
+            let pattern_len = crate::sector_pattern_search::SECTOR_SIZE;
+            let virtual_results: Vec<crate::search::SearchResult> = results.iter().map(|m| {
+                let filtered_page = src_pages.partition_point(|&p| p < m.page) as u64;
+                let virtual_offset = filtered_page * page_len + m.offset_in_page;
+                crate::search::SearchResult {
+                    index:          m.index,
+                    byte_offset:    virtual_offset,
+                    block:          m.block,
+                    page:           filtered_page,
+                    offset_in_page: m.offset_in_page,
+                    preview_hex:    m.preview_hex.clone(),
+                    preview_ascii:  m.target_name.clone(),
+                }
+            }).collect();
+
+            return Some((virtual_results, pattern_len));
+        }
 
         let (search_pattern, is_hex, case_sensitive, results, output_mode, bytes_before, bytes_after) =
             match &search_node.kind {
@@ -1718,6 +1838,145 @@ impl WorkflowEditorState {
         self.active_searches.lock().contains_key(&node_id)
     }
 
+    /// Start a SectorPatternSearch node in a background thread.
+    ///
+    /// Reuses `ActiveSearchState` by:
+    /// - Converting `SectorPatternMatch` → `SearchResult` in the thread so the
+    ///   existing live-count channel (`match_rx`) and completion channel (`rx`)
+    ///   both carry `SearchResult`-compatible types.
+    /// - The `preview_ascii` field carries the target name; `preview_hex` carries
+    ///   the matched bytes.  This lets `poll_active_searches` handle completion
+    ///   generically and we convert back when storing on the node.
+    pub fn start_sector_search_node(&mut self, node_id: usize) -> Result<(), String> {
+        let (incoming_id, max_matches, resume_offset, prior_count) = {
+            let node = self.nodes.iter().find(|n| n.id == node_id)
+                .ok_or_else(|| format!("Node #{} not found", node_id))?;
+            let incoming = self.connections.iter().find(|c| c.to_node == node_id)
+                .ok_or_else(|| format!("SectorPatternSearch node #{} has no input connected", node_id))?;
+            match &node.kind {
+                WorkflowNodeKind::SectorPatternSearch {
+                    max_matches, results, resume_from_offset, ..
+                } => (incoming.from_node, *max_matches, *resume_from_offset, results.len()),
+                _ => return Err(format!("Node #{} is not a SectorPatternSearch node", node_id)),
+            }
+        };
+
+        // Cancel any running search on this node first.
+        self.cancel_search_node(node_id);
+
+        let upstream   = self.build_data_provider(incoming_id)?;
+        let total_bytes = upstream.lock().get_metadata().size;
+
+        // Collect DATA segments from the shared page structure.
+        let data_segments: Vec<crate::pattern_healing::DataSegment> = self
+            .page_structure
+            .as_ref()
+            .map(|ps| {
+                let g = ps.lock().unwrap();
+                let mut off: u32 = 0;
+                let mut segs = Vec::new();
+                for seg in &g.segments {
+                    let end = off + seg.size;
+                    if seg.kind == crate::page_structure_tab::SegmentKind::Data {
+                        segs.push(crate::pattern_healing::DataSegment { start: off, end });
+                    }
+                    off = end;
+                }
+                segs
+            })
+            .unwrap_or_default();
+
+        let remaining = if max_matches == 0 { 0 } else { max_matches.saturating_sub(prior_count) };
+        let index_base = prior_count;
+
+        let cancel_flag    = Arc::new(AtomicBool::new(false));
+        let progress_bytes = Arc::new(AtomicU64::new(0));
+
+        // Completion channel carries the sector matches encoded as SearchResults.
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<crate::search::SearchResult>, String>>();
+        // Live-count channel: one SearchResult per sector match (for the counter).
+        let (match_tx, match_rx) = std::sync::mpsc::channel::<crate::search::SearchResult>();
+
+        let cancel_t  = cancel_flag.clone();
+        let prog_t    = progress_bytes.clone();
+        let prov_t    = upstream.clone();
+        let start_off = resume_offset.unwrap_or(0);
+
+        std::thread::spawn(move || {
+            prog_t.store(start_off, Ordering::Relaxed);
+
+            // Wrap match_tx: forward each SectorPatternMatch as a SearchResult.
+            let (sector_tx, sector_rx) =
+                std::sync::mpsc::channel::<crate::sector_pattern_search::SectorPatternMatch>();
+
+            // Spawn a forwarding thread so we don't block the search.
+            let match_tx2 = match_tx.clone();
+            let index_b   = index_base;
+            std::thread::spawn(move || {
+                while let Ok(m) = sector_rx.recv() {
+                    let sr = crate::search::SearchResult {
+                        index:          index_b + m.index,
+                        byte_offset:    m.byte_offset,
+                        block:          m.block,
+                        page:           m.page,
+                        offset_in_page: m.offset_in_page,
+                        preview_hex:    m.preview_hex.clone(),
+                        // Encode target name in preview_ascii for round-trip.
+                        preview_ascii:  m.target_name.clone(),
+                    };
+                    let _ = match_tx2.send(sr);
+                }
+            });
+
+            let res = crate::sector_pattern_search::search_sector_patterns(
+                prov_t,
+                data_segments,
+                cancel_t,
+                prog_t,
+                remaining,
+                Some(sector_tx),
+            );
+
+            let converted = res.map(|matches| {
+                matches.into_iter().map(|m| crate::search::SearchResult {
+                    index:          index_b + m.index,
+                    byte_offset:    m.byte_offset,
+                    block:          m.block,
+                    page:           m.page,
+                    offset_in_page: m.offset_in_page,
+                    preview_hex:    m.preview_hex,
+                    preview_ascii:  m.target_name,
+                }).collect()
+            });
+            let _ = tx.send(converted);
+        });
+
+        self.active_searches.lock().insert(
+            node_id,
+            ActiveSearchState {
+                cancel_flag,
+                progress_bytes,
+                total_bytes,
+                rx,
+                match_rx,
+                live_match_count: 0,
+                prior_result_count: prior_count,
+            },
+        );
+
+        if let Some(node) = self.nodes.iter_mut().find(|n| n.id == node_id) {
+            node.status = NodeExecutionStatus::Running;
+            let resume_msg = if resume_offset.is_some() {
+                format!(" (resuming from {} existing matches)", prior_count)
+            } else {
+                String::new()
+            };
+            node.output_log = format!("Sector pattern search started{}…", resume_msg);
+        }
+        self.status_message = format!("Sector pattern search started on node #{}…", node_id);
+        Ok(())
+    }
+
     /// Cancel any background search running on node_id
     pub fn cancel_search_node(&mut self, node_id: usize) {
         if let Some(search) = self.active_searches.lock().get(&node_id) {
@@ -1756,7 +2015,7 @@ impl WorkflowEditorState {
                     // thread finished, so we can set resume_from_offset correctly.
                     let scan_offset = search.progress_bytes.load(Ordering::Relaxed);
                     let was_cancelled = search.cancel_flag.load(Ordering::Relaxed);
-                    completed.push((node_id, res, search.prior_result_count, scan_offset, was_cancelled));
+                    completed.push((node_id, res, search.prior_result_count, scan_offset, was_cancelled, search.total_bytes));
                 }
             }
         }
@@ -1765,12 +2024,27 @@ impl WorkflowEditorState {
             ctx.request_repaint();
         }
 
-        for (node_id, res, _prior_count, scan_offset, was_cancelled) in completed {
+        for (node_id, res, _prior_count, scan_offset, was_cancelled, total_bytes) in completed {
             self.active_searches.lock().remove(&node_id);
             let page_len = match self.connections.iter().find(|c| c.to_node == node_id) {
                 Some(c) => self.build_data_provider(c.from_node).map(|p| p.lock().get_metadata().page_length as u64).unwrap_or(512),
                 None => 512,
             };
+            // For SectorPatternSearch log writing: gather page/block sizes and log path before the mutable borrow.
+            let sector_log_info: Option<(String, u32, u32)> = self.nodes.iter().find(|n| n.id == node_id).and_then(|n| {
+                if let WorkflowNodeKind::SectorPatternSearch { log_path, .. } = &n.kind {
+                    if !log_path.trim().is_empty() {
+                        let (pl, bs) = match self.connections.iter().find(|c| c.to_node == node_id) {
+                            Some(c) => self.build_data_provider(c.from_node)
+                                .map(|p| { let m = p.lock().get_metadata(); (m.page_length, m.block_size) })
+                                .unwrap_or((512, 64)),
+                            None => (512, 64),
+                        };
+                        return Some((log_path.clone(), pl, bs));
+                    }
+                }
+                None
+            });
             if let Some(node) = self.nodes.iter_mut().find(|n| n.id == node_id) {
                 match res {
                     Ok(new_results) => {
@@ -1800,6 +2074,40 @@ impl WorkflowEditorState {
                             } else {
                                 None
                             };
+                        } else if let WorkflowNodeKind::SectorPatternSearch {
+                            results: node_res,
+                            resume_from_offset,
+                            max_matches,
+                            log_path: _,
+                            ..
+                        } = &mut node.kind {
+                            // Convert SearchResult back to SectorPatternMatch.
+                            let new_sector: Vec<crate::sector_pattern_search::SectorPatternMatch> =
+                                new_results.iter().map(|r| {
+                                    crate::sector_pattern_search::SectorPatternMatch {
+                                        index:          r.index,
+                                        byte_offset:    r.byte_offset,
+                                        block:          r.block,
+                                        page:           r.page,
+                                        offset_in_page: r.offset_in_page,
+                                        preview_hex:    r.preview_hex.clone(),
+                                        target_name:    r.preview_ascii.clone(),
+                                    }
+                                }).collect();
+
+                            let last_offset = new_sector.last().map(|m| m.byte_offset);
+                            node_res.extend(new_sector);
+                            match_count = node_res.len();
+                            hit_limit = *max_matches > 0 && match_count >= *max_matches;
+
+                            *resume_from_offset = if hit_limit {
+                                last_offset.map(|o| o + 1)
+                            } else if was_cancelled {
+                                Some(scan_offset)
+                            } else {
+                                None
+                            };
+
                         } else {
                             match_count = 0;
                             hit_limit = false;
@@ -1811,10 +2119,20 @@ impl WorkflowEditorState {
                                 pages.sort_unstable();
                                 pages.dedup();
                                 pages.len()
+                            } else if let WorkflowNodeKind::SectorPatternSearch { results: node_res, .. } = &node.kind {
+                                let mut pages: Vec<u64> = node_res.iter().map(|r| r.page).collect();
+                                pages.sort_unstable();
+                                pages.dedup();
+                                pages.len()
                             } else { 0 }
                         } else { 0 };
 
                         node.status = NodeExecutionStatus::Completed;
+                        let node_label = if matches!(node.kind, WorkflowNodeKind::SectorPatternSearch { .. }) {
+                            "Sector Pattern Search"
+                        } else {
+                            "Pattern Search"
+                        };
                         let limit_note = if was_cancelled {
                             "\n⏹ Search stopped — click ▶ Continue to resume from here."
                         } else if hit_limit {
@@ -1822,10 +2140,18 @@ impl WorkflowEditorState {
                         } else {
                             "\n✔ Search reached end of data."
                         };
-                        node.output_log = format!(
-                            "Pattern Search Completed!\nMatches found: {} across {} pages{}",
-                            match_count, unique_pages, limit_note
-                        );
+                        node.output_log = if matches!(node.kind, WorkflowNodeKind::SectorPatternSearch { .. }) {
+                            let total_pages = if page_len > 0 { total_bytes / page_len } else { 0 };
+                            format!(
+                                "{} Completed!\nMatches found: {} across {} pages out of {} pages{}",
+                                node_label, match_count, unique_pages, total_pages, limit_note
+                            )
+                        } else {
+                            format!(
+                                "{} Completed!\nMatches found: {} across {} pages{}",
+                                node_label, match_count, unique_pages, limit_note
+                            )
+                        };
                         self.status_message = format!(
                             "Search on node #{} found {} matches in {} pages",
                             node_id, match_count, unique_pages
@@ -1835,6 +2161,24 @@ impl WorkflowEditorState {
                         node.status = NodeExecutionStatus::Error(e.clone());
                         node.output_log = format!("Search failed: {}", e);
                         self.status_message = format!("Search failed on node #{}: {}", node_id, e);
+                    }
+                }
+            }
+            // Write sector search log file now that the mutable node borrow is released.
+            if let Some((lp, pl, bs)) = sector_log_info {
+                let results_snap: Option<Vec<crate::sector_pattern_search::SectorPatternMatch>> =
+                    self.nodes.iter().find(|n| n.id == node_id).and_then(|n| {
+                        if let WorkflowNodeKind::SectorPatternSearch { results, .. } = &n.kind {
+                            Some(results.clone())
+                        } else {
+                            None
+                        }
+                    });
+                if let Some(snap) = results_snap {
+                    if let Err(e) = crate::sector_pattern_search::write_log_file(&lp, &snap, pl, bs) {
+                        log::warn!("Failed to write sector search log '{}': {}", lp, e);
+                    } else {
+                        log::info!("Sector search log written to '{}'", lp);
                     }
                 }
             }
@@ -1848,6 +2192,7 @@ impl WorkflowEditorState {
             let kind_tag = self.nodes.iter().find(|n| n.id == id).map(|n| {
                 match &n.kind {
                     WorkflowNodeKind::PatternSearch { .. } => "search",
+                    WorkflowNodeKind::SectorPatternSearch { .. } => "sector_search",
                     WorkflowNodeKind::FileExport { .. } => "export",
                     WorkflowNodeKind::FuseMount { auto_mount, .. } => {
                         if *auto_mount {
@@ -1865,6 +2210,14 @@ impl WorkflowEditorState {
                         if let Some(node) = self.nodes.iter_mut().find(|n| n.id == id) {
                             node.status = NodeExecutionStatus::Error(e.clone());
                             node.output_log = format!("Search execution failed: {}", e);
+                        }
+                    }
+                }
+                Some("sector_search") => {
+                    if let Err(e) = self.start_sector_search_node(id) {
+                        if let Some(node) = self.nodes.iter_mut().find(|n| n.id == id) {
+                            node.status = NodeExecutionStatus::Error(e.clone());
+                            node.output_log = format!("Sector search execution failed: {}", e);
                         }
                     }
                 }
@@ -1889,6 +2242,7 @@ impl WorkflowEditorState {
             let kind_tag = self.nodes.iter().find(|n| n.id == selected_id).map(|n| {
                 match &n.kind {
                     WorkflowNodeKind::PatternSearch { .. } => "search",
+                    WorkflowNodeKind::SectorPatternSearch { .. } => "sector_search",
                     WorkflowNodeKind::FileExport { .. } => "export",
                     WorkflowNodeKind::FuseMount { .. } => "fuse_mount",
                     _ => "other",
@@ -1901,6 +2255,15 @@ impl WorkflowEditorState {
                         if let Some(node) = self.nodes.iter_mut().find(|n| n.id == selected_id) {
                             node.status = NodeExecutionStatus::Error(e.clone());
                             node.output_log = format!("Search execution failed: {}", e);
+                        }
+                    }
+                }
+                Some("sector_search") => {
+                    if let Err(e) = self.start_sector_search_node(selected_id) {
+                        self.status_message = format!("Sector search failed: {}", e);
+                        if let Some(node) = self.nodes.iter_mut().find(|n| n.id == selected_id) {
+                            node.status = NodeExecutionStatus::Error(e.clone());
+                            node.output_log = format!("Sector search failed: {}", e);
                         }
                     }
                 }
@@ -1995,6 +2358,7 @@ impl WorkflowEditorState {
         let mut action_dismiss_xor = false;
         let mut action_run_search: Option<usize> = None;
         let mut action_cancel_search: Option<usize> = None;
+        let mut action_run_sector_search: Option<usize> = None;
         let mut action_export_node: Option<usize> = None;
         let mut action_mount_fuse: Option<usize> = None;
         let mut action_unmount_fuse: Option<usize> = None;
@@ -2121,6 +2485,15 @@ impl WorkflowEditorState {
                     }
                     if ui.button("Block Permutation").clicked() {
                         self.add_node(WorkflowNodeKind::BlockPermutation { ordered: false });
+                        ui.close_menu();
+                    }
+                    if ui.button("Sector Pattern Search").clicked() {
+                        self.add_node(WorkflowNodeKind::SectorPatternSearch {
+                            log_path: String::new(),
+                            max_matches: 10_000,
+                            results: Vec::new(),
+                            resume_from_offset: None,
+                        });
                         ui.close_menu();
                     }
                 });
@@ -2870,6 +3243,117 @@ impl WorkflowEditorState {
                                     "⚠ Output = N×(N+1)/2 blocks. Use only with small N.",
                                 );
                             }
+                            WorkflowNodeKind::SectorPatternSearch {
+                                log_path, max_matches, results, resume_from_offset,
+                            } => {
+                                ui.horizontal(|ui| {
+                                    ui.label("Log file:");
+                                    ui.text_edit_singleline(log_path);
+                                });
+                                ui.label(
+                                    egui::RichText::new("Empty = no file. Use .csv for CSV format.")
+                                        .italics().weak().size(11.0),
+                                );
+
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    ui.label("Limit:");
+                                    ui.add(hex_drag_usize(max_matches, 1.0));
+                                });
+                                ui.label(
+                                    egui::RichText::new("0 = unlimited")
+                                        .italics().weak().size(11.0),
+                                );
+
+                                ui.add_space(4.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Searches 11 targets × 27 probe positions per sector\n\
+                                         (|Block, P00000, Fill00/77/FF and their XOR combos)",
+                                    )
+                                    .italics().weak().size(11.0),
+                                );
+
+                                ui.add_space(4.0);
+                                if let Some(&(prog_bytes, tot_bytes, live_count, prior_count)) =
+                                    active_search_info.get(&node_id)
+                                {
+                                    // ── Running ──────────────────────────────
+                                    let ratio = if tot_bytes > 0 {
+                                        (prog_bytes as f32 / tot_bytes as f32).clamp(0.0, 1.0)
+                                    } else {
+                                        0.0
+                                    };
+                                    let prog_mb = prog_bytes as f64 / (1024.0 * 1024.0);
+                                    let tot_mb  = tot_bytes  as f64 / (1024.0 * 1024.0);
+                                    ui.add(
+                                        egui::ProgressBar::new(ratio)
+                                            .text(format!(
+                                                "{:.1}% ({:.1} / {:.1} MB)",
+                                                ratio * 100.0, prog_mb, tot_mb
+                                            ))
+                                            .animate(true),
+                                    );
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(100, 210, 255),
+                                        format!("⟳ {} sector matches so far…", prior_count + live_count),
+                                    );
+                                    if ui.button("⏹ Stop Search").clicked() {
+                                        action_cancel_search = Some(node_id);
+                                    }
+                                } else {
+                                    // ── Idle / Completed ─────────────────────
+                                    if results.is_empty() {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(180, 180, 180),
+                                            "No results yet — click ▶ Start Search",
+                                        );
+                                    } else {
+                                        let mut pages: Vec<u64> = results.iter().map(|r| r.page).collect();
+                                        pages.sort_unstable();
+                                        pages.dedup();
+                                        let limit_hit   = resume_from_offset.is_some();
+                                        let label_color = if limit_hit {
+                                            egui::Color32::from_rgb(255, 200, 80)
+                                        } else {
+                                            egui::Color32::from_rgb(100, 230, 140)
+                                        };
+                                        let icon = if limit_hit { "⚠" } else { "✔" };
+                                        ui.colored_label(
+                                            label_color,
+                                            format!("{} {} matches ({} pages)", icon, results.len(), pages.len()),
+                                        );
+                                        if limit_hit {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(255, 200, 80),
+                                                "Limit reached — increase limit or click ▶ Continue.",
+                                            );
+                                        }
+                                    }
+
+                                    ui.add_space(2.0);
+                                    let can_continue = resume_from_offset.is_some();
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .button("🔍 Start Search")
+                                            .on_hover_text("Clear results and search from the beginning")
+                                            .clicked()
+                                        {
+                                            *results = Vec::new();
+                                            *resume_from_offset = None;
+                                            action_run_sector_search = Some(node_id);
+                                        }
+                                        if can_continue
+                                            && ui
+                                                .button("▶ Continue")
+                                                .on_hover_text("Keep results and resume from where it stopped")
+                                                .clicked()
+                                        {
+                                            action_run_sector_search = Some(node_id);
+                                        }
+                                    });
+                                }
+                            }
                         }
 
                         ui.separator();
@@ -3116,6 +3600,11 @@ impl WorkflowEditorState {
         if let Some(s_node_id) = action_run_search {
             if let Err(e) = self.start_search_node(s_node_id) {
                 self.status_message = format!("Search failed: {}", e);
+            }
+        }
+        if let Some(s_node_id) = action_run_sector_search {
+            if let Err(e) = self.start_sector_search_node(s_node_id) {
+                self.status_message = format!("Sector search failed: {}", e);
             }
         }
         if let Some(c_node_id) = action_cancel_search {
