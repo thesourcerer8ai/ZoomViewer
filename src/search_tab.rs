@@ -141,7 +141,7 @@ impl SearchTabState {
         let progress = self.progress_bytes.clone();
 
         thread::spawn(move || {
-            let res = search_provider_with_sender(provider, &options, cancel, progress, Some(match_tx));
+            let res = search_provider_with_sender(provider, &options, cancel, progress, 0, 0, Some(match_tx));
             match res {
                 Ok(results) => {
                     let _ = done_tx.send(Ok(results.len()));

@@ -69,6 +69,12 @@ pub enum WorkflowNodeKind {
         bytes_after: u64,
         #[serde(default)]
         results: Vec<crate::search::SearchResult>,
+        /// Byte offset at which the *next* search run should start.
+        /// Set to the byte just past the last result's offset after a limit-capped
+        /// run, so the user can increase the limit and continue without rescanning.
+        /// `None` means "start from the beginning".
+        #[serde(default)]
+        resume_from_offset: Option<u64>,
     },
     BlockArranger {
         grid_width: u32,
@@ -212,6 +218,7 @@ impl WorkflowNode {
                 bytes_before: 0,
                 bytes_after: 0,
                 results: Vec::new(),
+                resume_from_offset: None,
             },
             status: NodeExecutionStatus::Idle,
             output_log: "No execution history".to_string(),
@@ -744,6 +751,12 @@ pub struct ActiveSearchState {
     pub progress_bytes: Arc<AtomicU64>,
     pub total_bytes: u64,
     pub rx: Receiver<Result<Vec<crate::search::SearchResult>, String>>,
+    /// Receives individual matches as they are found (for live count display).
+    pub match_rx: std::sync::mpsc::Receiver<crate::search::SearchResult>,
+    /// Count of matches found so far in this run (updated by poll_active_searches).
+    pub live_match_count: usize,
+    /// Number of results already stored on the node before this run started.
+    pub prior_result_count: usize,
 }
 
 impl std::fmt::Debug for ActiveSearchState {
@@ -1605,14 +1618,25 @@ impl WorkflowEditorState {
 
     /// Start search on a PatternSearch node in a background thread (non-blocking)
     pub fn start_search_node(&mut self, node_id: usize) -> Result<(), String> {
-        let (incoming_id, search_pattern, is_hex, case_sensitive, max_matches) = {
+        let (incoming_id, search_pattern, is_hex, case_sensitive, max_matches, resume_offset, prior_count) = {
             let node = self.nodes.iter().find(|n| n.id == node_id)
                 .ok_or_else(|| format!("Node #{} not found", node_id))?;
             let incoming = self.connections.iter().find(|c| c.to_node == node_id)
                 .ok_or_else(|| format!("Search node #{} has no input connected", node_id))?;
             match &node.kind {
-                WorkflowNodeKind::PatternSearch { search_pattern, is_hex, case_sensitive, max_matches, .. } => {
-                    (incoming.from_node, search_pattern.clone(), *is_hex, *case_sensitive, *max_matches)
+                WorkflowNodeKind::PatternSearch {
+                    search_pattern, is_hex, case_sensitive, max_matches,
+                    results, resume_from_offset, ..
+                } => {
+                    (
+                        incoming.from_node,
+                        search_pattern.clone(),
+                        *is_hex,
+                        *case_sensitive,
+                        *max_matches,
+                        *resume_from_offset,
+                        results.len(),
+                    )
                 }
                 _ => return Err(format!("Node #{} is not a PatternSearch node", node_id)),
             }
@@ -1628,23 +1652,38 @@ impl WorkflowEditorState {
         let upstream_provider = self.build_data_provider(incoming_id)?;
         let total_bytes = upstream_provider.lock().get_metadata().size;
         let mode = if is_hex { crate::search::SearchMode::Hex } else { crate::search::SearchMode::Ascii };
+
+        // Clamp max_matches for this run: we only need (max_matches - prior_count) more.
+        let remaining = max_matches.saturating_sub(prior_count);
         let options = crate::search::SearchOptions {
             pattern: search_pattern.clone(),
             mode,
             case_sensitive,
-            max_matches,
+            max_matches: remaining,
         };
+
+        let start_offset = resume_offset.unwrap_or(0);
 
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let progress_bytes = Arc::new(AtomicU64::new(0));
         let (tx, rx) = std::sync::mpsc::channel();
+        let (match_tx, match_rx) = std::sync::mpsc::channel::<crate::search::SearchResult>();
 
         let cancel_thread = cancel_flag.clone();
         let prog_thread = progress_bytes.clone();
         let prov_thread = upstream_provider.clone();
+        let index_offset = prior_count;
 
         std::thread::spawn(move || {
-            let res = crate::search::search_provider(prov_thread, &options, cancel_thread, prog_thread);
+            let res = crate::search::search_provider_from(
+                prov_thread,
+                &options,
+                cancel_thread,
+                prog_thread,
+                start_offset,
+                index_offset,
+                Some(match_tx),
+            );
             let _ = tx.send(res);
         });
 
@@ -1655,14 +1694,22 @@ impl WorkflowEditorState {
                 progress_bytes,
                 total_bytes,
                 rx,
+                match_rx,
+                live_match_count: 0,
+                prior_result_count: prior_count,
             },
         );
 
         if let Some(node) = self.nodes.iter_mut().find(|n| n.id == node_id) {
             node.status = NodeExecutionStatus::Running;
-            node.output_log = format!("Search started in background for '{}'...", search_pattern);
+            let resume_msg = if resume_offset.is_some() {
+                format!(" (continuing from {} existing results)", prior_count)
+            } else {
+                String::new()
+            };
+            node.output_log = format!("Search started{}…  Pattern: '{}'", resume_msg, search_pattern);
         }
-        self.status_message = format!("Search started for '{}' on node #{}...", search_pattern, node_id);
+        self.status_message = format!("Search started for '{}' on node #{}…", search_pattern, node_id);
         Ok(())
     }
 
@@ -1697,11 +1744,15 @@ impl WorkflowEditorState {
         let mut any_running = false;
 
         {
-            let searches = self.active_searches.lock();
-            for (&node_id, search) in searches.iter() {
+            let mut searches = self.active_searches.lock();
+            for (&node_id, search) in searches.iter_mut() {
                 any_running = true;
+                // Drain live match stream to update the counter in real time.
+                while let Ok(_m) = search.match_rx.try_recv() {
+                    search.live_match_count += 1;
+                }
                 if let Ok(res) = search.rx.try_recv() {
-                    completed.push((node_id, res));
+                    completed.push((node_id, res, search.prior_result_count));
                 }
             }
         }
@@ -1710,34 +1761,64 @@ impl WorkflowEditorState {
             ctx.request_repaint();
         }
 
-        for (node_id, res) in completed {
+        for (node_id, res, _prior_count) in completed {
             self.active_searches.lock().remove(&node_id);
-            // Compute page_len *before* borrowing self.nodes mutably (fixes E0502)
             let page_len = match self.connections.iter().find(|c| c.to_node == node_id) {
                 Some(c) => self.build_data_provider(c.from_node).map(|p| p.lock().get_metadata().page_length as u64).unwrap_or(512),
                 None => 512,
             };
             if let Some(node) = self.nodes.iter_mut().find(|n| n.id == node_id) {
                 match res {
-                    Ok(results) => {
-                        let unique_pages = if page_len > 0 {
-                            let mut pages: Vec<u64> = results.iter().map(|r| r.byte_offset / page_len).collect();
-                            pages.sort_unstable();
-                            pages.dedup();
-                            pages.len()
+                    Ok(new_results) => {
+                        let hit_limit;
+                        let match_count;
+
+                        if let WorkflowNodeKind::PatternSearch {
+                            results: node_res,
+                            resume_from_offset,
+                            max_matches,
+                            ..
+                        } = &mut node.kind {
+                            // Append new results to existing ones.
+                            let last_offset = new_results.last().map(|r| r.byte_offset);
+                            node_res.extend(new_results);
+                            match_count = node_res.len();
+                            hit_limit = match_count >= *max_matches;
+                            // If we hit the limit, record where to resume from next time.
+                            // Otherwise clear the resume point (search reached end of data).
+                            *resume_from_offset = if hit_limit {
+                                last_offset.map(|o| o + 1)
+                            } else {
+                                None
+                            };
                         } else {
-                            0
-                        };
-                        let match_count = results.len();
-                        node.status = NodeExecutionStatus::Completed;
-                        node.output_log = format!(
-                            "Pattern Search Completed!\nMatches found: {} across {} pages",
-                            match_count, unique_pages
-                        );
-                        if let WorkflowNodeKind::PatternSearch { results: node_res, .. } = &mut node.kind {
-                            *node_res = results;
+                            match_count = 0;
+                            hit_limit = false;
                         }
-                        self.status_message = format!("Search on node #{} found {} matches in {} pages", node_id, match_count, unique_pages);
+
+                        let unique_pages = if page_len > 0 {
+                            if let WorkflowNodeKind::PatternSearch { results: node_res, .. } = &node.kind {
+                                let mut pages: Vec<u64> = node_res.iter().map(|r| r.byte_offset / page_len).collect();
+                                pages.sort_unstable();
+                                pages.dedup();
+                                pages.len()
+                            } else { 0 }
+                        } else { 0 };
+
+                        node.status = NodeExecutionStatus::Completed;
+                        let limit_note = if hit_limit {
+                            "\n⚠ Limit reached — increase limit and click ▶ Continue to find more."
+                        } else {
+                            "\n✔ Search reached end of data."
+                        };
+                        node.output_log = format!(
+                            "Pattern Search Completed!\nMatches found: {} across {} pages{}",
+                            match_count, unique_pages, limit_note
+                        );
+                        self.status_message = format!(
+                            "Search on node #{} found {} matches in {} pages",
+                            node_id, match_count, unique_pages
+                        );
                     }
                     Err(e) => {
                         node.status = NodeExecutionStatus::Error(e.clone());
@@ -1961,6 +2042,7 @@ impl WorkflowEditorState {
                             bytes_before: 0,
                             bytes_after: 0,
                             results: Vec::new(),
+                            resume_from_offset: None,
                         });
                         ui.close_menu();
                     }
@@ -2129,10 +2211,16 @@ impl WorkflowEditorState {
                 .collect();
 
             // Pre-collect active-search progress info to avoid borrowing self inside the node window closure (fixes E0499)
-            let active_search_info: HashMap<usize, (u64, u64)> = {
+            // Maps node_id -> (progress_bytes, total_bytes, live_match_count, prior_result_count)
+            let active_search_info: HashMap<usize, (u64, u64, usize, usize)> = {
                 let searches = self.active_searches.lock();
                 searches.iter()
-                    .map(|(&id, s)| (id, (s.progress_bytes.load(Ordering::Relaxed), s.total_bytes)))
+                    .map(|(&id, s)| (id, (
+                        s.progress_bytes.load(Ordering::Relaxed),
+                        s.total_bytes,
+                        s.live_match_count,
+                        s.prior_result_count,
+                    )))
                     .collect()
             };
 
@@ -2340,7 +2428,7 @@ impl WorkflowEditorState {
                                 ui.label("XOR Hex Pattern:");
                                 ui.text_edit_singleline(pattern_hex);
                             }
-                            WorkflowNodeKind::PatternSearch { search_pattern, is_hex, case_sensitive, max_matches, output_mode, bytes_before, bytes_after, results } => {
+                            WorkflowNodeKind::PatternSearch { search_pattern, is_hex, case_sensitive, max_matches, output_mode, bytes_before, bytes_after, results, resume_from_offset } => {
                                 ui.label("Pattern:");
                                 ui.text_edit_singleline(search_pattern);
                                 ui.checkbox(is_hex, "Hex mode");
@@ -2376,7 +2464,8 @@ impl WorkflowEditorState {
                                     });
                                 }
                                 ui.add_space(4.0);
-                                if let Some(&(prog_bytes, tot_bytes)) = active_search_info.get(&node_id) {
+                                if let Some(&(prog_bytes, tot_bytes, live_count, prior_count)) = active_search_info.get(&node_id) {
+                                    // ── Running ──────────────────────────────────────────
                                     let ratio = if tot_bytes > 0 {
                                         (prog_bytes as f32 / tot_bytes as f32).clamp(0.0, 1.0)
                                     } else {
@@ -2384,25 +2473,63 @@ impl WorkflowEditorState {
                                     };
                                     let prog_mb = prog_bytes as f64 / (1024.0 * 1024.0);
                                     let tot_mb = tot_bytes as f64 / (1024.0 * 1024.0);
-                                    ui.add(egui::ProgressBar::new(ratio).text(format!("{:.1}% ({:.1} / {:.1} MB)", ratio * 100.0, prog_mb, tot_mb)));
+                                    ui.add(egui::ProgressBar::new(ratio)
+                                        .text(format!("{:.1}% ({:.1} / {:.1} MB)", ratio * 100.0, prog_mb, tot_mb))
+                                        .animate(true));
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(100, 210, 255),
+                                        format!("⟳ {} matches found so far…", prior_count + live_count),
+                                    );
                                     if ui.button("⏹ Stop Search").clicked() {
                                         action_cancel_search = Some(node_id);
                                     }
                                 } else {
+                                    // ── Idle / Completed ────────────────────────────────
                                     if results.is_empty() {
-                                        ui.colored_label(egui::Color32::from_rgb(180, 180, 180), "Matches: 0 (Click 'Run Search')");
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(180, 180, 180),
+                                            "No results yet — click ▶ Start Search",
+                                        );
                                     } else {
                                         let mut pages: Vec<u64> = results.iter().map(|r| r.page).collect();
                                         pages.sort_unstable();
                                         pages.dedup();
+                                        let limit_hit = resume_from_offset.is_some();
+                                        let label_color = if limit_hit {
+                                            egui::Color32::from_rgb(255, 200, 80) // amber = limit hit
+                                        } else {
+                                            egui::Color32::from_rgb(100, 230, 140) // green = complete
+                                        };
+                                        let status_icon = if limit_hit { "⚠" } else { "✔" };
                                         ui.colored_label(
-                                            egui::Color32::from_rgb(100, 230, 140),
-                                            format!("✔ Found {} matches ({} pages)", results.len(), pages.len()),
+                                            label_color,
+                                            format!("{} {} matches ({} pages)", status_icon, results.len(), pages.len()),
                                         );
+                                        if limit_hit {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(255, 200, 80),
+                                                "Limit reached — increase limit to find more.",
+                                            );
+                                        }
                                     }
-                                    if ui.button("🔍 Run Search").clicked() {
-                                        action_run_search = Some(node_id);
-                                    }
+
+                                    ui.add_space(2.0);
+                                    let can_continue = resume_from_offset.is_some();
+                                    ui.horizontal(|ui| {
+                                        // Always show a fresh-start button.
+                                        if ui.button("🔍 Start Search").on_hover_text("Clear existing results and search from the beginning").clicked() {
+                                            // Clear existing results and resume point before starting.
+                                            *results = Vec::new();
+                                            *resume_from_offset = None;
+                                            action_run_search = Some(node_id);
+                                        }
+                                        // Show Continue only when there's a resume point.
+                                        if can_continue {
+                                            if ui.button("▶ Continue").on_hover_text("Keep existing results and continue searching from where the limit was reached").clicked() {
+                                                action_run_search = Some(node_id);
+                                            }
+                                        }
+                                    });
                                 }
                             }
                             WorkflowNodeKind::BlockArranger { grid_width, grid_height, stripe_width } => {

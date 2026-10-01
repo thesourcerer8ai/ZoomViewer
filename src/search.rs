@@ -135,7 +135,26 @@ pub fn search_provider(
     cancel_flag: Arc<AtomicBool>,
     progress_bytes: Arc<AtomicU64>,
 ) -> Result<Vec<SearchResult>, String> {
-    search_provider_with_sender(provider, options, cancel_flag, progress_bytes, None)
+    search_provider_from(provider, options, cancel_flag, progress_bytes, 0, 0, None)
+}
+
+/// Search starting at `start_offset` bytes, with match indices beginning at
+/// `index_offset + 1`.  Streams each match immediately via `match_sender`.
+///
+/// Used both for fresh searches (`start_offset = 0`, `index_offset = 0`) and
+/// for incremental "continue" searches where `start_offset` is the byte just
+/// after the last result and `index_offset` is the number of already-found results.
+pub fn search_provider_from(
+    provider: Arc<Mutex<dyn DumpDataProvider>>,
+    options: &SearchOptions,
+    cancel_flag: Arc<AtomicBool>,
+    progress_bytes: Arc<AtomicU64>,
+    start_offset: u64,
+    index_offset: usize,
+    match_sender: Option<Sender<SearchResult>>,
+) -> Result<Vec<SearchResult>, String> {
+    // Keep the old name around so existing call-sites in tests still compile.
+    search_provider_with_sender(provider, options, cancel_flag, progress_bytes, start_offset, index_offset, match_sender)
 }
 
 /// Search across a DumpDataProvider with live streaming of matches as they are found.
@@ -144,6 +163,8 @@ pub fn search_provider_with_sender(
     options: &SearchOptions,
     cancel_flag: Arc<AtomicBool>,
     progress_bytes: Arc<AtomicU64>,
+    start_offset: u64,
+    index_offset: usize,
     match_sender: Option<Sender<SearchResult>>,
 ) -> Result<Vec<SearchResult>, String> {
     let pattern_bytes = parse_pattern(options)?;
@@ -160,8 +181,12 @@ pub fn search_provider_with_sender(
     let overlap: usize = pat_len.saturating_sub(1);
 
     let mut results = Vec::new();
-    let mut offset: u64 = 0;
+    // Start scanning from start_offset; for a resume this is just past the last match.
+    // We step back by `overlap` bytes so we don't miss a match straddling the boundary.
+    let mut offset: u64 = start_offset.saturating_sub(overlap as u64);
     let mut prev_tail: Vec<u8> = Vec::new();
+    // Initialise progress at the resume point so the progress bar starts correctly.
+    progress_bytes.store(offset, Ordering::Relaxed);
 
     while offset < total_size {
         if cancel_flag.load(Ordering::Relaxed) {
@@ -203,7 +228,11 @@ pub fn search_provider_with_sender(
             if is_match {
                 let match_abs_offset = combined_start_offset + (i as u64);
 
-                // Avoid duplicating matches found in overlap
+                // Avoid duplicating matches found in overlap (including the
+                // last match from a previous run when resuming).
+                if match_abs_offset < start_offset {
+                    continue;
+                }
                 if let Some(last) = results.last() {
                     let last_res: &SearchResult = last;
                     if last_res.byte_offset == match_abs_offset {
@@ -223,7 +252,7 @@ pub fn search_provider_with_sender(
                 let (preview_hex, preview_ascii) = generate_previews(snippet);
 
                 let match_res = SearchResult {
-                    index: results.len() + 1,
+                    index: index_offset + results.len() + 1,
                     byte_offset: match_abs_offset,
                     block,
                     page,
