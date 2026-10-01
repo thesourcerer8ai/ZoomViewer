@@ -1200,40 +1200,104 @@ mod tests {
 // BlockPermutationDataProvider
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Generates all permutations of source blocks as a single concatenated byte stream.
+/// Generates every non-empty subset of source blocks as a single concatenated
+/// byte stream — without ever allocating a permutation table.
 ///
-/// Given N source blocks the provider enumerates every ordered selection of
-/// increasing length from 1 up to N and emits the corresponding blocks
-/// back-to-back.
+/// Given N source blocks the output contains `2^N − 1` output blocks in total.
+/// Each output block is exactly `block_bytes` bytes (same geometry as the source).
 ///
-/// Two ordering modes are supported:
+/// The source block index for any output block is computed on-the-fly using
+/// combinatorial arithmetic (no large allocations at construction time).
 ///
-/// **Unordered** (`ordered = false`) — length increases first, then blocks
-/// within each length group cycle together.  For N = 4 blocks the output is:
+/// ## Unordered mode (`ordered = false`)
+/// Subsets grouped by size; within each size group in lexicographic order.
+///
+/// Example N = 4:
 /// ```text
-/// [0][1][2][3][0,1][0,2][0,3][1,2][1,3][2,3][0,1,2][0,1,3][0,2,3][1,2,3][0,1,2,3]
-/// ```
-/// Blocks are therefore sorted in the way the user described:
-/// `0 1 2 3 | 0 1  0 2  0 3 | …`
-///
-/// **Ordered** (`ordered = true`) — blocks are grouped by their leading index
-/// first, so all combinations that start with 0 come before those starting
-/// with 1, and so on.  For N = 4 blocks the output is:
-/// ```text
-/// [0][0,1][0,1,2][0,1,2,3][0,1,3][0,2][0,2,3][0,3][1][1,2][1,2,3][1,3][2][2,3][3]
+/// size 1: [0] [1] [2] [3]
+/// size 2: [0,1] [0,2] [0,3] [1,2] [1,3] [2,3]
+/// size 3: [0,1,2] [0,1,3] [0,2,3] [1,2,3]
+/// size 4: [0,1,2,3]
 /// ```
 ///
-/// The total number of output blocks equals `2^N - 1` (all non-empty subsets).
-/// Each output block is exactly `block_bytes` bytes long (same as the source).
+/// ## Ordered mode (`ordered = true`)
+/// All non-empty subsets in strict lexicographic order (as sorted tuples).
+///
+/// Example N = 4 (lex order):
+/// ```text
+/// {0} {0,1} {0,1,2} {0,1,2,3} {0,1,3} {0,2} {0,2,3} {0,3}
+/// {1} {1,2} {1,2,3} {1,3}  {2} {2,3}  {3}
+/// ```
 pub struct BlockPermutationDataProvider {
     source: Arc<Mutex<dyn DumpDataProvider>>,
-    /// The permutation table: each entry is a source block index.
-    /// Entry `i` tells us which source block occupies output block `i`.
-    permutation: Vec<u64>,
+    /// Number of source blocks (N).
+    n: u64,
+    /// Whether to use lexicographic (ordered) or size-grouped (unordered) mode.
+    ordered: bool,
     metadata: FileMetadata,
     identity: String,
     /// Number of bytes per block.
     block_bytes: u64,
+}
+
+// ── combinatorial helpers ─────────────────────────────────────────────────────
+
+/// Binomial coefficient C(n, k), saturating at u64::MAX to avoid overflow.
+fn binom(n: u64, k: u64) -> u64 {
+    if k > n { return 0; }
+    if k == 0 || k == n { return 1; }
+    let k = k.min(n - k);
+    let mut result: u128 = 1;
+    for i in 0..k {
+        result = result * (n - i) as u128 / (i + 1) as u128;
+        if result > u64::MAX as u128 { return u64::MAX; }
+    }
+    result as u64
+}
+
+/// Given the 0-indexed lex rank `rank` of a k-combination of {0..n-1},
+/// return the element at position `pos` (0 = first/smallest element).
+///
+/// Uses the combinatorial number system: scan from the smallest candidate
+/// value upward, subtracting the count of combinations that start smaller.
+fn kth_combination_element(n: u64, k: u64, mut rank: u64, pos: u64) -> u64 {
+    let mut start = 0u64;
+    for slot in 0..k {
+        // At this slot we must place some value v >= start.
+        // Combinations that place v at this slot and fill the remaining
+        // (k-slot-1) slots freely from {v+1..n-1}: C(n-v-1, k-slot-1).
+        let mut v = start;
+        loop {
+            let ways = binom(n - v - 1, k - slot - 1);
+            if rank < ways {
+                if slot == pos {
+                    return v;
+                }
+                // Descend into combinations whose slot `slot` is v.
+                start = v + 1;
+                break;
+            }
+            rank -= ways;
+            v += 1;
+        }
+    }
+    0 // unreachable for valid inputs
+}
+
+/// Compute the total output-block count contributed by all non-empty subsets
+/// of a `tail_n`-element universe, each prepended with a fixed prefix of
+/// `prefix_len` already-chosen elements.
+///
+/// = Σ_{s=0}^{tail_n}  (prefix_len + s) · C(tail_n, s)
+/// = prefix_len · 2^tail_n  +  tail_n · 2^(tail_n-1)
+fn blocks_for_subset_family(prefix_len: u64, tail_n: u64) -> u64 {
+    let pow = 1u64.checked_shl(tail_n as u32).unwrap_or(u64::MAX);
+    if tail_n == 0 {
+        prefix_len
+    } else {
+        let pow_half = 1u64.checked_shl((tail_n - 1) as u32).unwrap_or(u64::MAX);
+        prefix_len.saturating_mul(pow).saturating_add(tail_n.saturating_mul(pow_half))
+    }
 }
 
 impl BlockPermutationDataProvider {
@@ -1241,8 +1305,7 @@ impl BlockPermutationDataProvider {
     ///
     /// # Arguments
     /// * `source`  – Upstream provider.
-    /// * `ordered` – `true` for "ordered" (group by leading index), `false`
-    ///               for "unordered" (cycle together within each length).
+    /// * `ordered` – `true` for lexicographic order, `false` for size-grouped.
     pub fn new(source: Arc<Mutex<dyn DumpDataProvider>>, ordered: bool) -> Self {
         let (page_length, block_size, total_blocks, src_identity) = {
             let g = source.lock();
@@ -1251,22 +1314,23 @@ impl BlockPermutationDataProvider {
         };
 
         let block_bytes = (page_length as u64) * (block_size as u64);
-        let n = total_blocks as usize;
+        let n = total_blocks;
 
-        // Build the permutation table: for every non-empty subset of {0..n-1}
-        // determine which output position it occupies and flatten the subsets
-        // into a sequence of individual source block indices.
-        let permutation = if ordered {
-            Self::build_ordered(n)
+        // Total output blocks = sum_{k=1}^{N} k * C(N,k) = N * 2^(N-1)
+        // This is the total number of individual block slots across all subsets.
+        // Capped to prevent metadata overflow for very large N.
+        let out_blocks = if n == 0 {
+            0
+        } else if n < 63 {
+            // N * 2^(N-1)
+            n.saturating_mul(1u64 << (n - 1))
         } else {
-            Self::build_unordered(n)
+            u64::MAX / block_bytes.max(1)
         };
-
-        let out_blocks = permutation.len() as u64;
-        let total_size = out_blocks * block_bytes;
+        let total_size = out_blocks.saturating_mul(block_bytes);
 
         let mut hasher = DefaultHasher::new();
-        "BLOCK_PERMUTATION".hash(&mut hasher);
+        "BLOCK_PERMUTATION_V2".hash(&mut hasher);
         src_identity.hash(&mut hasher);
         ordered.hash(&mut hasher);
         total_blocks.hash(&mut hasher);
@@ -1281,89 +1345,79 @@ impl BlockPermutationDataProvider {
             block_size,
         );
 
-        Self {
-            source,
-            permutation,
-            metadata,
-            identity,
-            block_bytes,
+        Self { source, n, ordered, metadata, identity, block_bytes }
+    }
+
+    /// Map output block index `ob` → source block index. O(N²), no allocation.
+    fn source_block_for(&self, ob: u64) -> u64 {
+        if self.ordered {
+            Self::source_block_ordered(self.n, ob)
+        } else {
+            Self::source_block_unordered(self.n, ob)
         }
     }
 
-    /// Unordered: group subsets by size; within each size group emit the
-    /// subsets in lexicographic order and lay their members sequentially.
+    /// Unordered: size-grouped layout.
     ///
-    /// Example N=4:
-    ///   length 1: [0][1][2][3]
-    ///   length 2: [0,1][0,2][0,3][1,2][1,3][2,3]
-    ///   length 3: [0,1,2][0,1,3][0,2,3][1,2,3]
-    ///   length 4: [0,1,2,3]
-    fn build_unordered(n: usize) -> Vec<u64> {
-        let mut result = Vec::new();
-        for len in 1..=n {
-            // Generate all combinations of `len` items from 0..n in lex order.
-            let mut combo = (0..len).collect::<Vec<usize>>();
+    /// Walk through sizes k = 1, 2, …, N.  Each size-k group occupies
+    /// C(n,k)·k output blocks.  Locate the group, then the combination rank
+    /// and element position within it.
+    fn source_block_unordered(n: u64, mut ob: u64) -> u64 {
+        for k in 1..=n {
+            let group_blocks = binom(n, k).saturating_mul(k);
+            if ob < group_blocks {
+                let combo_rank = ob / k;
+                let elem_pos  = ob % k;
+                return kth_combination_element(n, k, combo_rank, elem_pos);
+            }
+            ob -= group_blocks;
+        }
+        0
+    }
+
+    /// Ordered: lex order of subsets as sorted tuples.
+    ///
+    /// Strategy: maintain a cursor `remaining` (output blocks still to skip)
+    /// and decode the subset digit-by-digit, storing chosen elements in a
+    /// small fixed-size stack.  When `remaining` falls inside the current
+    /// "prefix-only" subset, we look up the element from the stack.
+    fn source_block_ordered(n: u64, ob: u64) -> u64 {
+        // Stack of chosen element values (at most N deep, N ≤ 63 in practice).
+        let mut chosen = [0u64; 64];
+        let mut remaining = ob;
+
+        for slot in 0..n {
+            let min_val = if slot == 0 { 0 } else { chosen[slot as usize - 1] + 1 };
+
+            let mut v = min_val;
             loop {
-                for &idx in &combo {
-                    result.push(idx as u64);
-                }
-                // Advance to next combination.
-                let mut i = len;
-                loop {
-                    if i == 0 {
-                        // All combinations for this length exhausted.
-                        break;
+                if v >= n { break; }
+                // Blocks contributed by all subsets whose first `slot+1` elements
+                // are (chosen[0..slot-1], v) — i.e. the singleton {…,v} itself
+                // plus all its extensions into {v+1..n-1}.
+                let tail_n = n - v - 1;
+                let blocks = blocks_for_subset_family(slot + 1, tail_n);
+
+                if remaining < blocks {
+                    // Our output block is somewhere inside these subsets.
+                    chosen[slot as usize] = v;
+
+                    // The "prefix-only" subset {chosen[0..=slot]} contributes
+                    // (slot+1) output blocks at the front of this family.
+                    if remaining < slot + 1 {
+                        // We're inside the prefix subset itself; look up element.
+                        return chosen[remaining as usize];
                     }
-                    i -= 1;
-                    if combo[i] < n - (len - i) {
-                        combo[i] += 1;
-                        for j in (i + 1)..len {
-                            combo[j] = combo[j - 1] + 1;
-                        }
-                        break;
-                    }
-                    if i == 0 {
-                        break;
-                    }
-                }
-                // Check whether we've just exhausted this length.
-                if combo[0] > n - len {
+                    // Skip past the prefix subset and recurse into extensions.
+                    remaining -= slot + 1;
+                    // Continue to next slot.
                     break;
                 }
+                remaining -= blocks;
+                v += 1;
             }
         }
-        result
-    }
-
-    /// Ordered: sort subsets by their first element, then recursively.
-    /// This is equivalent to lexicographic order on the subsets themselves
-    /// as tuples.
-    ///
-    /// Example N=4 (lex order of all non-empty subsets):
-    ///   {0},{0,1},{0,1,2},{0,1,2,3},{0,1,3},{0,2},{0,2,3},{0,3},
-    ///   {1},{1,2},{1,2,3},{1,3},{2},{2,3},{3}
-    fn build_ordered(n: usize) -> Vec<u64> {
-        // Generate all 2^n - 1 non-empty subsets in lexicographic order.
-        // A subset is represented as a sorted Vec<usize>.
-        let total = (1usize << n).saturating_sub(1);
-        let mut subsets: Vec<Vec<usize>> = Vec::with_capacity(total);
-        for mask in 1u64..(1u64 << n) {
-            let subset: Vec<usize> = (0..n).filter(|&b| mask & (1 << b) != 0).collect();
-            subsets.push(subset);
-        }
-        // Sort lexicographically.
-        subsets.sort();
-        // Flatten.
-        subsets.into_iter().flatten().map(|x| x as u64).collect()
-    }
-
-    /// Total number of output blocks.
-    pub fn output_block_count(&self) -> u64 {
-        // The permutation table has one entry per output-block slot.
-        // Divide by the number of entries per block to get block count
-        // — but actually each entry IS one block.  The permutation maps
-        // output block i → source block index.
-        self.permutation.len() as u64
+        0
     }
 }
 
@@ -1380,27 +1434,23 @@ impl DumpDataProvider for BlockPermutationDataProvider {
         let readable_end = (offset + length as u64).min(total_size);
         let start_ob = offset / bb;
         let end_ob = (readable_end.saturating_sub(1)) / bb;
+        let total_out_blocks = self.metadata.total_blocks;
 
         for ob in start_ob..=end_ob {
-            if ob as usize >= self.permutation.len() {
-                break;
-            }
-            let src_block = self.permutation[ob as usize];
+            if ob >= total_out_blocks { break; }
+            let src_block = self.source_block_for(ob);
             let out_block_start = ob * bb;
             let out_block_end = out_block_start + bb;
 
             let seg_start = offset.max(out_block_start);
             let seg_end = readable_end.min(out_block_end);
-            if seg_end <= seg_start {
-                continue;
-            }
+            if seg_end <= seg_start { continue; }
 
             let in_block_off = seg_start - out_block_start;
             let seg_len = (seg_end - seg_start) as u32;
             let src_offset = src_block * bb + in_block_off;
 
             let bytes = self.source.lock().read_bytes(src_offset, seg_len)?;
-
             let dest_start = (seg_start - offset) as usize;
             let copy_len = bytes.len().min(seg_len as usize);
             buffer[dest_start..dest_start + copy_len].copy_from_slice(&bytes[..copy_len]);
@@ -1415,5 +1465,91 @@ impl DumpDataProvider for BlockPermutationDataProvider {
 
     fn cache_identity(&self) -> String {
         self.identity.clone()
+    }
+}
+
+#[cfg(test)]
+mod block_permutation_tests {
+    use super::{binom, kth_combination_element,
+                BlockPermutationDataProvider};
+
+    /// Test the pure mapping functions directly — no provider needed.
+
+    fn unordered_sequence(n: u64) -> Vec<u64> {
+        let total: u64 = if n == 0 { 0 } else if n < 63 { n * (1u64 << (n - 1)) } else { u64::MAX };
+        (0..total).map(|ob| BlockPermutationDataProvider::source_block_unordered(n, ob)).collect()
+    }
+
+    fn ordered_sequence(n: u64) -> Vec<u64> {
+        let total: u64 = if n == 0 { 0 } else if n < 63 { n * (1u64 << (n - 1)) } else { u64::MAX };
+        (0..total).map(|ob| BlockPermutationDataProvider::source_block_ordered(n, ob)).collect()
+    }
+
+    #[test]
+    fn unordered_n4() {
+        #[rustfmt::skip]
+        let expected: Vec<u64> = vec![
+            0, 1, 2, 3,
+            0,1,  0,2,  0,3,  1,2,  1,3,  2,3,
+            0,1,2,  0,1,3,  0,2,3,  1,2,3,
+            0,1,2,3,
+        ];
+        assert_eq!(unordered_sequence(4), expected, "unordered N=4");
+    }
+
+    #[test]
+    fn ordered_n4() {
+        #[rustfmt::skip]
+        let expected: Vec<u64> = vec![
+            0,
+            0,1,
+            0,1,2,
+            0,1,2,3,
+            0,1,3,
+            0,2,
+            0,2,3,
+            0,3,
+            1,
+            1,2,
+            1,2,3,
+            1,3,
+            2,
+            2,3,
+            3,
+        ];
+        assert_eq!(ordered_sequence(4), expected, "ordered N=4");
+    }
+
+    #[test]
+    fn total_block_count() {
+        for n in 1u64..=10 {
+            // Total output blocks = N * 2^(N-1)
+            let expected = n * (1u64 << (n - 1));
+            let seq_len = unordered_sequence(n).len() as u64;
+            assert_eq!(seq_len, expected, "unordered N={} length", n);
+            let seq_len_ord = ordered_sequence(n).len() as u64;
+            assert_eq!(seq_len_ord, expected, "ordered N={} length", n);
+        }
+    }
+
+    #[test]
+    fn binom_values() {
+        assert_eq!(binom(4, 0), 1);
+        assert_eq!(binom(4, 1), 4);
+        assert_eq!(binom(4, 2), 6);
+        assert_eq!(binom(4, 3), 4);
+        assert_eq!(binom(4, 4), 1);
+        assert_eq!(binom(5, 2), 10);
+    }
+
+    #[test]
+    fn kth_combination_spot_checks() {
+        // 2-combinations of {0,1,2,3} in lex order: (0,1)(0,2)(0,3)(1,2)(1,3)(2,3)
+        assert_eq!(kth_combination_element(4, 2, 0, 0), 0);
+        assert_eq!(kth_combination_element(4, 2, 0, 1), 1);
+        assert_eq!(kth_combination_element(4, 2, 2, 0), 0);
+        assert_eq!(kth_combination_element(4, 2, 2, 1), 3);
+        assert_eq!(kth_combination_element(4, 2, 5, 0), 2);
+        assert_eq!(kth_combination_element(4, 2, 5, 1), 3);
     }
 }
