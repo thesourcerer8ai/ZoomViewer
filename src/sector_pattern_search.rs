@@ -1,19 +1,21 @@
 //! Sector Pattern Search
 //!
-//! Searches every 512-byte DATA sub-sector for one of 11 precomputed 6-byte
-//! probe signatures, covering all meaningful XOR combinations of the five base
+//! Searches every 512-byte DATA sub-sector for one of 9 precomputed 6-byte
+//! probe signatures, covering meaningful XOR combinations of three active base
 //! NAND sector types:
 //!
 //!   |Block  — LBA sector (bytes 80–509 are ASCII 'x' = 0x78)
 //!   P00000  — ECC sector (32 × 16-byte "P00000…" chunks)
-//!   Fill00  — blank sector, all 0x00
 //!   Fill77  — blank sector, all 0x77
-//!   FillFF  — blank sector, all 0xFF
 //!
-//! Because all five patterns produce fixed, predictable bytes in the x-fill
-//! region (offsets 80–496, 16-byte aligned), XORing any two patterns yields the
-//! same 6-byte sequence at every probe position.  These sequences are
-//! precomputed once; the hot loop is pure 6-byte equality comparisons.
+//! Fill00 (all 0x00) and FillFF (all 0xFF) singles are intentionally excluded
+//! because they produce too many false positives on real NAND dumps.
+//! Fill00 XOR pairs are also omitted (XOR with zero is the identity).
+//!
+//! Because all three active patterns produce fixed, predictable bytes in the
+//! x-fill region (offsets 80–496, 16-byte aligned), XORing any two patterns
+//! yields the same 6-byte sequence at every probe position.  These sequences
+//! are precomputed once; the hot loop is pure 6-byte equality comparisons.
 //!
 //! A sector matches as soon as ANY single probe matches; the search skips to
 //! the next sector immediately, reporting only the sector's start offset.
@@ -84,13 +86,14 @@ pub struct SectorTarget {
     pub probe: [u8; 6],
 }
 
-/// All 11 non-degenerate targets.
+/// All 9 non-degenerate targets.
 ///
-/// Fill00 XOR anything == anything (identity), so Fill00 mixed pairs are
-/// already covered by the single-target entries and are omitted.
+/// Fill00 and FillFF singles are excluded (too many false positives on real
+/// NAND dumps).  Fill00 XOR pairs are also omitted because XOR with zero is
+/// the identity — they would just duplicate the other singles.
 pub fn all_targets() -> Vec<SectorTarget> {
     vec![
-        // 5 singles
+        // 3 singles (Fill 0x00 and Fill 0xFF disabled — false positives)
         SectorTarget { name: "|Block",           probe: BLOCK              },
         SectorTarget { name: "P00000",           probe: P00000             },
         //SectorTarget { name: "Fill 0x00",        probe: F00                },
@@ -381,8 +384,9 @@ mod tests {
 
     #[test]
     fn all_targets_count() {
-        // 5 singles + 6 XOR pairs = 11
-        assert_eq!(all_targets().len(), 11);
+        // 3 singles (Fill 0x00 and Fill 0xFF omitted — too many false positives)
+        // + 6 XOR pairs = 9
+        assert_eq!(all_targets().len(), 9);
     }
 
     #[test]
