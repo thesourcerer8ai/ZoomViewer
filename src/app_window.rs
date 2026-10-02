@@ -888,16 +888,16 @@ impl AppWindow {
         let zoom_controller = Arc::new(Mutex::new(ZoomController::new(
             metadata.clone(),
             viewport_manager.clone(),
-            1024,
-            648, // Account for status bar height
+            saved_win.width as u32,
+            viewport_h as u32, // Derived: window_height - tab_strip_h - status_bar_h
         )));
 
         // Create pan controller
         let pan_controller = Arc::new(Mutex::new(PanController::new(
             metadata.clone(),
             viewport_manager.clone(),
-            1024,
-            648,
+            saved_win.width as u32,
+            viewport_h as u32,
         )));
 
         // Create address display
@@ -913,14 +913,14 @@ impl AppWindow {
         // Initialize viewport at upper left corner with default zoom (level 0)
         {
             let mut vm = viewport_manager.lock().unwrap();
-            let center_x = 1024.0 / 2.0;
-            let center_y = 648.0 / 2.0;
-            vm.update_viewport(0, center_x, center_y, 1024, 648);
+            let center_x = saved_win.width as f64 / 2.0;
+            let center_y = viewport_h as f64 / 2.0;
+            vm.update_viewport(0, center_x, center_y, saved_win.width as u32, viewport_h as u32);
             vm.update_task_priorities();
         }
 
         // Create initial viewport image
-        let viewport_image = Arc::new(Mutex::new(RgbaImage::new(1024, 648)));
+        let viewport_image = Arc::new(Mutex::new(RgbaImage::new(saved_win.width as u32, viewport_h as u32)));
         
         // Create FLTK tile cache
         let fltk_tile_cache = Arc::new(Mutex::new(HashMap::new()));
@@ -1184,6 +1184,10 @@ impl AppWindow {
         app_window.composite_tiles_into_viewport();
         app_window.draw_viewport_to_frame();
         
+        // Capture initial viewport dimensions for use inside closures (Copy types).
+        let initial_viewport_w = saved_win.width;
+        let initial_viewport_h = viewport_h;
+
         // Set up unified timer loop (tile completion, search jump navigation, workflow output sync)
         let viewport_image_clone = app_window.viewport_image.clone();
         let viewport_frame_clone = app_window.viewport_frame.clone();
@@ -1311,9 +1315,9 @@ impl AppWindow {
                             }
 
                             if let Ok(mut vm) = viewport_manager_clone.try_lock() {
-                                let center_x = 1024.0 / 2.0;
-                                let center_y = 648.0 / 2.0;
-                                vm.update_viewport(0, center_x, center_y, 1024, 648);
+                                let center_x = initial_viewport_w as f64 / 2.0;
+                                let center_y = initial_viewport_h as f64 / 2.0;
+                                vm.update_viewport(0, center_x, center_y, initial_viewport_w as u32, initial_viewport_h as u32);
                                 vm.update_task_priorities();
                             }
                             // Reset Hex Tab to the beginning when a new OutputViewer is shown
@@ -1458,7 +1462,12 @@ impl AppWindow {
                     fltk::enums::Event::MouseWheel => {
                         log::debug!("MouseWheel event at window level");
                         let mouse_x = fltk::app::event_x() as f64;
-                        let mouse_y = fltk::app::event_y() as f64;
+                        // event_y() is window-relative and includes the 30 px tab strip.
+                        // ZoomController::screen_height is the usable viewport height (no tab
+                        // strip), so we subtract the tab strip offset before forwarding the
+                        // coordinate so that the pivot point matches the true cursor position.
+                        let tab_strip_offset: f64 = 30.0;
+                        let mouse_y = fltk::app::event_y() as f64 - tab_strip_offset;
                         let scroll_amount = fltk::app::event_dy();
                         
                         log::debug!("Mouse at ({}, {}), scroll: {:?}", mouse_x, mouse_y, scroll_amount);
