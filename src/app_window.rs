@@ -1400,17 +1400,31 @@ impl AppWindow {
                     fltk::enums::Event::Resize => {
                         let new_width = win.width() as u32;
                         let new_height = win.height() as u32;
+                        let tab_strip_height = 30u32;
                         let status_bar_height = 60u32;
-                        let viewport_height = new_height.saturating_sub(status_bar_height);
-                        
-                        // Resize viewport frame
+                        // Viewport sits below the tab strip and above the status bar.
+                        let viewport_height = new_height
+                            .saturating_sub(tab_strip_height)
+                            .saturating_sub(status_bar_height);
+
+                        // Resize viewport frame — keep it below the tab bar
                         if let Ok(mut frame) = viewport_frame_resize.lock() {
-                            frame.resize(0, 0, new_width as i32, viewport_height as i32);
+                            frame.resize(
+                                0,
+                                tab_strip_height as i32,
+                                new_width as i32,
+                                viewport_height as i32,
+                            );
                         }
-                        
-                        // Resize and reposition status bar
+
+                        // Resize and reposition status bar — just below the viewport
                         if let Ok(mut status) = status_bar_resize.lock() {
-                            status.resize(0, viewport_height as i32, new_width as i32, status_bar_height as i32);
+                            status.resize(
+                                0,
+                                (tab_strip_height + viewport_height) as i32,
+                                new_width as i32,
+                                status_bar_height as i32,
+                            );
                         }
                         
                         // Update viewport manager with new dimensions
@@ -1557,8 +1571,10 @@ impl AppWindow {
 
                             if is_zero || is_plus || is_minus {
                                 let center_x = (win.width() as f64) / 2.0;
+                                let tab_strip_h = 30.0;
                                 let status_bar_height = 60.0;
-                                let center_y = ((win.height() as f64) - status_bar_height) / 2.0;
+                                // Center within the usable viewport area (below tabs, above status bar)
+                                let center_y = tab_strip_h + ((win.height() as f64) - tab_strip_h - status_bar_height) / 2.0;
                                 let render_start = Instant::now();
 
                                 {
