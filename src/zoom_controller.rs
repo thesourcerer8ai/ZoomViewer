@@ -269,8 +269,14 @@ impl ZoomController {
         let half_width = (self.screen_width as f64) / 2.0;
         let half_height = (self.screen_height as f64) / 2.0;
         
-        new_center_x = new_center_x.max(half_width).min(pixels_wide - half_width);
-        new_center_y = new_center_y.max(half_height).min(pixels_tall - half_height);
+        // When the image is smaller than the viewport in one axis, both bounds collapse
+        // to half_width/half_height (centering the image) — mirrors pan_controller::calculate_boundaries.
+        new_center_x = new_center_x
+            .max(half_width)
+            .min((pixels_wide - half_width).max(half_width));
+        new_center_y = new_center_y
+            .max(half_height)
+            .min((pixels_tall - half_height).max(half_height));
         
         // Update viewport manager
         if let Ok(mut manager) = self.viewport_manager.lock() {
