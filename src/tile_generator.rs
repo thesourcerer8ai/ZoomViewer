@@ -119,12 +119,18 @@ impl TileGenerator {
         fragments
     }
 
-    /// Generate a double-sized (512x512) PixelBuffer directly from dump file for level-1 tile calculation
+    /// Generate a double-sized (512x512) PixelBuffer directly from dump file for level-1 tile calculation.
+    ///
+    /// Returns `(buffer, fragments_were_empty)`.  The bool is `true` when the fragment
+    /// list came back empty (dump too small — confirmed blank canvas); it is `false` when
+    /// at least one fragment was produced and rendered, even if the resulting pixels are
+    /// all-white (e.g. fully-erased NAND).  Callers should use the bool — not the pixel
+    /// content — to decide whether to cache the result.
     pub fn generate_double_tile_buffer(
         coord: TileCoord,
         metadata: &FileMetadata,
         file_loader: &mut dyn DumpDataProvider,
-    ) -> Result<PixelBuffer> {
+    ) -> Result<(PixelBuffer, bool)> {
         if coord.level != 1 {
             return Err(crate::error::Error::InvalidCoordinates(
                 "generate_double_tile_buffer only supports level 1 target coordinates".to_string(),
@@ -143,9 +149,11 @@ impl TileGenerator {
         let mut canvas = PixelBuffer::new(512, 512);
 
         if fragments.is_empty() {
+            // Use grid_height (column-major layout): tile (0,0) only needs blocks in
+            // column 0, so the minimum is ceil(tile_end_pixel_y / block_size) * grid_height.
             let min_blocks_needed = (tile_end_pixel_y + metadata.block_size as u64 - 1)
                 / metadata.block_size as u64
-                * metadata.grid_width as u64;
+                * metadata.grid_height as u64;
             log::warn!(
                 "Level-1 tile ({},{}) produced no fragments (pixel range x={}..{}, y={}..{}). \
                  Dump may be too small: need ~{} blocks, have {}.",
@@ -155,7 +163,8 @@ impl TileGenerator {
                 min_blocks_needed,
                 metadata.total_blocks,
             );
-            return Ok(canvas);
+            // fragments_were_empty = true → caller should not cache this blank canvas
+            return Ok((canvas, true));
         }
 
         let tile_data = file_loader.read_fragments(fragments).map_err(|e| {
@@ -164,7 +173,9 @@ impl TileGenerator {
 
         Self::render_tile_data(&tile_data, TileCoord::new(0, coord.x * 2, coord.y * 2), metadata, &mut canvas)?;
 
-        Ok(canvas)
+        // fragments_were_empty = false → real data was rendered (may still be all-white
+        // for erased flash, but that is legitimate and should be cached)
+        Ok((canvas, false))
     }
 
     /// Generate a 256x256 QOI tile for negative zoom levels (-1 to -4) by upscaling from dump
@@ -1268,6 +1279,13 @@ mod tests {
             &metadata,
         );
 
+        // With a 64-block dump and grid_height=1, column 1 starts at block index 1
+        // which is within bounds — fragments must not be empty.
+        assert!(
+            !fragments.is_empty(),
+            "fragments must be non-empty for x=1 tile with 64-block dump"
+        );
+
         // The dump may not be wide enough to have a column at x=512px, so fragments
         // could be empty for that reason — but if they are non-empty, every fragment
         // must be valid.
@@ -1313,7 +1331,7 @@ mod tests {
         // Must not panic or error — graceful degradation
         assert!(result.is_ok(), "generate_double_tile_buffer must not error on a small dump");
 
-        let canvas = result.unwrap();
+        let (canvas, _fragments_were_empty) = result.unwrap();
         assert_eq!(canvas.width(), 512, "Canvas must be 512px wide");
         assert_eq!(canvas.height(), 512, "Canvas must be 512px tall");
 
@@ -1357,7 +1375,8 @@ mod tests {
 
         assert!(result.is_ok(), "generate_double_tile_buffer must succeed for a large dump");
 
-        let canvas = result.unwrap();
+        let (canvas, fragments_were_empty) = result.unwrap();
+        assert!(!fragments_were_empty, "Fragments must not be empty for a large enough dump");
         // At least some pixels should be non-white (i.e. black, from 0xFF data)
         let has_non_white = canvas.data().iter().any(|p| p.r != 255 || p.g != 255 || p.b != 255);
         assert!(

@@ -317,18 +317,21 @@ impl PyramidTileGenerator {
         
         // Special case for Level 1: generate from 512x512 region loaded directly from dump
         if coord.level == 1 {
-            let double_buffer = TileGenerator::generate_double_tile_buffer(coord, metadata, file_loader)?;
+            let (double_buffer, fragments_were_empty) = TileGenerator::generate_double_tile_buffer(coord, metadata, file_loader)?;
             let downscaled = Self::downscale(&double_buffer)?;
             let cached_bytes = Self::encode_qoi(&downscaled)?;
-            // Only persist the tile if it contains real (non-white) data.
-            // An all-white result means the dump was too small to fill this tile;
-            // caching it would permanently block future correct generation.
-            let has_real_data = downscaled.data().iter().any(|p| p.r != 255 || p.g != 255 || p.b != 255);
-            if has_real_data {
+            // Only persist the tile if the fragment list was non-empty.
+            // An empty fragment list means the dump was too small to produce any data for
+            // this tile (confirmed blank canvas).  Caching a blank tile would permanently
+            // block future correct generation once the dump grows or the parameters change.
+            // A non-empty fragment list means real data was rendered — even if the resulting
+            // pixels are all-white (e.g. fully-erased NAND flash) — and that result is
+            // legitimate and should be cached.
+            if !fragments_were_empty {
                 cache.save_tile(&coord, &cached_bytes)?;
             } else {
                 log::warn!(
-                    "Level-1 tile ({},{}) is all-white (dump too small?); skipping cache write.",
+                    "Level-1 tile ({},{}) has no fragments (dump too small?); skipping cache write.",
                     coord.x, coord.y,
                 );
             }

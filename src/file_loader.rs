@@ -75,18 +75,21 @@ impl FileLoader {
         // Each block contributes `block_size` pixel-rows, so we need at least
         // ceil(512 / block_size) blocks tall per column in the grid.
         let min_block_rows: u64 = (512 + metadata.block_size as u64 - 1) / metadata.block_size as u64;
-        let min_blocks_for_level1: u64 = min_block_rows * metadata.grid_width as u64;
+        // The fragment loop is column-major (block_index = block_x * grid_height + block_y).
+        // Tile (0,0) only needs blocks in column 0, so the threshold is min_block_rows
+        // blocks within that column, which equals min_block_rows * grid_height total blocks.
+        let min_blocks_for_level1: u64 = min_block_rows * metadata.grid_height as u64;
         if metadata.total_blocks < min_blocks_for_level1 {
             log::warn!(
                 "Dump '{}' is too small to produce level-1 tiles: has {} blocks, \
-                 needs at least {} ({}×{} block rows × {} grid columns). \
+                 needs at least {} ({}×{} block rows × {} grid height). \
                  Level-1 zoom-out tiles will appear gray.",
                 metadata.path,
                 metadata.total_blocks,
                 min_blocks_for_level1,
                 min_block_rows,
                 metadata.block_size,
-                metadata.grid_width,
+                metadata.grid_height,
             );
         }
         
