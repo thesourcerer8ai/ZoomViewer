@@ -70,6 +70,26 @@ impl FileLoader {
         
         let metadata = FileMetadata::new(path_str, size, page_length, block_size);
         
+        // Warn if the dump is too small to produce any level-1 tile at position (0,0).
+        // Level-1 tile (0,0) requires 512 pixel-rows in the level-0 space.
+        // Each block contributes `block_size` pixel-rows, so we need at least
+        // ceil(512 / block_size) blocks tall per column in the grid.
+        let min_block_rows: u64 = (512 + metadata.block_size as u64 - 1) / metadata.block_size as u64;
+        let min_blocks_for_level1: u64 = min_block_rows * metadata.grid_width as u64;
+        if metadata.total_blocks < min_blocks_for_level1 {
+            log::warn!(
+                "Dump '{}' is too small to produce level-1 tiles: has {} blocks, \
+                 needs at least {} ({}×{} block rows × {} grid columns). \
+                 Level-1 zoom-out tiles will appear gray.",
+                metadata.path,
+                metadata.total_blocks,
+                min_blocks_for_level1,
+                min_block_rows,
+                metadata.block_size,
+                metadata.grid_width,
+            );
+        }
+        
         Ok(FileLoader { file, metadata })
     }
     

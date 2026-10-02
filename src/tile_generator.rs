@@ -91,7 +91,13 @@ impl TileGenerator {
             
             // Calculate byte range within the page
             let byte_in_page_start = tile_start_byte_x % page_length;
-            let byte_in_page_end = (tile_end_byte_x % page_length).min(page_length);
+            // When tile_end_byte_x is an exact multiple of page_length, the modulo
+            // produces 0 which would make every row's range empty. Treat that as
+            // "read the full page" instead.
+            let byte_in_page_end = match tile_end_byte_x % page_length {
+                0 => page_length,           // ends exactly at page boundary → read full page
+                r => r,
+            };
             
             let row_start_offset = block_start_offset + page_offset + byte_in_page_start;
             let row_end_offset = block_start_offset + page_offset + byte_in_page_end;
@@ -137,6 +143,18 @@ impl TileGenerator {
         let mut canvas = PixelBuffer::new(512, 512);
 
         if fragments.is_empty() {
+            let min_blocks_needed = (tile_end_pixel_y + metadata.block_size as u64 - 1)
+                / metadata.block_size as u64
+                * metadata.grid_width as u64;
+            log::warn!(
+                "Level-1 tile ({},{}) produced no fragments (pixel range x={}..{}, y={}..{}). \
+                 Dump may be too small: need ~{} blocks, have {}.",
+                coord.x, coord.y,
+                tile_start_pixel_x, tile_end_pixel_x,
+                tile_start_pixel_y, tile_end_pixel_y,
+                min_blocks_needed,
+                metadata.total_blocks,
+            );
             return Ok(canvas);
         }
 
@@ -1179,6 +1197,210 @@ mod tests {
         // Verify it's a complete, valid QOI by decoding
         let result = qoi::decode_to_vec(&qoi_bytes);
         assert!(result.is_ok(), "QOI should be decodable");
+    }
+
+    // -----------------------------------------------------------------------
+    // Edge-case tests for the layer-1 gray-tile bug fixes
+    // -----------------------------------------------------------------------
+
+    /// Fix 1: `byte_in_page_end` exact-boundary test.
+    ///
+    /// When `tile_end_byte_x` is an exact multiple of `page_length` the old code
+    /// computed `byte_in_page_end = 0`, which produced empty fragments for every
+    /// row of the tile.  The fix maps 0 → `page_length`.
+    ///
+    /// Setup: page_length=64, block_size=64.  Tile (0,0) spans x-pixels 0..256,
+    /// so `tile_end_byte_x = ceil(256/8) = 32`.  32 % 64 = 32 (not 0), so this
+    /// is fine.  To trigger the boundary case we need
+    ///   `tile_end_byte_x % page_length == 0`.
+    /// The simplest way is to craft a custom bounds call where tile_end_pixel_x=512
+    /// and page_length=64, giving tile_end_byte_x=64, 64%64=0.
+    #[test]
+    fn test_byte_in_page_end_exact_boundary() {
+        // 8 blocks, page_length=64, block_size=64 → 8*64*64 = 32768 bytes
+        let metadata = FileMetadata::new(
+            "test.bin".to_string(),
+            32_768,
+            64,  // page_length = 64: tile_end_byte_x=64, 64%64=0 triggers the old bug
+            64,
+        );
+
+        // tile_end_pixel_x=512 → tile_end_byte_x = (512+7)/8 = 64; 64 % 64 == 0
+        let fragments = TileGenerator::calculate_fragments_for_bounds(
+            0,   // tile_start_pixel_x
+            512, // tile_end_pixel_x  ← exact multiple of page_length in bytes
+            0,   // tile_start_pixel_y
+            64,  // tile_end_pixel_y (one block tall)
+            &metadata,
+        );
+
+        assert!(
+            !fragments.is_empty(),
+            "Fragments must not be empty when tile_end_byte_x is an exact multiple of page_length"
+        );
+
+        for frag in &fragments {
+            assert!(frag.start_byte < frag.end_byte, "Each fragment must have a positive length");
+            assert!(frag.end_byte <= metadata.size, "Fragment must stay within file bounds");
+        }
+    }
+
+    /// Fix 1 variant: same boundary, non-zero x-start.
+    ///
+    /// Tile starts at x-pixel 512 (second tile column) with page_length=64.
+    /// tile_start_byte_x=64, tile_end_byte_x=128; both 64%64=0 and 128%64=0.
+    #[test]
+    fn test_byte_in_page_end_exact_boundary_nonzero_x() {
+        // Enough blocks to contain x=1 tiles: grid_width≥2 required.
+        // Use a generous dump (64 blocks * 64 pages * 64 bytes = 262144 bytes).
+        let metadata = FileMetadata::new(
+            "test.bin".to_string(),
+            262_144,
+            64,
+            64,
+        );
+
+        let fragments = TileGenerator::calculate_fragments_for_bounds(
+            512, // tile_start_pixel_x → start_byte = 64; 64 % 64 == 0
+            1024,// tile_end_pixel_x   → end_byte   = 128; 128 % 64 == 0
+            0,
+            64,
+            &metadata,
+        );
+
+        // The dump may not be wide enough to have a column at x=512px, so fragments
+        // could be empty for that reason — but if they are non-empty, every fragment
+        // must be valid.
+        for frag in &fragments {
+            assert!(frag.start_byte < frag.end_byte, "Fragment must have positive length");
+            assert!(frag.end_byte <= metadata.size, "Fragment must stay within file bounds");
+        }
+    }
+
+    /// Small dump — level-1 tile (0,0) returns Ok (graceful degradation, no panic).
+    ///
+    /// The dump has only 4 blocks (block_size=64, page_length=512).
+    /// Level-1 tile (0,0) needs 512 pixel-rows → 8 blocks tall per grid column.
+    /// The dump does not fill the whole tile, so only the lower half of the buffer
+    /// can have real data; the rest stays white.  The important guarantee is that
+    /// `generate_double_tile_buffer` completes without an error or panic and returns
+    /// a 512×512 buffer.
+    #[test]
+    fn test_level1_tile_small_dump_returns_ok() {
+        use tempfile::NamedTempFile;
+        use std::io::Write;
+
+        // 4 blocks × 64 pages/block × 512 bytes/page = 131072 bytes
+        let dump_size: usize = 4 * 64 * 512;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(&vec![0xFFu8; dump_size]).unwrap();
+        temp_file.flush().unwrap();
+
+        let mut file_loader = FileLoader::new(temp_file.path(), 512, 64).unwrap();
+        let metadata = file_loader.get_metadata();
+
+        // Sanity: dump is indeed too small to fill a full level-1 tile (0,0)
+        // which needs ceil(512 / block_size) = 8 block-rows per grid column.
+        assert!(
+            metadata.total_blocks < 8 * metadata.grid_width as u64,
+            "Expected a dump too small for a full level-1 tile (0,0), got {} blocks",
+            metadata.total_blocks
+        );
+
+        let coord = TileCoord::new(1, 0, 0);
+        let result = TileGenerator::generate_double_tile_buffer(coord, &metadata, &mut file_loader);
+
+        // Must not panic or error — graceful degradation
+        assert!(result.is_ok(), "generate_double_tile_buffer must not error on a small dump");
+
+        let canvas = result.unwrap();
+        assert_eq!(canvas.width(), 512, "Canvas must be 512px wide");
+        assert_eq!(canvas.height(), 512, "Canvas must be 512px tall");
+
+        // The bottom rows (pixel_y beyond the dump's block range) must remain white.
+        // For a 4-block dump with grid_width=4 and block_size=64,
+        // the maximum pixel_y with data is 4 * 64 - 1 = 255 (or less for larger grid_width).
+        // So the last row (y=511) must always be white regardless of dump layout.
+        let last_row_start = (511 * 512) as usize;
+        let last_row_is_white = canvas.data()[last_row_start..last_row_start + 512]
+            .iter()
+            .all(|p| p.r == 255 && p.g == 255 && p.b == 255);
+        assert!(
+            last_row_is_white,
+            "Last row of level-1 tile must be white when dump is too small to fill the tile"
+        );
+    }
+
+    /// Sufficient dump — level-1 tile (0,0) has real (non-white) data.
+    ///
+    /// The dump is 8+ blocks tall (block_size=64) and filled with 0xFF bytes,
+    /// which renders as all-black pixels.  After `generate_double_tile_buffer`
+    /// the buffer must contain at least some black pixels, proving real data
+    /// was read and rendered.
+    #[test]
+    fn test_level1_tile_sufficient_dump_has_real_data() {
+        use tempfile::NamedTempFile;
+        use std::io::Write;
+
+        // 16 blocks × 64 pages × 512 bytes = 524288 bytes (definitely large enough)
+        let dump_size: usize = 16 * 64 * 512;
+        let mut temp_file = NamedTempFile::new().unwrap();
+        // 0xFF → all bits set → all-black pixels in the viewer
+        temp_file.write_all(&vec![0xFFu8; dump_size]).unwrap();
+        temp_file.flush().unwrap();
+
+        let mut file_loader = FileLoader::new(temp_file.path(), 512, 64).unwrap();
+        let metadata = file_loader.get_metadata();
+
+        let coord = TileCoord::new(1, 0, 0);
+        let result = TileGenerator::generate_double_tile_buffer(coord, &metadata, &mut file_loader);
+
+        assert!(result.is_ok(), "generate_double_tile_buffer must succeed for a large dump");
+
+        let canvas = result.unwrap();
+        // At least some pixels should be non-white (i.e. black, from 0xFF data)
+        let has_non_white = canvas.data().iter().any(|p| p.r != 255 || p.g != 255 || p.b != 255);
+        assert!(
+            has_non_white,
+            "Level-1 tile must contain non-white pixels when dump is large enough and data is non-zero"
+        );
+    }
+
+    /// `calculate_fragments_for_bounds` partial-page test.
+    ///
+    /// A tile that starts and ends mid-page must produce fragments whose
+    /// per-row byte ranges sit strictly inside [0, page_length).
+    #[test]
+    fn test_fragments_partial_page_byte_offsets() {
+        // page_length=512, tile x from pixel 8 to 24 → bytes 1..3 within the page
+        let metadata = FileMetadata::new(
+            "test.bin".to_string(),
+            10_000_000,
+            512,
+            64,
+        );
+
+        // pixel 8 → byte 1; pixel 24 → byte 3 (both within the first page)
+        let fragments = TileGenerator::calculate_fragments_for_bounds(
+            8,  // start pixel x
+            24, // end pixel x   (tile_end_byte_x = ceil(24/8) = 3)
+            0,  // start pixel y
+            64, // end pixel y
+            &metadata,
+        );
+
+        assert!(!fragments.is_empty(), "Should produce fragments for a valid mid-page tile");
+
+        // For every fragment the byte range within the page must be [1, 3]
+        // that is: each fragment covers exactly 2 bytes per row.
+        for frag in &fragments {
+            let length = frag.end_byte - frag.start_byte;
+            assert_eq!(
+                length, 2,
+                "Each row fragment should be 2 bytes wide (bytes 1..3 of the page), got {}",
+                length
+            );
+        }
     }
 }
 

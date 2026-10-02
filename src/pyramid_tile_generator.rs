@@ -320,7 +320,18 @@ impl PyramidTileGenerator {
             let double_buffer = TileGenerator::generate_double_tile_buffer(coord, metadata, file_loader)?;
             let downscaled = Self::downscale(&double_buffer)?;
             let cached_bytes = Self::encode_qoi(&downscaled)?;
-            cache.save_tile(&coord, &cached_bytes)?;
+            // Only persist the tile if it contains real (non-white) data.
+            // An all-white result means the dump was too small to fill this tile;
+            // caching it would permanently block future correct generation.
+            let has_real_data = downscaled.data().iter().any(|p| p.r != 255 || p.g != 255 || p.b != 255);
+            if has_real_data {
+                cache.save_tile(&coord, &cached_bytes)?;
+            } else {
+                log::warn!(
+                    "Level-1 tile ({},{}) is all-white (dump too small?); skipping cache write.",
+                    coord.x, coord.y,
+                );
+            }
             return Ok(cached_bytes);
         }
 
