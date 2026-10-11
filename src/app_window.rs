@@ -508,6 +508,16 @@ impl AppWindow {
                     }
                 };
 
+                let entropy_vec: Vec<Option<f32>> = {
+                    let base_page = if let Ok(ht) = hex_tab_draw.try_lock() {
+                        ht.current_page
+                    } else {
+                        0
+                    };
+                    let wf = workflow_for_hex.lock().unwrap_or_else(|e| e.into_inner());
+                    (0..128u64).map(|i| wf.get_page_entropy(base_page + i)).collect()
+                };
+
                 let full_output = hex_egui_ctx_draw.run(raw_input, |ctx| {
                     let mut ht = hex_tab_draw.lock().unwrap_or_else(|e| e.into_inner());
                     ht.show_ui(
@@ -517,6 +527,7 @@ impl AppWindow {
                         &search_results_clone,
                         pattern_len,
                         &page_records_clone,
+                        &entropy_vec,
                     );
                 });
 

@@ -308,6 +308,7 @@ impl HexTabState {
         search_results: &[SearchResult],
         search_pattern_len: usize,
         page_records: &[PageStructureRecord],
+        entropy_per_page: &[Option<f32>],
     ) {
         let Some(main_prov_arc) = main_provider_opt else {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -502,6 +503,7 @@ impl HexTabState {
                                     search_results,
                                     search_pattern_len,
                                     page_records,
+                                    entropy_per_page,
                                 );
                             },
                         );
@@ -888,6 +890,7 @@ impl HexTabState {
         search_results: &[SearchResult],
         search_pattern_len: usize,
         page_records: &[PageStructureRecord],
+        entropy_per_page: &[Option<f32>],
     ) {
         let mono_font = FontId::new(self.font_size, FontFamily::Monospace);
         let block_size = meta.block_size as u64;
@@ -978,7 +981,7 @@ impl HexTabState {
                     let (active_bytes, raw_bytes) = row_data.get(row_idx).cloned().unwrap_or_default();
                     let _ = (total_size, page_length); // suppress unused-variable warning
 
-                    ui.horizontal(|ui| {
+                    let row_response = ui.horizontal(|ui| {
                         // 1. Prefix: Block, Page, Offset
                         let prefix_str = format!("B:{:04} P:{:03} +{:04X} | ", block_idx, page_in_block, self.col_offset_in_page);
                         let prefix_label = ui.label(
@@ -1124,6 +1127,18 @@ impl HexTabState {
                             }
                         }
                     });
+                    // Apply entropy-based tint overlay on the row
+                    if let Some(entropy) = entropy_per_page.get(row_idx).copied().flatten() {
+                        let t = (1.0 - (entropy / 8.0)).clamp(0.0, 1.0);
+                        let alpha = (t * 55.0) as u8;
+                        let tint = Color32::from_rgba_premultiplied(
+                            (t * 30.0) as u8,
+                            (t * 30.0) as u8,
+                            (t * 55.0) as u8,
+                            alpha,
+                        );
+                        ui.painter().rect_filled(row_response.response.rect, Rounding::ZERO, tint);
+                    }
                 }
             });
     }

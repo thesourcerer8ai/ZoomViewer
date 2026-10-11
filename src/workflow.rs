@@ -18,6 +18,14 @@ use crate::pattern_healing::{DataSegment, PatternHealingDataProvider};
 use crate::page_structure_tab::{PageStructureTabState, SegmentKind};
 pub use crate::file_dialog::FileDialog;
 
+/// Per-page entropy result stored by an Entropy workflow node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntropyResult {
+    pub page: u64,
+    pub entropy_8: f32,
+    pub entropy_32: Option<f32>,
+}
+
 /// Status of node execution
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeExecutionStatus {
@@ -173,6 +181,18 @@ pub enum WorkflowNodeKind {
         /// `None` = start from the beginning.
         #[serde(default)]
         resume_from_offset: Option<u64>,
+    },
+    /// Entropy Analysis node — computes per-page Shannon entropy for every page in
+    /// the upstream pipeline. Results are stored on the node and optionally written
+    /// to a CSV log file. Passes bytes through unchanged (acts as a transparent tap).
+    Entropy {
+        /// CSV log file path. Empty = no file written.
+        log_path: String,
+        /// Also compute 32-bit differential entropy (XOR of consecutive 32-bit words).
+        compute_32bit: bool,
+        /// Per-page entropy results accumulated during analysis.
+        #[serde(default)]
+        results: Vec<EntropyResult>,
     },
 }
 
@@ -409,6 +429,22 @@ impl WorkflowNode {
         }
     }
 
+    pub fn new_entropy(id: usize, pos: [f32; 2]) -> Self {
+        Self {
+            id,
+            name: "Entropy Analysis".to_string(),
+            pos,
+            kind: WorkflowNodeKind::Entropy {
+                log_path: String::new(),
+                compute_32bit: false,
+                results: Vec::new(),
+            },
+            status: NodeExecutionStatus::Idle,
+            output_log: "Connect an upstream node and run entropy analysis.".to_string(),
+            collapsed: false,
+        }
+    }
+
     pub fn execute(&mut self) {
         self.status = NodeExecutionStatus::Running;
         let start_time = std::time::Instant::now();
@@ -522,6 +558,13 @@ impl WorkflowNode {
                 self.output_log = format!(
                     "Sector Pattern Search ready.\nSearches 11 targets × 27 probe positions per sector.\nLimit: {} matches.\nConnect an upstream node and run.",
                     if *max_matches == 0 { "unlimited".to_string() } else { max_matches.to_string() }
+                );
+            }
+            WorkflowNodeKind::Entropy { compute_32bit, .. } => {
+                self.status = NodeExecutionStatus::Completed;
+                self.output_log = format!(
+                    "Entropy Analysis ready. 32-bit: {}. Connect upstream and click Start Analysis.",
+                    compute_32bit
                 );
             }
         }
@@ -642,6 +685,58 @@ fn hex_drag_usize(value: &mut usize, speed: f64) -> egui::DragValue<'_> {
         .speed(speed)
         .custom_formatter(|n, _| format!("0x{:X} ({})", n as u64, n as u64))
         .custom_parser(|s| parse_dec_or_hex(s).map(|v| v as f64))
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Entropy computation helpers
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Compute standard 8-bit Shannon entropy of `data`. Range [0.0, 8.0].
+/// Returns 0.0 for empty input.
+pub fn compute_entropy_8(data: &[u8]) -> f32 {
+    if data.is_empty() {
+        return 0.0;
+    }
+    let mut counts = [0u32; 256];
+    for &b in data {
+        counts[b as usize] += 1;
+    }
+    let n = data.len() as f32;
+    let mut h = 0.0f32;
+    for &c in &counts {
+        if c > 0 {
+            let p = c as f32 / n;
+            h -= p * p.log2();
+        }
+    }
+    h
+}
+
+/// Compute 32-bit differential entropy: XOR the page with itself shifted by 4 bytes,
+/// then compute the 8-bit Shannon entropy of the XOR result. Range [0.0, 8.0].
+/// Returns 0.0 if data has fewer than 5 bytes.
+pub fn compute_entropy_32(data: &[u8]) -> f32 {
+    if data.len() < 5 {
+        return 0.0;
+    }
+    let len = data.len();
+    let xored: Vec<u8> = data[4..].iter().zip(&data[..len - 4]).map(|(a, b)| a ^ b).collect();
+    compute_entropy_8(&xored)
+}
+
+/// Write entropy results to a CSV log file.
+/// Format: page,entropy_8,entropy_32 (one row per page, header on first line).
+fn write_entropy_csv(path: &str, results: &[EntropyResult]) -> std::io::Result<()> {
+    use std::io::BufWriter;
+    let file = fs::File::create(path)?;
+    let mut writer = BufWriter::new(file);
+    writeln!(writer, "page,entropy_8,entropy_32")?;
+    for r in results {
+        let e32_str = r.entropy_32.map(|v| format!("{:.6}", v)).unwrap_or_default();
+        writeln!(writer, "{},{:.6},{}", r.page, r.entropy_8, e32_str)?;
+    }
+    writer.flush()?;
+    Ok(())
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1020,6 +1115,7 @@ impl WorkflowEditorState {
             WorkflowNodeKind::BlockSelector { .. } => WorkflowNode::new_block_selector(id, pos),
             WorkflowNodeKind::BlockPermutation { .. } => WorkflowNode::new_block_permutation(id, pos),
             WorkflowNodeKind::SectorPatternSearch { .. } => WorkflowNode::new_sector_pattern_search(id, pos),
+            WorkflowNodeKind::Entropy { .. } => WorkflowNode::new_entropy(id, pos),
         };
 
         self.nodes.push(node);
@@ -1356,6 +1452,13 @@ impl WorkflowEditorState {
                 );
                 Ok(Arc::new(Mutex::new(filtered)) as Arc<Mutex<dyn DumpDataProvider>>)
             }
+            WorkflowNodeKind::Entropy { .. } => {
+                // Pass-through: entropy node acts as a transparent tap on the upstream data.
+                let incoming = self.connections.iter()
+                    .find(|c| c.to_node == target_node_id)
+                    .ok_or_else(|| format!("Entropy node #{} has no input connected", target_node_id))?;
+                self.build_data_provider_internal(incoming.from_node, ancestors)
+            }
         };
 
         // Backtrack: remove this node from the ancestor path so sibling branches
@@ -1577,6 +1680,26 @@ impl WorkflowEditorState {
         };
 
         Some((virtual_results, pattern_len))
+    }
+
+    /// Walk upstream from the active OutputViewer looking for an Entropy node,
+    /// and return the entropy_8 value for the given page if found.
+    pub fn get_page_entropy(&self, page: u64) -> Option<f32> {
+        let output_id = self.get_active_output_node_id()?;
+        let mut current_id = output_id;
+        let mut visited = std::collections::HashSet::new();
+        loop {
+            if !visited.insert(current_id) {
+                return None; // cycle guard
+            }
+            let node = self.nodes.iter().find(|n| n.id == current_id)?;
+            if let WorkflowNodeKind::Entropy { results, .. } = &node.kind {
+                return results.iter().find(|r| r.page == page).map(|r| r.entropy_8);
+            }
+            // Follow single upstream connection
+            let incoming = self.connections.iter().find(|c| c.to_node == current_id)?;
+            current_id = incoming.from_node;
+        }
     }
 
     /// Returns (active_output_provider, Option<raw_primary_input_provider>).
@@ -1977,6 +2100,107 @@ impl WorkflowEditorState {
         Ok(())
     }
 
+    /// Start an Entropy Analysis node in a background thread.
+    ///
+    /// Encodes `EntropyResult` as `SearchResult` for transport over the existing
+    /// `ActiveSearchState` channels:
+    ///   - `preview_ascii` = entropy_8 formatted to 6 decimal places
+    ///   - `preview_hex`   = entropy_32 formatted to 6 decimal places (empty if not computed)
+    ///   - `page`          = page index
+    ///   - `byte_offset`   = page * page_len
+    pub fn start_entropy_node(&mut self, node_id: usize) -> Result<(), String> {
+        let (incoming_id, compute_32bit) = {
+            let node = self.nodes.iter().find(|n| n.id == node_id)
+                .ok_or_else(|| format!("Node #{} not found", node_id))?;
+            let incoming = self.connections.iter().find(|c| c.to_node == node_id)
+                .ok_or_else(|| format!("Entropy node #{} has no input connected", node_id))?;
+            match &node.kind {
+                WorkflowNodeKind::Entropy { compute_32bit, .. } => {
+                    (incoming.from_node, *compute_32bit)
+                }
+                _ => return Err(format!("Node #{} is not an Entropy node", node_id)),
+            }
+        };
+
+        // Cancel any existing run on this node.
+        self.cancel_search_node(node_id);
+
+        let upstream = self.build_data_provider(incoming_id)?;
+        let total_bytes = upstream.lock().get_metadata().size;
+
+        let cancel_flag    = Arc::new(AtomicBool::new(false));
+        let progress_bytes = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<crate::search::SearchResult>, String>>();
+        let (match_tx, match_rx) = std::sync::mpsc::channel::<crate::search::SearchResult>();
+
+        let cancel_t    = cancel_flag.clone();
+        let prog_t      = progress_bytes.clone();
+        let prov_t      = upstream.clone();
+        let do_32bit_t  = compute_32bit;
+        let match_tx_t  = match_tx;
+        let total_bytes_t = total_bytes;
+
+        std::thread::spawn(move || {
+            let page_len = {
+                let guard = prov_t.lock();
+                guard.get_metadata().page_length as u64
+            };
+            if page_len == 0 {
+                let _ = tx.send(Err("Page length is 0".to_string()));
+                return;
+            }
+            let total_pages = total_bytes_t / page_len;
+            let mut all_results: Vec<crate::search::SearchResult> = Vec::new();
+
+            for page_idx in 0..total_pages {
+                if cancel_t.load(Ordering::Relaxed) {
+                    break;
+                }
+                let offset = page_idx * page_len;
+                let data = {
+                    let mut guard = prov_t.lock();
+                    guard.read_bytes(offset, page_len as u32).unwrap_or_default()
+                };
+                let e8  = compute_entropy_8(&data);
+                let e32 = if do_32bit_t { Some(compute_entropy_32(&data)) } else { None };
+                prog_t.store(offset + page_len, Ordering::Relaxed);
+
+                let sr = crate::search::SearchResult {
+                    index:          page_idx as usize,
+                    byte_offset:    offset,
+                    block:          0,
+                    page:           page_idx,
+                    offset_in_page: 0,
+                    preview_ascii:  format!("{:.6}", e8),
+                    preview_hex:    e32.map(|v| format!("{:.6}", v)).unwrap_or_default(),
+                };
+                let _ = match_tx_t.send(sr.clone());
+                all_results.push(sr);
+            }
+            let _ = tx.send(Ok(all_results));
+        });
+
+        self.active_searches.lock().insert(
+            node_id,
+            ActiveSearchState {
+                cancel_flag,
+                progress_bytes,
+                total_bytes,
+                rx,
+                match_rx,
+                live_match_count: 0,
+                prior_result_count: 0,
+            },
+        );
+
+        if let Some(node) = self.nodes.iter_mut().find(|n| n.id == node_id) {
+            node.status = NodeExecutionStatus::Running;
+            node.output_log = "Entropy analysis started…".to_string();
+        }
+        self.status_message = format!("Entropy analysis started on node #{}…", node_id);
+        Ok(())
+    }
+
     /// Cancel any background search running on node_id
     pub fn cancel_search_node(&mut self, node_id: usize) {
         if let Some(search) = self.active_searches.lock().get(&node_id) {
@@ -2110,6 +2334,31 @@ impl WorkflowEditorState {
                                 None
                             };
 
+                        } else if let WorkflowNodeKind::Entropy { results: node_res, .. } = &mut node.kind {
+                            // Convert SearchResult back to EntropyResult.
+                            let new_entropy: Vec<EntropyResult> = new_results.iter().map(|r| EntropyResult {
+                                page:       r.page,
+                                entropy_8:  r.preview_ascii.parse().unwrap_or(0.0),
+                                entropy_32: if r.preview_hex.is_empty() { None } else { r.preview_hex.parse().ok() },
+                            }).collect();
+                            node_res.extend(new_entropy);
+                            match_count = node_res.len();
+                            hit_limit = false;
+
+                            let summary = if !node_res.is_empty() {
+                                let min_e = node_res.iter().map(|r| r.entropy_8).fold(f32::INFINITY, f32::min);
+                                let max_e = node_res.iter().map(|r| r.entropy_8).fold(f32::NEG_INFINITY, f32::max);
+                                let avg_e = node_res.iter().map(|r| r.entropy_8).sum::<f32>() / node_res.len() as f32;
+                                format!(
+                                    "Entropy Analysis Complete!\nAnalyzed {} pages.\nMin: {:.4}  Max: {:.4}  Avg: {:.4}",
+                                    match_count, min_e, max_e, avg_e
+                                )
+                            } else {
+                                "Entropy Analysis Complete! No pages analyzed.".to_string()
+                            };
+                            node.status = NodeExecutionStatus::Completed;
+                            node.output_log = summary;
+
                         } else {
                             match_count = 0;
                             hit_limit = false;
@@ -2126,43 +2375,49 @@ impl WorkflowEditorState {
                                 pages.sort_unstable();
                                 pages.dedup();
                                 pages.len()
+                            } else if let WorkflowNodeKind::Entropy { results: node_res, .. } = &node.kind {
+                                node_res.len()
                             } else { 0 }
                         } else { 0 };
 
-                        node.status = NodeExecutionStatus::Completed;
-                        let node_label = if matches!(node.kind, WorkflowNodeKind::SectorPatternSearch { .. }) {
-                            "Sector Pattern Search"
-                        } else {
-                            "Pattern Search"
-                        };
-                        let limit_note = if was_cancelled {
-                            "\n⏹ Search stopped — click ▶ Continue to resume from here."
-                        } else if hit_limit {
-                            "\n⚠ Limit reached — increase limit and click ▶ Continue to find more."
-                        } else {
-                            "\n✔ Search reached end of data."
-                        };
-                        node.output_log = if matches!(node.kind, WorkflowNodeKind::SectorPatternSearch { .. }) {
-                            let pages_searched = if page_len > 0 { scan_offset / page_len } else { 0 };
-                            let total_pages    = if page_len > 0 { total_bytes  / page_len } else { 0 };
-                            format!(
-                                "{} Completed!\nMatches: {} in {} pages\nSearched {} of {} pages ({:.1}%){}",
-                                node_label, match_count, unique_pages,
-                                pages_searched, total_pages,
-                                if total_pages > 0 { pages_searched as f64 / total_pages as f64 * 100.0 } else { 0.0 },
-                                limit_note
-                            )
-                        } else {
-                            let pages_searched = if page_len > 0 { scan_offset / page_len } else { 0 };
-                            let total_pages    = if page_len > 0 { total_bytes  / page_len } else { 0 };
-                            format!(
-                                "{} Completed!\nMatches: {} in {} pages\nSearched {} of {} pages ({:.1}%){}",
-                                node_label, match_count, unique_pages,
-                                pages_searched, total_pages,
-                                if total_pages > 0 { pages_searched as f64 / total_pages as f64 * 100.0 } else { 0.0 },
-                                limit_note
-                            )
-                        };
+                        // Entropy nodes already set status and output_log in their branch above;
+                        // skip the generic search-result summary for them.
+                        if !matches!(node.kind, WorkflowNodeKind::Entropy { .. }) {
+                            node.status = NodeExecutionStatus::Completed;
+                            let node_label = if matches!(node.kind, WorkflowNodeKind::SectorPatternSearch { .. }) {
+                                "Sector Pattern Search"
+                            } else {
+                                "Pattern Search"
+                            };
+                            let limit_note = if was_cancelled {
+                                "\n⏹ Search stopped — click ▶ Continue to resume from here."
+                            } else if hit_limit {
+                                "\n⚠ Limit reached — increase limit and click ▶ Continue to find more."
+                            } else {
+                                "\n✔ Search reached end of data."
+                            };
+                            node.output_log = if matches!(node.kind, WorkflowNodeKind::SectorPatternSearch { .. }) {
+                                let pages_searched = if page_len > 0 { scan_offset / page_len } else { 0 };
+                                let total_pages    = if page_len > 0 { total_bytes  / page_len } else { 0 };
+                                format!(
+                                    "{} Completed!\nMatches: {} in {} pages\nSearched {} of {} pages ({:.1}%){}",
+                                    node_label, match_count, unique_pages,
+                                    pages_searched, total_pages,
+                                    if total_pages > 0 { pages_searched as f64 / total_pages as f64 * 100.0 } else { 0.0 },
+                                    limit_note
+                                )
+                            } else {
+                                let pages_searched = if page_len > 0 { scan_offset / page_len } else { 0 };
+                                let total_pages    = if page_len > 0 { total_bytes  / page_len } else { 0 };
+                                format!(
+                                    "{} Completed!\nMatches: {} in {} pages\nSearched {} of {} pages ({:.1}%){}",
+                                    node_label, match_count, unique_pages,
+                                    pages_searched, total_pages,
+                                    if total_pages > 0 { pages_searched as f64 / total_pages as f64 * 100.0 } else { 0.0 },
+                                    limit_note
+                                )
+                            };
+                        }
                         self.status_message = format!(
                             "Search on node #{} found {} matches in {} pages",
                             node_id, match_count, unique_pages
@@ -2193,6 +2448,23 @@ impl WorkflowEditorState {
                     }
                 }
             }
+            // Write entropy CSV log now that the mutable node borrow is released.
+            let entropy_log_info: Option<(String, Vec<EntropyResult>)> =
+                self.nodes.iter().find(|n| n.id == node_id).and_then(|n| {
+                    if let WorkflowNodeKind::Entropy { log_path, results, .. } = &n.kind {
+                        if !log_path.trim().is_empty() {
+                            return Some((log_path.clone(), results.clone()));
+                        }
+                    }
+                    None
+                });
+            if let Some((lp, snap)) = entropy_log_info {
+                if let Err(e) = write_entropy_csv(&lp, &snap) {
+                    log::warn!("Failed to write entropy CSV '{}': {}", lp, e);
+                } else {
+                    log::info!("Entropy CSV written to '{}'", lp);
+                }
+            }
         }
     }
 
@@ -2204,6 +2476,7 @@ impl WorkflowEditorState {
                 match &n.kind {
                     WorkflowNodeKind::PatternSearch { .. } => "search",
                     WorkflowNodeKind::SectorPatternSearch { .. } => "sector_search",
+                    WorkflowNodeKind::Entropy { .. } => "entropy",
                     WorkflowNodeKind::FileExport { .. } => "export",
                     WorkflowNodeKind::FuseMount { auto_mount, .. } => {
                         if *auto_mount {
@@ -2232,6 +2505,14 @@ impl WorkflowEditorState {
                         }
                     }
                 }
+                Some("entropy") => {
+                    if let Err(e) = self.start_entropy_node(id) {
+                        if let Some(node) = self.nodes.iter_mut().find(|n| n.id == id) {
+                            node.status = NodeExecutionStatus::Error(e.clone());
+                            node.output_log = format!("Entropy analysis failed: {}", e);
+                        }
+                    }
+                }
                 Some("export") => {
                     self.execute_export_node(id);
                 }
@@ -2254,6 +2535,7 @@ impl WorkflowEditorState {
                 match &n.kind {
                     WorkflowNodeKind::PatternSearch { .. } => "search",
                     WorkflowNodeKind::SectorPatternSearch { .. } => "sector_search",
+                    WorkflowNodeKind::Entropy { .. } => "entropy",
                     WorkflowNodeKind::FileExport { .. } => "export",
                     WorkflowNodeKind::FuseMount { .. } => "fuse_mount",
                     _ => "other",
@@ -2275,6 +2557,15 @@ impl WorkflowEditorState {
                         if let Some(node) = self.nodes.iter_mut().find(|n| n.id == selected_id) {
                             node.status = NodeExecutionStatus::Error(e.clone());
                             node.output_log = format!("Sector search failed: {}", e);
+                        }
+                    }
+                }
+                Some("entropy") => {
+                    if let Err(e) = self.start_entropy_node(selected_id) {
+                        self.status_message = format!("Entropy analysis failed: {}", e);
+                        if let Some(node) = self.nodes.iter_mut().find(|n| n.id == selected_id) {
+                            node.status = NodeExecutionStatus::Error(e.clone());
+                            node.output_log = format!("Entropy analysis failed: {}", e);
                         }
                     }
                 }
@@ -2370,6 +2661,7 @@ impl WorkflowEditorState {
         let mut action_run_search: Option<usize> = None;
         let mut action_cancel_search: Option<usize> = None;
         let mut action_run_sector_search: Option<usize> = None;
+        let mut action_run_entropy: Option<usize> = None;
         let mut action_export_node: Option<usize> = None;
         let mut action_mount_fuse: Option<usize> = None;
         let mut action_unmount_fuse: Option<usize> = None;
@@ -2504,6 +2796,14 @@ impl WorkflowEditorState {
                             max_matches: 10_000,
                             results: Vec::new(),
                             resume_from_offset: None,
+                        });
+                        ui.close_menu();
+                    }
+                    if ui.button("Entropy Analysis").clicked() {
+                        self.add_node(WorkflowNodeKind::Entropy {
+                            log_path: String::new(),
+                            compute_32bit: false,
+                            results: Vec::new(),
                         });
                         ui.close_menu();
                     }
@@ -3365,6 +3665,69 @@ impl WorkflowEditorState {
                                     });
                                 }
                             }
+                            WorkflowNodeKind::Entropy { log_path, compute_32bit, results } => {
+                                ui.checkbox(compute_32bit, "Compute 32-bit differential entropy");
+                                ui.horizontal(|ui| {
+                                    ui.label("Log file (CSV):");
+                                    ui.text_edit_singleline(log_path);
+                                });
+                                ui.label(egui::RichText::new("Empty = no file written.").italics().weak().size(11.0));
+                                ui.add_space(4.0);
+
+                                if let Some(&(prog_bytes, tot_bytes, live_count, _prior)) = active_search_info.get(&node_id) {
+                                    // ── Running ──────────────────────────────
+                                    let ratio = if tot_bytes > 0 {
+                                        (prog_bytes as f32 / tot_bytes as f32).clamp(0.0, 1.0)
+                                    } else {
+                                        0.0
+                                    };
+                                    ui.add(egui::ProgressBar::new(ratio)
+                                        .text(format!("{:.1}% ({} pages)", ratio * 100.0, live_count))
+                                        .animate(true));
+                                    if ui.button("⏹ Stop").clicked() {
+                                        action_cancel_search = Some(node_id);
+                                    }
+                                } else {
+                                    if results.is_empty() {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(180, 180, 180),
+                                            "No results yet — click 🔬 Start Analysis",
+                                        );
+                                    } else {
+                                        let min_e = results.iter().map(|r| r.entropy_8).fold(f32::INFINITY, f32::min);
+                                        let max_e = results.iter().map(|r| r.entropy_8).fold(f32::NEG_INFINITY, f32::max);
+                                        let avg_e = results.iter().map(|r| r.entropy_8).sum::<f32>() / results.len() as f32;
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(100, 230, 140),
+                                            format!("✔ {} pages. Min: {:.4} Max: {:.4} Avg: {:.4}", results.len(), min_e, max_e, avg_e),
+                                        );
+
+                                        ui.collapsing("Top/Bottom Pages by Entropy", |ui| {
+                                            let mut sorted = results.clone();
+                                            sorted.sort_by(|a, b| a.entropy_8.partial_cmp(&b.entropy_8).unwrap_or(std::cmp::Ordering::Equal));
+                                            ui.label(egui::RichText::new("Lowest entropy (likely blank/fill):").strong());
+                                            for r in sorted.iter().take(10) {
+                                                let e32_str = r.entropy_32.map(|v| format!(" | 32-bit: {:.4}", v)).unwrap_or_default();
+                                                ui.label(format!("  Page {}: {:.4}{}", r.page, r.entropy_8, e32_str));
+                                            }
+                                            ui.add_space(4.0);
+                                            ui.label(egui::RichText::new("Highest entropy (likely data/encrypted):").strong());
+                                            for r in sorted.iter().rev().take(10) {
+                                                let e32_str = r.entropy_32.map(|v| format!(" | 32-bit: {:.4}", v)).unwrap_or_default();
+                                                ui.label(format!("  Page {}: {:.4}{}", r.page, r.entropy_8, e32_str));
+                                            }
+                                        });
+                                    }
+                                    ui.add_space(2.0);
+                                    if ui.button("🔬 Start Analysis")
+                                        .on_hover_text("Clear results and analyze all pages")
+                                        .clicked()
+                                    {
+                                        *results = Vec::new();
+                                        action_run_entropy = Some(node_id);
+                                    }
+                                }
+                            }
                         }
 
                         ui.separator();
@@ -3616,6 +3979,11 @@ impl WorkflowEditorState {
         if let Some(s_node_id) = action_run_sector_search {
             if let Err(e) = self.start_sector_search_node(s_node_id) {
                 self.status_message = format!("Sector search failed: {}", e);
+            }
+        }
+        if let Some(e_node_id) = action_run_entropy {
+            if let Err(e) = self.start_entropy_node(e_node_id) {
+                self.status_message = format!("Entropy analysis failed: {}", e);
             }
         }
         if let Some(c_node_id) = action_cancel_search {
@@ -4269,5 +4637,29 @@ mod tests {
         let deserialized: WorkflowEditorState = serde_json::from_str(&json).expect("Workflow should deserialize");
         assert_eq!(deserialized.nodes.len(), 2);
         assert!(matches!(deserialized.nodes[1].kind, WorkflowNodeKind::FuseMount { .. }));
+    }
+
+    #[test]
+    fn test_entropy_8_all_zeros() {
+        let data = vec![0u8; 4096];
+        let e = compute_entropy_8(&data);
+        assert!((e - 0.0).abs() < 1e-6, "All-zeros entropy should be 0.0, got {}", e);
+    }
+
+    #[test]
+    fn test_entropy_8_uniform() {
+        // 256 bytes, one of each value — maximum entropy = 8.0
+        let data: Vec<u8> = (0..=255u8).collect();
+        let e = compute_entropy_8(&data);
+        assert!((e - 8.0).abs() < 1e-3, "Uniform entropy should be ~8.0, got {}", e);
+    }
+
+    #[test]
+    fn test_entropy_32_periodic() {
+        // Alternating [0xAB, 0xCD, ...] — XOR diff of adjacent bytes yields low entropy
+        let data: Vec<u8> = (0..4096).map(|i| if i % 2 == 0 { 0xAB } else { 0xCD }).collect();
+        let e = compute_entropy_32(&data);
+        // XOR of adjacent 4-byte groups yields a very low-entropy (repeating) byte stream
+        assert!(e < 2.0, "Periodic 32-bit pattern should have low differential entropy, got {}", e);
     }
 }
