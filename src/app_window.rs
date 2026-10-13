@@ -1,12 +1,13 @@
 //! Main application window with viewport rendering and event handling
 
 use crate::{
-    workflow::WorkflowEditorState,
+    workflow::{WorkflowEditorState, WorkflowNodeKind},
     window_state::{WindowState as WindowGeometry, WindowStateManager},
-    AddressDisplay, CacheManager, DumpDataProvider, FileMetadata, HexTabState, NandReaderTabState,
+    AddressDisplay, BacktrackingTabState, CacheManager, DumpDataProvider, FileMetadata, HexTabState, NandReaderTabState,
     PanController, PageStructureTabState, PatternWriterTabState, SearchTabState, TaskQueue,
     TileCoord, Viewport, ViewportManager, ViewportRenderer, ZoomController,
 };
+use crate::data_provider::BacktrackAddress;
 use fltk::{
     app::MouseWheel,
     enums::{ColorDepth, Event},
@@ -45,6 +46,8 @@ pub struct AppWindow {
     pub pattern_writer_tab_state: Arc<Mutex<PatternWriterTabState>>,
     /// NAND reader tab state
     pub nand_reader_tab_state: Arc<Mutex<NandReaderTabState>>,
+    /// Backtracking tab state
+    pub backtracking_tab_state: Arc<Mutex<BacktrackingTabState>>,
     /// Frame to display the viewport image
     viewport_frame: Arc<Mutex<Frame>>,
     /// Viewport manager for tile identification
@@ -245,6 +248,20 @@ impl AppWindow {
         gl_nand_reader.end();
 
         tab_nand_reader.end();
+
+        // --- TAB 8: Backtracking Results (embedded egui GL Canvas) ---
+        let tab_backtracking = Group::default()
+            .with_size(saved_win.width, tab_content_h)
+            .with_pos(0, tab_strip_h)
+            .with_label("Backtracking\t");
+
+        let mut gl_backtracking = GlWindow::default()
+            .with_size(saved_win.width, tab_content_h)
+            .with_pos(0, tab_strip_h);
+        gl_backtracking.set_mode(fltk::enums::Mode::Opengl3);
+        gl_backtracking.end();
+
+        tab_backtracking.end();
 
         tabs.end();
 
@@ -472,11 +489,29 @@ impl AppWindow {
                 let raw_input = state.take_input();
                 let ppp = state.pixels_per_point();
 
-                let (main_prov_opt, raw_prov_opt) = {
+                let (main_prov_opt, raw_prov_opt, current_node_id) = {
                     let wf = workflow_for_hex.lock().unwrap_or_else(|e| e.into_inner());
-                    match wf.build_hex_providers() {
-                        Ok((main_p, raw_p)) => (Some(main_p), raw_p),
-                        Err(_) => (None, None),
+                    let displayed = if let Ok(ht) = hex_tab_draw.try_lock() {
+                        ht.displayed_node_id
+                    } else {
+                        None
+                    };
+                    match displayed {
+                        Some(node_id) => {
+                            match wf.build_data_provider(node_id) {
+                                Ok(p) => (Some(p), None, node_id),
+                                Err(_) => (None, None, node_id),
+                            }
+                        }
+                        None => {
+                            match wf.build_hex_providers() {
+                                Ok((main_p, raw_p)) => {
+                                    let nid = wf.get_active_output_node_id().unwrap_or(0);
+                                    (Some(main_p), raw_p, nid)
+                                }
+                                Err(_) => (None, None, 0),
+                            }
+                        }
                     }
                 };
 
@@ -528,6 +563,7 @@ impl AppWindow {
                         pattern_len,
                         &page_records_clone,
                         &entropy_vec,
+                        current_node_id,
                     );
                 });
 
@@ -787,6 +823,81 @@ impl AppWindow {
         });
         gl_nand_reader.set_visible_focus();
 
+        // Setup fltk-egui for Backtracking tab
+        let backtracking_tab_state = Arc::new(Mutex::new(BacktrackingTabState::new()));
+        let bt_egui_state: Arc<Mutex<Option<(Painter, EguiState)>>> = Arc::new(Mutex::new(None));
+        let bt_egui_ctx = egui::Context::default();
+        bt_egui_ctx.set_fonts(chakra_font_definitions());
+
+        let bt_state_draw = backtracking_tab_state.clone();
+        let bt_egui_state_draw = bt_egui_state.clone();
+        let bt_egui_ctx_draw = bt_egui_ctx.clone();
+
+        gl_backtracking.draw(move |w| {
+            if !w.shown() {
+                return;
+            }
+            w.make_current();
+            let mut state_guard = bt_egui_state_draw.lock().unwrap();
+            if state_guard.is_none() {
+                *state_guard = Some(fltk_egui::init(w));
+            }
+            if let Some((painter, state)) = state_guard.as_mut() {
+                let raw_input = state.take_input();
+                let ppp = state.pixels_per_point();
+
+                let full_output = bt_egui_ctx_draw.run(raw_input, |ctx| {
+                    let mut bt = bt_state_draw.lock().unwrap();
+                    bt.show_ui(ctx);
+                });
+
+                state.fuse_output(w, full_output.platform_output);
+                let clipped_primitives =
+                    bt_egui_ctx_draw.tessellate(full_output.shapes, full_output.pixels_per_point);
+
+                painter.paint_and_update_textures(
+                    [w.width() as u32, w.height() as u32],
+                    ppp,
+                    &clipped_primitives,
+                    &full_output.textures_delta,
+                );
+                w.swap_buffers();
+            }
+        });
+
+        let bt_egui_handle = bt_egui_state.clone();
+        let mut gl_bt_handle = gl_backtracking.clone();
+        gl_bt_handle.handle(move |w, ev| {
+            if let Ok(mut state_guard) = bt_egui_handle.try_lock() {
+                if let Some((_, state)) = state_guard.as_mut() {
+                    state.fuse_input(w, ev);
+                }
+            }
+            match ev {
+                Event::Push => {
+                    let _ = w.take_focus();
+                    w.redraw();
+                    true
+                }
+                Event::Focus | Event::Unfocus => {
+                    w.redraw();
+                    true
+                }
+                Event::Drag
+                | Event::Move
+                | Event::Released
+                | Event::KeyDown
+                | Event::KeyUp
+                | Event::MouseWheel
+                | Event::Resize => {
+                    w.redraw();
+                    true
+                }
+                _ => false,
+            }
+        });
+        gl_backtracking.set_visible_focus();
+
         // Create viewport manager
         let viewport_manager = Arc::new(Mutex::new(ViewportManager::new(
             metadata.clone(),
@@ -950,6 +1061,7 @@ impl AppWindow {
             page_structure_tab_state: page_structure_state.clone(),
             pattern_writer_tab_state: pattern_writer_state.clone(),
             nand_reader_tab_state: nand_reader_state.clone(),
+            backtracking_tab_state: backtracking_tab_state.clone(),
             viewport_frame: viewport_frame_arc.clone(),
             viewport_manager: viewport_manager.clone(),
             zoom_controller: zoom_controller.clone(),
@@ -1216,6 +1328,10 @@ impl AppWindow {
         let mut gl_page_structure_timer = gl_page_structure.clone();
         let mut gl_nand_reader_timer = gl_nand_reader.clone();
         let mut gl_win_timer = gl_win.clone();
+        let mut gl_backtracking_timer = gl_backtracking.clone();
+        let tab_hex_timer = tab_hex.clone();
+        let mut tab_backtracking_timer = tab_backtracking.clone();
+        let bt_tab_timer = app_window.backtracking_tab_state.clone();
         let fltk_tile_cache_timer = app_window.fltk_tile_cache.clone();
         let initial_identity = file_loader.as_ref().map(|fl| fl.lock().cache_identity()).unwrap_or_default();
         let current_identity_timer = Arc::new(Mutex::new(initial_identity));
@@ -1306,6 +1422,111 @@ impl AppWindow {
                 }
             }
 
+            // 2c. Check if Hex tab has a pending backtrack request
+            if let Ok(mut ht) = hex_tab_timer.try_lock() {
+                if let Some((clicked_node_id, clicked_offset)) = ht.pending_backtrack.take() {
+                    // Build provider for the clicked node and call trace_byte
+                    let addresses = if let Ok(wf) = workflow_state_timer.try_lock() {
+                        match wf.build_data_provider(clicked_node_id) {
+                            Ok(provider) => {
+                                let guard = provider.lock();
+                                let mut addrs = guard.trace_byte(clicked_offset);
+
+                                // Compute address components for the clicked node itself (origin entry)
+                                let meta = guard.get_metadata();
+                                let pl = (meta.page_length as u64).max(1);
+                                let bs = (meta.block_size as u64).max(1);
+                                let total_page = clicked_offset / pl;
+                                let clicked_block = total_page / bs;
+                                let clicked_page_in_block = total_page % bs;
+                                let clicked_offset_in_page = clicked_offset % pl;
+                                let clicked_node_name = wf.nodes.iter()
+                                    .find(|n| n.id == clicked_node_id)
+                                    .map(|n| n.name.clone())
+                                    .unwrap_or_else(|| format!("Node #{}", clicked_node_id));
+
+                                // Add origin entry for the clicked node
+                                addrs.push(BacktrackAddress {
+                                    node_id: clicked_node_id,
+                                    node_name: clicked_node_name,
+                                    file_path: None,
+                                    absolute_offset: clicked_offset,
+                                    block: clicked_block,
+                                    page_in_block: clicked_page_in_block,
+                                    offset_in_page: clicked_offset_in_page,
+                                    byte_value: 0x00,
+                                    is_leaf: false,
+                                    is_origin: true,
+                                });
+
+                                // Fill node_id/node_name for leaf entries by matching file_path
+                                // against Input nodes in the workflow graph
+                                for addr in &mut addrs {
+                                    if addr.is_leaf {
+                                        if let Some(ref fp) = addr.file_path {
+                                            if let Some(n) = wf.nodes.iter().find(|n| {
+                                                if let WorkflowNodeKind::Input { file_path, .. } = &n.kind {
+                                                    file_path == fp
+                                                } else {
+                                                    false
+                                                }
+                                            }) {
+                                                addr.node_id = n.id;
+                                                addr.node_name = n.name.clone();
+                                            }
+                                        }
+                                    }
+                                }
+                                addrs
+                            }
+                            Err(_) => vec![],
+                        }
+                    } else {
+                        vec![]
+                    };
+
+                    // Fill byte_value for leaf entries by reading 1 byte from each leaf's provider
+                    // (done in a second pass after releasing the first workflow lock)
+                    let mut final_addresses = addresses;
+                    for addr in &mut final_addresses {
+                        if addr.is_leaf && addr.node_id != 0 {
+                            if let Ok(wf) = workflow_state_timer.try_lock() {
+                                if let Ok(p) = wf.build_data_provider(addr.node_id) {
+                                    if let Ok(bytes) = p.lock().read_bytes(addr.absolute_offset, 1) {
+                                        addr.byte_value = bytes.first().copied().unwrap_or(0u8);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Populate BacktrackingTabState and switch to that tab
+                    if let Ok(mut bt) = bt_tab_timer.try_lock() {
+                        bt.set_results(final_addresses, clicked_node_id, clicked_offset);
+                    }
+                    let _ = tabs_timer.set_value(&tab_backtracking_timer);
+                    tabs_timer.redraw();
+                    tab_backtracking_timer.redraw();
+                    need_redraw = true;
+                }
+            }
+
+            // 2d. Check if Backtracking tab requested a jump to Hex
+            if let Ok(mut bt) = bt_tab_timer.try_lock() {
+                if let Some((target_node_id, target_offset)) = bt.jump_to_hex.take() {
+                    // Set displayed_node_id so gl_hex.draw() picks the right provider
+                    if let Ok(mut ht) = hex_tab_timer.try_lock() {
+                        ht.displayed_node_id = Some(target_node_id);
+                        ht.pending_jump_offset = Some(target_offset);
+                    }
+                    // Switch to the Hex tab
+                    let _ = tabs_timer.set_value(&tab_hex_timer);
+                    tabs_timer.redraw();
+                    gl_hex_timer.redraw();
+                    need_redraw = true;
+                }
+            }
+
             // 3. Check if active OutputViewer in workflow changed (Variante A)
             if let Ok(wf) = workflow_state_timer.try_lock() {
                 match wf.build_active_output_provider() {
@@ -1337,6 +1558,7 @@ impl AppWindow {
                                 ht.col_offset_in_page = 0;
                                 ht.pending_jump_offset = None;
                                 ht.goto_address_input = "0x00000000".to_string();
+                                ht.displayed_node_id = None;
                             }
                             tab_viewer_timer.activate();
                             gl_hex_timer.redraw();
@@ -1389,6 +1611,7 @@ impl AppWindow {
             gl_page_structure_timer.redraw();
             gl_pattern_writer_timer.redraw();
             gl_nand_reader_timer.redraw();
+            gl_backtracking_timer.redraw();
 
             // Repeat timer
             fltk::app::repeat_timeout3(0.05, handle);
