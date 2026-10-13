@@ -57,7 +57,7 @@ impl EntropyCluster {
         match self {
             EntropyCluster::All             => "All (no filter)",
             EntropyCluster::NoEntropy       => "NOENTROPY",
-            EntropyCluster::VeryLowEntropy  => "VERYLOWENTROPY",
+            EntropyCluster::VeryLowEntropy  => "VERYLOWENTROPYOUTLIER",
             EntropyCluster::E32Low          => "E32LOW",
             EntropyCluster::HighestEntropy  => "HIGHESTENTROPY",
             EntropyCluster::LowEntropyArc   => "LOWENTROPYARC",
@@ -77,7 +77,7 @@ impl EntropyCluster {
             EntropyCluster::E32Low          => e8 > 0.9 && e8 < 1.0 && e32 < 0.1,
             EntropyCluster::HighestEntropy  => e8 > 7.9 && e32 > 7.9,
             EntropyCluster::LowEntropyArc   => e8 > 0.2 && e8 < 1.6 && e32 > 0.5 && e32 < 2.5,
-            EntropyCluster::MediumEntropyArc => e8 > 1.6 && e8 < 4.4 && e32 > 1.4 && e32 < 3.624,
+            EntropyCluster::MediumEntropyArc => e8 > 1.6 && e8 < 4.4 && e32 > 1.4 && e32 < 3.62,
             EntropyCluster::HighEntropyArc  => e8 > 3.4 && e8 < 7.89 && e32 > 3.62 && e32 < 8.08,
             EntropyCluster::Outlier         => {
                 !EntropyCluster::NoEntropy.matches(e8, e32)
