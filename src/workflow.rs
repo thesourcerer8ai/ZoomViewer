@@ -28,6 +28,19 @@ pub struct EntropyResult {
 
 /// Cluster classification for an entropy page, used to filter the output
 /// of an Entropy node.  `entropy_32 = None` is treated as `0.0`.
+///
+/// # Intentional classification gaps
+///
+/// Several coordinate regions fall into no named cluster and land in `Outlier`
+/// by design (they are sparse or transitional areas in the entropy scatter plot):
+/// - e8 ∈ (0.1, 0.2) at any e32 — gap between VeryLowEntropy and LowEntropyArc
+/// - e8 ∈ (0.0002, 0.1) with e32 ∈ (0.1, 0.5) — VeryLowEntropy upper e32 bound
+/// - e8 ≈ 8.0 with e32 ≤ 7.9 — HighestEntropy requires *both* > 7.9
+///
+/// These gaps are intentional; they reflect natural sparsity in the data.
+/// When `compute_32bit` is disabled, arc-based clusters (LowEntropyArc,
+/// MediumEntropyArc, HighEntropyArc) require e32 > threshold and will match
+/// zero pages because `entropy_32 = None` is treated as `0.0`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum EntropyCluster {
     /// No filter — pass all pages through (default).
@@ -42,12 +55,16 @@ pub enum EntropyCluster {
     /// e8 > 7.9 AND e32 > 7.9
     HighestEntropy,
     /// e8 > 0.2 AND e8 < 1.6 AND e32 > 0.5 AND e32 < 2.5
+    /// Note: requires e32 > 0.5; returns zero pages when compute_32bit is false.
     LowEntropyArc,
     /// e8 > 1.6 AND e8 < 4.4 AND e32 > 1.4 AND e32 < 3.624
+    /// Note: requires e32 > 1.4; returns zero pages when compute_32bit is false.
     MediumEntropyArc,
     /// e8 > 3.4 AND e8 < 7.89 AND e32 > 3.62 AND e32 < 8.08
+    /// Note: requires e32 > 3.62; returns zero pages when compute_32bit is false.
     HighEntropyArc,
-    /// Anything not matched by the rules above.
+    /// Anything not matched by the named clusters above.
+    /// Includes intentional gap regions — see enum-level doc comment.
     Outlier,
 }
 
@@ -77,9 +94,11 @@ impl EntropyCluster {
             EntropyCluster::E32Low          => e8 > 0.9 && e8 < 1.0 && e32 < 0.1,
             EntropyCluster::HighestEntropy  => e8 > 7.9 && e32 > 7.9,
             EntropyCluster::LowEntropyArc   => e8 > 0.2 && e8 < 1.6 && e32 > 0.5 && e32 < 2.5,
-            EntropyCluster::MediumEntropyArc => e8 > 1.6 && e8 < 4.4 && e32 > 1.4 && e32 < 3.62,
+            EntropyCluster::MediumEntropyArc => e8 > 1.6 && e8 < 4.4 && e32 > 1.4 && e32 < 3.624,
             EntropyCluster::HighEntropyArc  => e8 > 3.4 && e8 < 7.89 && e32 > 3.62 && e32 < 8.08,
             EntropyCluster::Outlier         => {
+                // Outlier = complement of all named clusters.
+                // Several coordinate regions fall here intentionally (see enum doc).
                 !EntropyCluster::NoEntropy.matches(e8, e32)
                     && !EntropyCluster::VeryLowEntropy.matches(e8, e32)
                     && !EntropyCluster::E32Low.matches(e8, e32)
