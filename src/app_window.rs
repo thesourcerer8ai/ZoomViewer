@@ -1606,6 +1606,11 @@ impl AppWindow {
                                 ht.goto_address_input = "0x00000000".to_string();
                                 ht.displayed_node_id = None;
                             }
+                            // Clear the cached identity so that the next iteration of section 3
+                            // always detects a "change" and calls update_provider() with the
+                            // correct OutputViewer provider, even if we were previously showing
+                            // a backtracking Leaf node's provider.
+                            *current_identity_timer.lock().unwrap() = String::new();
                             tab_viewer_timer.activate();
                             gl_hex_timer.redraw();
                             gl_pattern_writer_timer.redraw();
