@@ -886,15 +886,13 @@ pub fn load_entropy_results_from_csv(path: &Path) -> Vec<EntropyResult> {
 /// Write entropy results to a CSV log file.
 /// Format: page,entropy_8,entropy_32 (one row per page, header on first line).
 fn write_entropy_csv(path: &str, results: &[EntropyResult]) -> std::io::Result<()> {
-    use std::io::BufWriter;
-    let file = fs::File::create(path)?;
-    let mut writer = BufWriter::new(file);
-    writeln!(writer, "page,entropy_8,entropy_32")?;
+    use std::io::{Seek, SeekFrom, Write};
+    let mut file = fs::OpenOptions::new().write(true).create(true).truncate(true).open(path)?;
     for r in results {
-        let e32_str = r.entropy_32.map(|v| format!("{:.6}", v)).unwrap_or_default();
-        writeln!(writer, "{},{:.6},{}", r.page, r.entropy_8, e32_str)?;
+        let row = format!("{:020},{:.6},{:.6}\n", r.page, r.entropy_8, r.entropy_32.unwrap_or(0.0));
+        file.seek(SeekFrom::Start(r.page * ENTROPY_CSV_ROW_BYTES as u64))?;
+        file.write_all(row.as_bytes())?;
     }
-    writer.flush()?;
     Ok(())
 }
 
@@ -999,6 +997,10 @@ impl DumpDataProvider for EntropyDataProvider {
 
     fn cache_identity(&self) -> String {
         self.identity.clone()
+    }
+
+    fn trace_byte(&self, offset: u64) -> Vec<crate::data_provider::BacktrackAddress> {
+        self.upstream.lock().trace_byte(offset)
     }
 }
 

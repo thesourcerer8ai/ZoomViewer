@@ -583,6 +583,10 @@ impl DumpDataProvider for PatternHealingDataProvider {
     fn cache_identity(&self) -> String {
         self.identity.clone()
     }
+
+    fn trace_byte(&self, offset: u64) -> Vec<crate::data_provider::BacktrackAddress> {
+        self.upstream.lock().trace_byte(offset)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

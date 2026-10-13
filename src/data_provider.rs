@@ -40,6 +40,38 @@ pub trait DumpDataProvider: Send + Sync {
 
     /// Stable unique cache identifier for tile caching.
     fn cache_identity(&self) -> String;
+
+    /// Trace the provenance of the byte at `offset` through the provider chain.
+    /// Returns an empty vec by default; providers override as needed.
+    /// This method takes `&self` (read-only) — no file I/O, only field access.
+    fn trace_byte(&self, _offset: u64) -> Vec<BacktrackAddress> {
+        vec![]
+    }
+}
+
+/// A provenance record: where a specific byte came from.
+#[derive(Debug, Clone)]
+pub struct BacktrackAddress {
+    /// Node ID in the workflow graph (filled in by the caller, 0 = unknown)
+    pub node_id: usize,
+    /// Human-readable node name (filled in by the caller)
+    pub node_name: String,
+    /// Absolute file path for leaf (Input) nodes; None for derived nodes
+    pub file_path: Option<String>,
+    /// Byte offset within this provider's virtual stream
+    pub absolute_offset: u64,
+    /// NAND block number derived from `absolute_offset`
+    pub block: u64,
+    /// Page within block derived from `absolute_offset`
+    pub page_in_block: u64,
+    /// Byte offset within the page
+    pub offset_in_page: u64,
+    /// The byte value at this location
+    pub byte_value: u8,
+    /// True if this is a leaf (Input file) node
+    pub is_leaf: bool,
+    /// True if this is the node that was clicked (the origin of the query)
+    pub is_origin: bool,
 }
 
 // Implement DumpDataProvider directly for FileLoader for backward compatibility
@@ -64,6 +96,10 @@ impl DumpDataProvider for FileLoader {
         meta.page_length.hash(&mut hasher);
         meta.block_size.hash(&mut hasher);
         format!("{:016x}", hasher.finish())
+    }
+
+    fn trace_byte(&self, _offset: u64) -> Vec<BacktrackAddress> {
+        vec![]
     }
 }
 
@@ -102,6 +138,28 @@ impl DumpDataProvider for FileDataProvider {
 
     fn cache_identity(&self) -> String {
         self.identity.clone()
+    }
+
+    fn trace_byte(&self, offset: u64) -> Vec<BacktrackAddress> {
+        let meta = self.loader.get_metadata();
+        let pl = (meta.page_length as u64).max(1);
+        let bs = (meta.block_size as u64).max(1);
+        let total_page = offset / pl;
+        let block = total_page / bs;
+        let page_in_block = total_page % bs;
+        let offset_in_page = offset % pl;
+        vec![BacktrackAddress {
+            node_id: 0,             // filled by caller
+            node_name: String::new(), // filled by caller
+            file_path: Some(meta.path.clone()),
+            absolute_offset: offset,
+            block,
+            page_in_block,
+            offset_in_page,
+            byte_value: 0x00,       // caller fills in
+            is_leaf: true,
+            is_origin: false,
+        }]
     }
 }
 
@@ -244,8 +302,7 @@ impl XorDataProvider {
 }
 
 impl DumpDataProvider for XorDataProvider {
-    fn read_bytes(&mut self, offset: u64, length: u32) -> Result<Vec<u8>> {
-        if length == 0 {
+    fn read_bytes(&mut self, offset: u64, length: u32) -> Result<Vec<u8>> {        if length == 0 {
             return Ok(Vec::new());
         }
 
@@ -288,6 +345,39 @@ impl DumpDataProvider for XorDataProvider {
 
     fn cache_identity(&self) -> String {
         self.identity.clone()
+    }
+
+    fn trace_byte(&self, offset: u64) -> Vec<BacktrackAddress> {
+        let page_len = self.metadata.page_length as u64;
+        let block_bytes = (self.metadata.block_size as u64) * page_len;
+
+        // Collect from primary (same offset)
+        let mut results = self.primary.lock().trace_byte(offset);
+
+        // Collect from each secondary using the same repetition rules as read_bytes
+        for sec_arc in &self.secondaries {
+            let sec = sec_arc.lock();
+            let sec_size = sec.get_metadata().size;
+            if sec_size == 0 { continue; }
+
+            let sec_offset = if sec_size <= page_len {
+                // Rule 1: repeats every page_length; active at offset-within-page if < sec_size
+                let off_in_page = offset % page_len;
+                if off_in_page < sec_size { Some(off_in_page) } else { None }
+            } else if sec_size <= block_bytes {
+                // Rule 2: repeats every block_bytes; active at offset-within-block if < sec_size
+                let off_in_block = offset % block_bytes;
+                if off_in_block < sec_size { Some(off_in_block) } else { None }
+            } else {
+                // Rule 3: linear; active only if offset < sec_size
+                if offset < sec_size { Some(offset) } else { None }
+            };
+
+            if let Some(src_off) = sec_offset {
+                results.extend(sec.trace_byte(src_off));
+            }
+        }
+        results
     }
 }
 
@@ -430,6 +520,19 @@ impl DumpDataProvider for ConcatenateDataProvider {
     fn cache_identity(&self) -> String {
         self.identity.clone()
     }
+
+    fn trace_byte(&self, offset: u64) -> Vec<BacktrackAddress> {
+        let pl = self.metadata.page_length as u64;
+        if pl == 0 { return vec![]; }
+        let padded_input_size = self.max_pages * pl;
+        if padded_input_size == 0 { return vec![]; }
+        let input_idx = (offset / padded_input_size) as usize;
+        if input_idx >= self.inputs.len() { return vec![]; }
+        let in_slot_offset = offset % padded_input_size;
+        // Guard against reading beyond this input's real data
+        if in_slot_offset >= self.input_sizes[input_idx] { return vec![]; }
+        self.inputs[input_idx].lock().trace_byte(in_slot_offset)
+    }
 }
 
 /// A provider that keeps only every Nth page of the source, starting at the Mth page (0-indexed).
@@ -552,6 +655,19 @@ impl DumpDataProvider for ModuloPageFilterDataProvider {
 
     fn cache_identity(&self) -> String {
         self.identity.clone()
+    }
+
+    fn trace_byte(&self, offset: u64) -> Vec<BacktrackAddress> {
+        let pl = self.metadata.page_length as u64;
+        if pl == 0 { return vec![]; }
+        let out_page = offset / pl;
+        let in_page_offset = offset % pl;
+        let src_page = match self.source_page(out_page) {
+            Some(p) => p,
+            None => return vec![],
+        };
+        let source_offset = src_page * pl + in_page_offset;
+        self.source.lock().trace_byte(source_offset)
     }
 }
 
@@ -678,6 +794,19 @@ impl DumpDataProvider for SearchFilteredDataProvider {
 
     fn cache_identity(&self) -> String {
         self.identity.clone()
+    }
+
+    fn trace_byte(&self, offset: u64) -> Vec<BacktrackAddress> {
+        let pl = self.metadata.page_length as u64;
+        if pl == 0 { return vec![]; }
+        let out_page = offset / pl;
+        let in_page_offset = offset % pl;
+        let src_page = match self.original_page(out_page) {
+            Some(p) => p,
+            None => return vec![],
+        };
+        let source_offset = src_page * pl + in_page_offset;
+        self.source.lock().trace_byte(source_offset)
     }
 }
 
@@ -861,6 +990,29 @@ impl DumpDataProvider for SearchContextDataProvider {
     fn cache_identity(&self) -> String {
         self.identity.clone()
     }
+
+    fn trace_byte(&self, offset: u64) -> Vec<BacktrackAddress> {
+        let page_size = (self.bytes_before + self.pattern_len + self.bytes_after).max(1);
+        let out_page = offset / page_size;
+        if out_page as usize >= self.match_offsets.len() { return vec![]; }
+
+        let in_page_pos = offset % page_size;
+        let match_abs = self.match_offsets[out_page as usize];
+
+        // How many bytes before the match are zero-padded (when match is near source start)
+        let leading_pad = self.bytes_before.saturating_sub(match_abs);
+        // Start of the source window for this match
+        let src_win_start = match_abs.saturating_sub(self.bytes_before);
+
+        if in_page_pos < leading_pad {
+            return vec![]; // zero-padded leading region, no source byte
+        }
+        let src_offset = src_win_start + (in_page_pos - leading_pad);
+        if src_offset >= self.source_size {
+            return vec![]; // zero-padded trailing region
+        }
+        self.source.lock().trace_byte(src_offset)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1000,6 +1152,19 @@ impl DumpDataProvider for BlockSelectorDataProvider {
 
     fn cache_identity(&self) -> String {
         self.identity.clone()
+    }
+
+    fn trace_byte(&self, offset: u64) -> Vec<BacktrackAddress> {
+        let bb = self.block_bytes;
+        if bb == 0 { return vec![]; }
+        let out_block = offset / bb;
+        let in_block_off = offset % bb;
+        let src_block = match self.source_block(out_block) {
+            Some(b) => b,
+            None => return vec![],
+        };
+        let source_offset = src_block * bb + in_block_off;
+        self.source.lock().trace_byte(source_offset)
     }
 }
 
@@ -1357,6 +1522,16 @@ impl DumpDataProvider for BlockPermutationDataProvider {
 
     fn cache_identity(&self) -> String {
         self.identity.clone()
+    }
+
+    fn trace_byte(&self, offset: u64) -> Vec<BacktrackAddress> {
+        let bb = self.block_bytes;
+        if bb == 0 { return vec![]; }
+        let out_block = offset / bb;
+        let in_block_off = offset % bb;
+        let src_block = self.source_block_for(out_block);
+        let source_offset = src_block * bb + in_block_off;
+        self.source.lock().trace_byte(source_offset)
     }
 }
 
