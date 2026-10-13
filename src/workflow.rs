@@ -26,6 +26,72 @@ pub struct EntropyResult {
     pub entropy_32: Option<f32>,
 }
 
+/// Cluster classification for an entropy page, used to filter the output
+/// of an Entropy node.  `entropy_32 = None` is treated as `0.0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum EntropyCluster {
+    /// No filter — pass all pages through (default).
+    #[default]
+    All,
+    /// e8 < 0.0002 AND e32 < 0.0002
+    NoEntropy,
+    /// e8 > 0.0002 AND e8 < 0.1 AND e32 < 0.1
+    VeryLowEntropy,
+    /// e8 > 0.9 AND e8 < 1.0 AND e32 < 0.1
+    E32Low,
+    /// e8 > 7.9 AND e32 > 7.9
+    HighestEntropy,
+    /// e8 > 0.2 AND e8 < 1.6 AND e32 > 0.5 AND e32 < 2.5
+    LowEntropyArc,
+    /// e8 > 1.6 AND e8 < 4.4 AND e32 > 1.4 AND e32 < 3.624
+    MediumEntropyArc,
+    /// e8 > 3.4 AND e8 < 7.89 AND e32 > 3.62 AND e32 < 8.08
+    HighEntropyArc,
+    /// Anything not matched by the rules above.
+    Outlier,
+}
+
+impl EntropyCluster {
+    /// Return the human-readable label shown in the UI combo box.
+    pub fn label(self) -> &'static str {
+        match self {
+            EntropyCluster::All             => "All (no filter)",
+            EntropyCluster::NoEntropy       => "NOENTROPY",
+            EntropyCluster::VeryLowEntropy  => "VERYLOWENTROPY",
+            EntropyCluster::E32Low          => "E32LOW",
+            EntropyCluster::HighestEntropy  => "HIGHESTENTROPY",
+            EntropyCluster::LowEntropyArc   => "LOWENTROPYARC",
+            EntropyCluster::MediumEntropyArc => "MEDIUMENTROPYARC",
+            EntropyCluster::HighEntropyArc  => "HIGHENTROPYARC",
+            EntropyCluster::Outlier         => "OUTLIER",
+        }
+    }
+
+    /// Return `true` if the page with the given entropies belongs to this cluster.
+    /// `entropy_32 = None` is treated as `0.0`.
+    pub fn matches(self, e8: f32, e32: f32) -> bool {
+        match self {
+            EntropyCluster::All             => true,
+            EntropyCluster::NoEntropy       => e8 < 0.0002 && e32 < 0.0002,
+            EntropyCluster::VeryLowEntropy  => e8 > 0.0002 && e8 < 0.1 && e32 < 0.1,
+            EntropyCluster::E32Low          => e8 > 0.9 && e8 < 1.0 && e32 < 0.1,
+            EntropyCluster::HighestEntropy  => e8 > 7.9 && e32 > 7.9,
+            EntropyCluster::LowEntropyArc   => e8 > 0.2 && e8 < 1.6 && e32 > 0.5 && e32 < 2.5,
+            EntropyCluster::MediumEntropyArc => e8 > 1.6 && e8 < 4.4 && e32 > 1.4 && e32 < 3.624,
+            EntropyCluster::HighEntropyArc  => e8 > 3.4 && e8 < 7.89 && e32 > 3.62 && e32 < 8.08,
+            EntropyCluster::Outlier         => {
+                !EntropyCluster::NoEntropy.matches(e8, e32)
+                    && !EntropyCluster::VeryLowEntropy.matches(e8, e32)
+                    && !EntropyCluster::E32Low.matches(e8, e32)
+                    && !EntropyCluster::HighestEntropy.matches(e8, e32)
+                    && !EntropyCluster::LowEntropyArc.matches(e8, e32)
+                    && !EntropyCluster::MediumEntropyArc.matches(e8, e32)
+                    && !EntropyCluster::HighEntropyArc.matches(e8, e32)
+            }
+        }
+    }
+}
+
 /// Status of node execution
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeExecutionStatus {
@@ -193,6 +259,10 @@ pub enum WorkflowNodeKind {
         /// Per-page entropy results accumulated during analysis.
         #[serde(default)]
         results: Vec<EntropyResult>,
+        /// Cluster filter applied when building the data provider.
+        /// `All` (the default) passes every page through unchanged.
+        #[serde(default)]
+        cluster_filter: EntropyCluster,
     },
 }
 
@@ -438,6 +508,7 @@ impl WorkflowNode {
                 log_path: String::new(),
                 compute_32bit: false,
                 results: Vec::new(),
+                cluster_filter: EntropyCluster::All,
             },
             status: NodeExecutionStatus::Idle,
             output_log: "Connect an upstream node and run entropy analysis.".to_string(),
@@ -724,6 +795,75 @@ pub fn compute_entropy_32(data: &[u8]) -> f32 {
     compute_entropy_8(&xored)
 }
 
+/// Fixed byte width of one entropy CSV row: `"{:020},{:.6},{:.6}\n"` = 39 bytes.
+/// 20 (page) + 1 (,) + 8 (e8, e.g. "3.141593") + 1 (,) + 8 (e32) + 1 (\n) = 39.
+pub const ENTROPY_CSV_ROW_BYTES: usize = 39;
+
+/// Return the default cache CSV path for an entropy node: `.cache/entropy_node_{id}.csv`.
+/// Creates the `.cache/` directory if it does not yet exist.
+pub fn entropy_csv_default_path(node_id: usize) -> PathBuf {
+    let dir = PathBuf::from(".cache");
+    let _ = fs::create_dir_all(&dir);
+    dir.join(format!("entropy_node_{}.csv", node_id))
+}
+
+/// Seek to `page * ENTROPY_CSV_ROW_BYTES` and write exactly 39 bytes for this row.
+/// `e32` is written as `0.000000` when `None`.
+fn write_entropy_csv_row(
+    file: &mut fs::File,
+    page: u64,
+    e8: f32,
+    e32: Option<f32>,
+) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let row = format!("{:020},{:.6},{:.6}\n", page, e8, e32.unwrap_or(0.0));
+    debug_assert_eq!(row.len(), ENTROPY_CSV_ROW_BYTES, "Row byte count mismatch: got {}", row.len());
+    file.seek(SeekFrom::Start(page * ENTROPY_CSV_ROW_BYTES as u64))?;
+    file.write_all(row.as_bytes())
+}
+
+/// Read all 39-byte rows from a fixed-width entropy CSV file.
+/// Slots whose first byte is 0x00 (never written) are silently skipped.
+/// Rows that fail to parse are silently skipped.
+pub fn load_entropy_results_from_csv(path: &Path) -> Vec<EntropyResult> {
+    use std::io::{BufReader, Read};
+    let file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let mut reader = BufReader::new(file);
+    let mut results = Vec::new();
+    let mut buf = [0u8; ENTROPY_CSV_ROW_BYTES];
+    loop {
+        match reader.read_exact(&mut buf) {
+            Ok(()) => {}
+            Err(_) => break,
+        }
+        if buf[0] == 0 {
+            continue; // unwritten slot
+        }
+        let row = match std::str::from_utf8(&buf) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let mut parts = row.trim_end_matches('\n').splitn(3, ',');
+        let page: u64 = match parts.next().and_then(|s| s.trim().parse().ok()) {
+            Some(v) => v,
+            None => continue,
+        };
+        let e8: f32 = match parts.next().and_then(|s| s.trim().parse().ok()) {
+            Some(v) => v,
+            None => continue,
+        };
+        let e32: Option<f32> = parts.next().and_then(|s| {
+            let t = s.trim();
+            if t.is_empty() { None } else { t.parse().ok() }
+        });
+        results.push(EntropyResult { page, entropy_8: e8, entropy_32: e32 });
+    }
+    results
+}
+
 /// Write entropy results to a CSV log file.
 /// Format: page,entropy_8,entropy_32 (one row per page, header on first line).
 fn write_entropy_csv(path: &str, results: &[EntropyResult]) -> std::io::Result<()> {
@@ -737,6 +877,110 @@ fn write_entropy_csv(path: &str, results: &[EntropyResult]) -> std::io::Result<(
     }
     writer.flush()?;
     Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// EntropyDataProvider — lazy per-page entropy computation wrapper
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Lazy entropy computation wrapper.
+///
+/// Wraps an upstream `DumpDataProvider` and computes per-page entropy on the first
+/// `read_bytes()` call for each page. Results are cached in `cache` (shared with
+/// `WorkflowEditorState.entropy_caches`) and optionally persisted to a fixed-width
+/// seekable CSV file so they survive restarts.
+///
+/// **Mutex ordering**: always lock `upstream`, read what is needed, release that lock
+/// completely, then lock `cache`. Never hold both locks simultaneously.
+struct EntropyDataProvider {
+    upstream:      Arc<Mutex<dyn DumpDataProvider>>,
+    cache:         Arc<Mutex<HashMap<u64, EntropyResult>>>,
+    csv_path:      PathBuf,
+    compute_32bit: bool,
+    /// Metadata snapshot taken at construction time (page_length, total pages, etc.)
+    metadata:      crate::types::FileMetadata,
+    /// Stable cache-identity string derived from upstream + csv_path.
+    identity:      String,
+}
+
+impl EntropyDataProvider {
+    fn new(
+        upstream: Arc<Mutex<dyn DumpDataProvider>>,
+        cache: Arc<Mutex<HashMap<u64, EntropyResult>>>,
+        csv_path: PathBuf,
+        compute_32bit: bool,
+    ) -> Self {
+        let (metadata, up_identity) = {
+            let guard = upstream.lock();
+            (guard.get_metadata(), guard.cache_identity())
+        };
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        "ENTROPY_PROVIDER".hash(&mut h);
+        up_identity.hash(&mut h);
+        csv_path.hash(&mut h);
+        compute_32bit.hash(&mut h);
+        let identity = format!("entropy_{:016x}", h.finish());
+        Self { upstream, cache, csv_path, compute_32bit, metadata, identity }
+    }
+}
+
+impl DumpDataProvider for EntropyDataProvider {
+    fn read_bytes(&mut self, offset: u64, length: u32) -> crate::error::Result<Vec<u8>> {
+        // 1. Read the requested bytes from upstream, then release the upstream lock.
+        let bytes = {
+            let mut guard = self.upstream.lock();
+            guard.read_bytes(offset, length)?
+        };
+        // upstream lock is now released
+
+        let page_len = self.metadata.page_length as u64;
+        if page_len == 0 {
+            return Ok(bytes);
+        }
+        let page = offset / page_len;
+
+        // 2. Check cache — if already computed for this page, return early.
+        let already_cached = self.cache.lock().contains_key(&page);
+        if !already_cached {
+            // 3. We need a full-page read for accurate entropy.
+            //    If the caller already provided the full page, reuse `bytes`; otherwise re-read.
+            let page_bytes = if offset == page * page_len && length == page_len as u32 {
+                bytes.clone()
+            } else {
+                let page_offset = page * page_len;
+                let mut guard = self.upstream.lock();
+                guard.read_bytes(page_offset, page_len as u32).unwrap_or_default()
+            };
+
+            let e8  = compute_entropy_8(&page_bytes);
+            let e32 = if self.compute_32bit { Some(compute_entropy_32(&page_bytes)) } else { None };
+            let result = EntropyResult { page, entropy_8: e8, entropy_32: e32 };
+
+            // 4. Insert into cache (lock, insert, drop).
+            self.cache.lock().insert(page, result);
+
+            // 5. Write CSV row (errors are logged but not propagated — the read must succeed).
+            if let Ok(mut file) = fs::OpenOptions::new()
+                .write(true).create(true).open(&self.csv_path)
+            {
+                if let Err(e) = write_entropy_csv_row(&mut file, page, e8, e32) {
+                    log::warn!("EntropyDataProvider: failed to write CSV row for page {}: {}", page, e);
+                }
+            }
+        }
+
+        Ok(bytes)
+    }
+
+    fn get_metadata(&self) -> crate::types::FileMetadata {
+        self.metadata.clone()
+    }
+
+    fn cache_identity(&self) -> String {
+        self.identity.clone()
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -946,6 +1190,9 @@ pub struct WorkflowEditorState {
     /// The PatternHealingDataProvider writes into these; the UI reads from them.
     #[serde(skip, default)]
     pub healing_stats: Arc<Mutex<HashMap<usize, Arc<Mutex<crate::pattern_healing::HealingStats>>>>>,
+    /// Per-node entropy result caches populated by on-demand computation (not persisted).
+    #[serde(skip, default)]
+    pub entropy_caches: Arc<Mutex<HashMap<usize, Arc<Mutex<HashMap<u64, EntropyResult>>>>>>,
 }
 impl Default for WorkflowEditorState {
     fn default() -> Self {
@@ -1009,6 +1256,7 @@ impl WorkflowEditorState {
                     page_structure: None,
                     healing_stats_cache: HashMap::new(),
                     healing_stats: Arc::new(Mutex::new(HashMap::new())),
+                    entropy_caches: Arc::new(Mutex::new(HashMap::new())),
                 };
             }
         }
@@ -1037,6 +1285,7 @@ impl WorkflowEditorState {
             page_structure: None,
             healing_stats_cache: HashMap::new(),
             healing_stats: Arc::new(Mutex::new(HashMap::new())),
+            entropy_caches: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1452,12 +1701,66 @@ impl WorkflowEditorState {
                 );
                 Ok(Arc::new(Mutex::new(filtered)) as Arc<Mutex<dyn DumpDataProvider>>)
             }
-            WorkflowNodeKind::Entropy { .. } => {
-                // Pass-through: entropy node acts as a transparent tap on the upstream data.
+            WorkflowNodeKind::Entropy { log_path, compute_32bit, cluster_filter, .. } => {
+                let log_path = log_path.clone();
+                let compute_32bit = *compute_32bit;
+                let cluster_filter = *cluster_filter;
                 let incoming = self.connections.iter()
                     .find(|c| c.to_node == target_node_id)
                     .ok_or_else(|| format!("Entropy node #{} has no input connected", target_node_id))?;
-                self.build_data_provider_internal(incoming.from_node, ancestors)
+                let upstream = self.build_data_provider_internal(incoming.from_node, ancestors)?;
+
+                // Get or create the shared entropy cache for this node.
+                let cache: Arc<Mutex<HashMap<u64, EntropyResult>>> = {
+                    let mut map = self.entropy_caches.lock();
+                    map.entry(target_node_id)
+                        .or_insert_with(|| Arc::new(Mutex::new(HashMap::new())))
+                        .clone()
+                };
+
+                // Resolve effective CSV path.
+                let effective_path = if log_path.trim().is_empty() {
+                    entropy_csv_default_path(target_node_id)
+                } else {
+                    PathBuf::from(&log_path)
+                };
+
+                // Pre-load any previously computed results from the CSV into the cache.
+                let existing = load_entropy_results_from_csv(&effective_path);
+                {
+                    let mut c = cache.lock();
+                    for r in existing {
+                        c.entry(r.page).or_insert(r);
+                    }
+                }
+
+                let provider = EntropyDataProvider::new(upstream, cache.clone(), effective_path, compute_32bit);
+
+                if cluster_filter == EntropyCluster::All {
+                    return Ok(Arc::new(Mutex::new(provider)) as Arc<Mutex<dyn DumpDataProvider>>);
+                }
+
+                // Build the filtered page list from the pre-loaded cache.
+                // If the cache is empty the analysis has not been run yet — return the
+                // unfiltered provider so the caller can read pages normally.
+                let matching_pages: Vec<u64> = {
+                    let c = cache.lock();
+                    if c.is_empty() {
+                        return Ok(Arc::new(Mutex::new(provider)) as Arc<Mutex<dyn DumpDataProvider>>);
+                    }
+                    let mut pages: Vec<u64> = c
+                        .values()
+                        .filter(|r| cluster_filter.matches(r.entropy_8, r.entropy_32.unwrap_or(0.0)))
+                        .map(|r| r.page)
+                        .collect();
+                    pages.sort_unstable();
+                    pages
+                };
+
+                let entropy_arc = Arc::new(Mutex::new(provider)) as Arc<Mutex<dyn DumpDataProvider>>;
+                let label = format!("entropy_cluster_{}", cluster_filter.label());
+                let filtered = SearchFilteredDataProvider::new(entropy_arc, matching_pages, label);
+                Ok(Arc::new(Mutex::new(filtered)) as Arc<Mutex<dyn DumpDataProvider>>)
             }
         };
 
@@ -1694,6 +1997,13 @@ impl WorkflowEditorState {
             }
             let node = self.nodes.iter().find(|n| n.id == current_id)?;
             if let WorkflowNodeKind::Entropy { results, .. } = &node.kind {
+                // First check the live on-demand cache (populated by EntropyDataProvider).
+                if let Some(cache_map) = self.entropy_caches.lock().get(&current_id) {
+                    if let Some(r) = cache_map.lock().get(&page) {
+                        return Some(r.entropy_8);
+                    }
+                }
+                // Fall back to full-run results stored on the node.
                 return results.iter().find(|r| r.page == page).map(|r| r.entropy_8);
             }
             // Follow single upstream connection
@@ -2804,6 +3114,7 @@ impl WorkflowEditorState {
                             log_path: String::new(),
                             compute_32bit: false,
                             results: Vec::new(),
+                            cluster_filter: EntropyCluster::All,
                         });
                         ui.close_menu();
                     }
@@ -3665,8 +3976,28 @@ impl WorkflowEditorState {
                                     });
                                 }
                             }
-                            WorkflowNodeKind::Entropy { log_path, compute_32bit, results } => {
+                            WorkflowNodeKind::Entropy { log_path, compute_32bit, results, cluster_filter } => {
                                 ui.checkbox(compute_32bit, "Compute 32-bit differential entropy");
+                                ui.horizontal(|ui| {
+                                    ui.label("Cluster filter:");
+                                    egui::ComboBox::from_id_source(format!("entropy_cluster_{}", node_id))
+                                        .selected_text(cluster_filter.label())
+                                        .show_ui(ui, |ui| {
+                                            for variant in [
+                                                EntropyCluster::All,
+                                                EntropyCluster::NoEntropy,
+                                                EntropyCluster::VeryLowEntropy,
+                                                EntropyCluster::E32Low,
+                                                EntropyCluster::HighestEntropy,
+                                                EntropyCluster::LowEntropyArc,
+                                                EntropyCluster::MediumEntropyArc,
+                                                EntropyCluster::HighEntropyArc,
+                                                EntropyCluster::Outlier,
+                                            ] {
+                                                ui.selectable_value(cluster_filter, variant, variant.label());
+                                            }
+                                        });
+                                });
                                 ui.horizontal(|ui| {
                                     ui.label("Log file (CSV):");
                                     ui.text_edit_singleline(log_path);
@@ -4149,6 +4480,7 @@ mod tests {
             page_structure: None,
             healing_stats_cache: HashMap::new(),
             healing_stats: Arc::new(Mutex::new(HashMap::new())),
+            entropy_caches: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // Build data provider for OutputViewer node 4
@@ -4188,6 +4520,7 @@ mod tests {
             page_structure: None,
             healing_stats_cache: HashMap::new(),
             healing_stats: Arc::new(Mutex::new(HashMap::new())),
+            entropy_caches: Arc::new(Mutex::new(HashMap::new())),
         };
 
         match state.build_data_provider(1) {
@@ -4244,6 +4577,7 @@ mod tests {
             page_structure: None,
             healing_stats_cache: HashMap::new(),
             healing_stats: Arc::new(Mutex::new(HashMap::new())),
+            entropy_caches: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let exported = state.export_node_to_file(2).expect("Export should succeed");
@@ -4346,6 +4680,7 @@ mod tests {
             page_structure: None,
             healing_stats_cache: HashMap::new(),
             healing_stats: Arc::new(Mutex::new(HashMap::new())),
+            entropy_caches: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // Insert XOR
@@ -4440,6 +4775,7 @@ mod tests {
             page_structure: None,
             healing_stats_cache: HashMap::new(),
             healing_stats: Arc::new(Mutex::new(HashMap::new())),
+            entropy_caches: Arc::new(Mutex::new(HashMap::new())),
         };
 
         let (main_p, raw_p) = state_simple.build_hex_providers().unwrap();
@@ -4549,6 +4885,7 @@ mod tests {
             page_structure: None,
             healing_stats_cache: HashMap::new(),
             healing_stats: Arc::new(Mutex::new(HashMap::new())),
+            entropy_caches: Arc::new(Mutex::new(HashMap::new())),
         };
 
         // 1. Before executing search: filtered view has 0 matching pages (suppresses all pages)
@@ -4661,5 +4998,211 @@ mod tests {
         let e = compute_entropy_32(&data);
         // XOR of adjacent 4-byte groups yields a very low-entropy (repeating) byte stream
         assert!(e < 2.0, "Periodic 32-bit pattern should have low differential entropy, got {}", e);
+    }
+
+    #[test]
+    fn test_entropy_data_provider_on_demand() {
+        use std::io::Write;
+
+        // Build a 1-page (256-byte) temp file with all 256 byte values (uniform → max entropy).
+        let mut tmp = NamedTempFile::new().unwrap();
+        let data: Vec<u8> = (0u8..=255u8).collect();
+        tmp.write_all(&data).unwrap();
+        tmp.flush().unwrap();
+
+        let path = tmp.path().to_str().unwrap();
+        let loader = crate::file_loader::FileLoader::new_unchecked(path, 256, 64).unwrap();
+        let upstream: Arc<Mutex<dyn DumpDataProvider>> =
+            Arc::new(Mutex::new(crate::data_provider::FileDataProvider::new(loader)));
+        let cache: Arc<Mutex<HashMap<u64, EntropyResult>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let csv_tmp = NamedTempFile::new().unwrap();
+        let csv_path = csv_tmp.path().to_path_buf();
+
+        let mut provider = EntropyDataProvider::new(
+            upstream.clone(), cache.clone(), csv_path.clone(), true,
+        );
+
+        // Read page 0 — should trigger on-demand entropy computation.
+        let returned = provider.read_bytes(0, 256).unwrap();
+        assert_eq!(returned, data, "Bytes must be passed through unchanged");
+
+        // Cache should now have page 0.
+        let c = cache.lock();
+        let result = c.get(&0).expect("Page 0 must be in cache after read");
+        assert!(
+            (result.entropy_8 - 8.0).abs() < 1e-3,
+            "Uniform data should have entropy ~8.0, got {}",
+            result.entropy_8
+        );
+        assert!(result.entropy_32.is_some(), "entropy_32 should be computed when compute_32bit=true");
+
+        // CSV file should be non-empty (row was written).
+        drop(c);
+        let csv_results = load_entropy_results_from_csv(&csv_path);
+        assert!(!csv_results.is_empty(), "CSV should have at least one row after on-demand read");
+        assert_eq!(csv_results[0].page, 0);
+        assert!(
+            (csv_results[0].entropy_8 - 8.0).abs() < 1e-3,
+            "CSV entropy should be ~8.0, got {}",
+            csv_results[0].entropy_8
+        );
+    }
+
+    #[test]
+    fn test_entropy_cluster_matches_all_variants() {
+        // All always matches
+        assert!(EntropyCluster::All.matches(0.0, 0.0));
+        assert!(EntropyCluster::All.matches(8.0, 8.0));
+
+        // NOENTROPY: e8 < 0.0002 AND e32 < 0.0002
+        assert!( EntropyCluster::NoEntropy.matches(0.0001, 0.0001));
+        assert!(!EntropyCluster::NoEntropy.matches(0.001,  0.0001));
+        assert!(!EntropyCluster::NoEntropy.matches(0.0001, 0.001 ));
+
+        // VERYLOWENTROPY: e8 > 0.0002 AND e8 < 0.1 AND e32 < 0.1
+        assert!( EntropyCluster::VeryLowEntropy.matches(0.05, 0.05));
+        assert!(!EntropyCluster::VeryLowEntropy.matches(0.0001, 0.05)); // e8 too low
+        assert!(!EntropyCluster::VeryLowEntropy.matches(0.2,    0.05)); // e8 too high
+        assert!(!EntropyCluster::VeryLowEntropy.matches(0.05,   0.2 )); // e32 too high
+
+        // E32LOW: e8 > 0.9 AND e8 < 1.0 AND e32 < 0.1
+        assert!( EntropyCluster::E32Low.matches(0.95, 0.05));
+        assert!(!EntropyCluster::E32Low.matches(0.85, 0.05));
+        assert!(!EntropyCluster::E32Low.matches(1.05, 0.05));
+        assert!(!EntropyCluster::E32Low.matches(0.95, 0.2 ));
+
+        // HIGHESTENTROPY: e8 > 7.9 AND e32 > 7.9
+        assert!( EntropyCluster::HighestEntropy.matches(7.95, 7.95));
+        assert!(!EntropyCluster::HighestEntropy.matches(7.85, 7.95));
+        assert!(!EntropyCluster::HighestEntropy.matches(7.95, 7.85));
+
+        // LOWENTROPYARC: e8 in (0.2,1.6) AND e32 in (0.5,2.5)
+        assert!( EntropyCluster::LowEntropyArc.matches(1.0, 1.5));
+        assert!(!EntropyCluster::LowEntropyArc.matches(0.1, 1.5));   // e8 too low
+        assert!(!EntropyCluster::LowEntropyArc.matches(1.7, 1.5));   // e8 too high
+        assert!(!EntropyCluster::LowEntropyArc.matches(1.0, 0.4));   // e32 too low
+        assert!(!EntropyCluster::LowEntropyArc.matches(1.0, 2.6));   // e32 too high
+
+        // MEDIUMENTROPYARC: e8 in (1.6,4.4) AND e32 in (1.4,3.624)
+        assert!( EntropyCluster::MediumEntropyArc.matches(3.0, 2.5));
+        assert!(!EntropyCluster::MediumEntropyArc.matches(1.5, 2.5)); // e8 too low
+        assert!(!EntropyCluster::MediumEntropyArc.matches(4.5, 2.5)); // e8 too high
+        assert!(!EntropyCluster::MediumEntropyArc.matches(3.0, 1.3)); // e32 too low
+        assert!(!EntropyCluster::MediumEntropyArc.matches(3.0, 3.7)); // e32 too high
+
+        // HIGHENTROPYARC: e8 in (3.4,7.89) AND e32 in (3.62,8.08)
+        assert!( EntropyCluster::HighEntropyArc.matches(5.0, 5.0));
+        assert!(!EntropyCluster::HighEntropyArc.matches(3.3, 5.0));   // e8 too low
+        assert!(!EntropyCluster::HighEntropyArc.matches(7.9, 5.0));   // e8 too high
+        assert!(!EntropyCluster::HighEntropyArc.matches(5.0, 3.6));   // e32 too low
+        assert!(!EntropyCluster::HighEntropyArc.matches(5.0, 8.1));   // e32 too high
+
+        // OUTLIER: matched when nothing else matches — e.g. e8=2.0 e32=0.0
+        assert!( EntropyCluster::Outlier.matches(2.0, 0.0));
+        // A page that matches NoEntropy must NOT be an Outlier
+        assert!(!EntropyCluster::Outlier.matches(0.0001, 0.0001));
+    }
+
+    #[test]
+    fn test_entropy_cluster_none_treated_as_zero() {
+        // When entropy_32 is None it is treated as 0.0 at the call site.
+        let e32_val = None::<f32>.unwrap_or(0.0);
+        assert!(EntropyCluster::NoEntropy.matches(0.0001, e32_val));
+    }
+
+    #[test]
+    fn test_entropy_data_provider_on_demand_cluster_filter() {
+        use std::io::Write;
+
+        // Build a 4-page file with 512-byte pages; all zeros so entropy_8 ≈ 0 → NOENTROPY.
+        let mut tmp = NamedTempFile::new().unwrap();
+        let data = vec![0u8; 4 * 512];
+        tmp.write_all(&data).unwrap();
+        tmp.flush().unwrap();
+
+        let path = tmp.path().to_str().unwrap().to_string();
+
+        // Construct: Input(1) -> Entropy(2, cluster=NoEntropy) -> Output(3)
+        let entropy_node = WorkflowNode {
+            id: 2,
+            name: "Entropy".to_string(),
+            pos: [100.0, 0.0],
+            kind: WorkflowNodeKind::Entropy {
+                log_path: String::new(),
+                compute_32bit: false,
+                results: Vec::new(),
+                cluster_filter: EntropyCluster::NoEntropy,
+            },
+            status: NodeExecutionStatus::Idle,
+            output_log: String::new(),
+            collapsed: false,
+        };
+
+        let mut state = WorkflowEditorState {
+            next_node_id: 4,
+            nodes: vec![
+                WorkflowNode::new_input(1, [0.0, 0.0], &path, 512, 64),
+                entropy_node,
+                WorkflowNode::new_output(3, [200.0, 0.0], "Viewer"),
+            ],
+            connections: vec![
+                NodeConnection { from_node: 1, to_node: 2 },
+                NodeConnection { from_node: 2, to_node: 3 },
+            ],
+            selected_node: Some(3),
+            connecting_from: None,
+            status_message: String::new(),
+            file_browser_open: HashMap::new(),
+            file_browser_path: HashMap::new(),
+            file_browser_show_all: HashMap::new(),
+            pending_xor_offer: None,
+            active_searches: Arc::new(Mutex::new(HashMap::new())),
+            active_fuse_mounts: Arc::new(Mutex::new(HashMap::new())),
+            node_rects: HashMap::new(),
+            page_structure: None,
+            healing_stats_cache: HashMap::new(),
+            healing_stats: Arc::new(Mutex::new(HashMap::new())),
+            entropy_caches: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        // Cache is empty → provider must fall through (unfiltered), size = 4*512 = 2048.
+        let provider = state.build_data_provider(3).expect("should build");
+        assert_eq!(provider.lock().get_metadata().size, 4 * 512,
+            "Empty cache must yield unfiltered provider");
+
+        // Pre-populate the cache with all-zero entropy results for pages 0-3.
+        {
+            let mut caches = state.entropy_caches.lock();
+            let node_cache = caches.entry(2)
+                .or_insert_with(|| Arc::new(Mutex::new(HashMap::new())))
+                .clone();
+            let mut c = node_cache.lock();
+            for page in 0u64..4 {
+                c.insert(page, EntropyResult { page, entropy_8: 0.0001, entropy_32: Some(0.0001) });
+            }
+        }
+
+        // Now cache is non-empty. All 4 pages match NOENTROPY.
+        let provider2 = state.build_data_provider(3).expect("should build with cache");
+        assert_eq!(provider2.lock().get_metadata().total_pages, 4,
+            "All 4 pages should match NOENTROPY");
+
+        // Switch filter to HIGHESTENTROPY — no pages should match.
+        if let WorkflowNodeKind::Entropy { cluster_filter, .. } = &mut state.nodes[1].kind {
+            *cluster_filter = EntropyCluster::HighestEntropy;
+        }
+        let provider3 = state.build_data_provider(3).expect("should build with HighestEntropy filter");
+        assert_eq!(provider3.lock().get_metadata().total_pages, 0,
+            "No pages should match HIGHESTENTROPY");
+
+        // Switch to All — all 4 pages must pass through.
+        if let WorkflowNodeKind::Entropy { cluster_filter, .. } = &mut state.nodes[1].kind {
+            *cluster_filter = EntropyCluster::All;
+        }
+        let provider4 = state.build_data_provider(3).expect("should build with All filter");
+        assert_eq!(provider4.lock().get_metadata().size, 4 * 512,
+            "All filter must return unfiltered provider");
     }
 }
