@@ -197,6 +197,15 @@ pub struct HexTabState {
     /// Requested jump target byte offset from outside (e.g. NAND viewer or search)
     pub pending_jump_offset: Option<u64>,
 
+    /// Set when user clicks a byte: (current_node_id, linear_byte_offset).
+    /// Consumed by the app_window timer loop to trigger backtracking.
+    pub pending_backtrack: Option<(usize, u64)>,
+
+    /// When Some(node_id), the hex tab displays that node's provider
+    /// instead of the active OutputViewer. Set by backtracking jump.
+    /// None = use default build_hex_providers() path.
+    pub displayed_node_id: Option<usize>,
+
     /// Display format (Hex+ASCII, Hex Only, ASCII Only)
     pub display_mode: HexDisplayMode,
     /// Font size (10.0, 12.0, 14.0)
@@ -249,6 +258,8 @@ impl HexTabState {
             current_page: 0,
             col_offset_in_page: 0,
             pending_jump_offset: None,
+            pending_backtrack: None,
+            displayed_node_id: None,
 
             display_mode: HexDisplayMode::HexAndAscii,
             font_size: 12.0,
@@ -309,6 +320,7 @@ impl HexTabState {
         search_pattern_len: usize,
         page_records: &[PageStructureRecord],
         entropy_per_page: &[Option<f32>],
+        current_node_id: usize,
     ) {
         let Some(main_prov_arc) = main_provider_opt else {
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -504,6 +516,7 @@ impl HexTabState {
                                     search_pattern_len,
                                     page_records,
                                     entropy_per_page,
+                                    current_node_id,
                                 );
                             },
                         );
@@ -891,6 +904,7 @@ impl HexTabState {
         search_pattern_len: usize,
         page_records: &[PageStructureRecord],
         entropy_per_page: &[Option<f32>],
+        current_node_id: usize,
     ) {
         let mono_font = FontId::new(self.font_size, FontFamily::Monospace);
         let block_size = meta.block_size as u64;
@@ -1053,7 +1067,10 @@ impl HexTabState {
                                     }
                                 }
 
-                                let byte_label = ui.label(rich);
+                                let byte_label = ui.add(egui::Label::new(rich).sense(egui::Sense::click()));
+                                if byte_label.clicked() {
+                                    self.pending_backtrack = Some((current_node_id, byte_linear_offset));
+                                }
 
                                 if is_diff || byte_label.hovered() {
                                     if let (Some(a), Some(r)) = (act_b, raw_b) {

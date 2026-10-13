@@ -68,6 +68,7 @@ pub mod fuse_node;
 pub mod page_structure_tab;
 pub mod pattern_writer_tab;
 pub mod nand_reader_tab;
+pub mod backtracking_tab;
 pub mod pattern_healing;
 pub mod sector_pattern_search;
 
@@ -79,6 +80,7 @@ pub use fuse_node::{ActiveFuseMount, InodeKind, parse_inode, default_mount_dir_f
 pub use page_structure_tab::PageStructureTabState;
 pub use pattern_writer_tab::PatternWriterTabState;
 pub use nand_reader_tab::NandReaderTabState;
+pub use backtracking_tab::BacktrackingTabState;
 pub use pattern_healing::{PatternHealingDataProvider, DataSegment as HealingDataSegment, HealingStats};
 pub use sector_pattern_search::{SectorPatternMatch, search_sector_patterns, all_targets, write_log_file as write_sector_log};
 
