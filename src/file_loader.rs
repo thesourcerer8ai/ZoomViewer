@@ -95,6 +95,26 @@ impl FileLoader {
         
         Ok(FileLoader { file, metadata })
     }
+
+    /// Test-only constructor that skips page-length and block-size range checks.
+    /// Use this when you need a synthetic small file (e.g. 256-byte pages) in
+    /// unit tests that exercise logic above FileLoader, not FileLoader itself.
+    #[cfg(test)]
+    pub fn new_unchecked<P: AsRef<Path>>(
+        path: P,
+        page_length: u32,
+        block_size: u32,
+    ) -> Result<Self> {
+        let path_ref = path.as_ref();
+        let file = File::open(path_ref).map_err(|e| Error::IoError(e))?;
+        let size = file.metadata().map_err(|e| Error::IoError(e))?.len();
+        let path_str = path_ref
+            .to_str()
+            .ok_or_else(|| Error::InvalidMetadata("Invalid path".to_string()))?
+            .to_string();
+        let metadata = FileMetadata::new(path_str, size, page_length, block_size);
+        Ok(FileLoader { file, metadata })
+    }
     
     /// Returns the cached file metadata
     ///
