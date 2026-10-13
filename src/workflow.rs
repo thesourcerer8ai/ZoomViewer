@@ -525,7 +525,7 @@ impl WorkflowNode {
             pos,
             kind: WorkflowNodeKind::Entropy {
                 log_path: String::new(),
-                compute_32bit: false,
+                compute_32bit: true,
                 results: Vec::new(),
                 cluster_filter: EntropyCluster::All,
             },
@@ -1760,12 +1760,17 @@ impl WorkflowEditorState {
                 }
 
                 // Build the filtered page list from the pre-loaded cache.
-                // If the cache is empty the analysis has not been run yet — return the
-                // unfiltered provider so the caller can read pages normally.
+                // If the cache is empty the analysis has not been run yet — return an
+                // empty filtered result so non-All filters show zero pages until
+                // analysis has been run.
                 let matching_pages: Vec<u64> = {
                     let c = cache.lock();
                     if c.is_empty() {
-                        return Ok(Arc::new(Mutex::new(provider)) as Arc<Mutex<dyn DumpDataProvider>>);
+                        // Analysis not yet run: no pages belong to any specific cluster.
+                        let entropy_arc = Arc::new(Mutex::new(provider)) as Arc<Mutex<dyn DumpDataProvider>>;
+                        let label = format!("entropy_cluster_{}", cluster_filter.label());
+                        let filtered = SearchFilteredDataProvider::new(entropy_arc, vec![], label);
+                        return Ok(Arc::new(Mutex::new(filtered)) as Arc<Mutex<dyn DumpDataProvider>>);
                     }
                     let mut pages: Vec<u64> = c
                         .values()
@@ -3131,7 +3136,7 @@ impl WorkflowEditorState {
                     if ui.button("Entropy Analysis").clicked() {
                         self.add_node(WorkflowNodeKind::Entropy {
                             log_path: String::new(),
-                            compute_32bit: false,
+                            compute_32bit: true,
                             results: Vec::new(),
                             cluster_filter: EntropyCluster::All,
                         });
@@ -5194,10 +5199,10 @@ mod tests {
             entropy_caches: Arc::new(Mutex::new(HashMap::new())),
         };
 
-        // Cache is empty → provider must fall through (unfiltered), size = 4*512 = 2048.
+        // Cache is empty → non-All filter must yield zero pages (analysis not yet run).
         let provider = state.build_data_provider(3).expect("should build");
-        assert_eq!(provider.lock().get_metadata().size, 4 * 512,
-            "Empty cache must yield unfiltered provider");
+        assert_eq!(provider.lock().get_metadata().total_pages, 0,
+            "Empty cache with non-All filter must yield zero pages");
 
         // Pre-populate the cache with all-zero entropy results for pages 0-3.
         {
