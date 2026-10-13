@@ -4017,6 +4017,14 @@ impl WorkflowEditorState {
                                             }
                                         });
                                 });
+                                if !*compute_32bit && matches!(cluster_filter,
+                                    EntropyCluster::LowEntropyArc
+                                    | EntropyCluster::MediumEntropyArc
+                                    | EntropyCluster::HighEntropyArc)
+                                {
+                                    ui.colored_label(egui::Color32::YELLOW,
+                                        "⚠ Arc filters require 'Compute 32-bit' enabled");
+                                }
                                 ui.horizontal(|ui| {
                                     ui.label("Log file (CSV):");
                                     ui.text_edit_singleline(log_path);
