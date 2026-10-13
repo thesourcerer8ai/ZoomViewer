@@ -1519,6 +1519,52 @@ impl AppWindow {
                         ht.displayed_node_id = Some(target_node_id);
                         ht.pending_jump_offset = Some(target_offset);
                     }
+
+                    // Fix 1: Switch the bitmap viewport renderer to the Leaf node's provider
+                    // so the NAND Viewer bitmap shows the correct raw data.
+                    if let Ok(wf) = workflow_state_timer.try_lock() {
+                        if let Ok(provider) = wf.build_data_provider(target_node_id) {
+                            let new_ident = provider.lock().cache_identity();
+                            if let Ok(new_cache) = CacheManager::new(".cache", new_ident.clone()) {
+                                let new_meta = provider.lock().get_metadata();
+                                viewport_renderer_clone.update_provider(
+                                    provider.clone(),
+                                    Arc::new(new_cache),
+                                    new_meta.clone(),
+                                );
+                                if let Ok(mut tc) = fltk_tile_cache_timer.try_lock() {
+                                    tc.clear();
+                                }
+                                // Update current_identity_timer so section 3 on the next tick
+                                // does NOT detect a mismatch and overwrite the backtracking provider.
+                                *current_identity_timer.lock().unwrap() = new_ident.clone();
+
+                                // Fix 2: Move the viewport center to the target offset so
+                                // the bitmap view is positioned at the jumped-to location.
+                                let pl = new_meta.page_length as u64;
+                                let bs = new_meta.block_size as u64;
+                                let gh = new_meta.grid_height as u64;
+                                if gh > 0 && pl > 0 && bs > 0 {
+                                    let total_page = target_offset / pl;
+                                    let block = total_page / bs;
+                                    let page_in_block = total_page % bs;
+                                    let byte_in_page = target_offset % pl;
+                                    let block_x = block / gh;
+                                    let block_y = block % gh;
+                                    let pixel_x_l0 = (block_x * (pl * 8) + (byte_in_page * 8)) as f64;
+                                    let pixel_y_l0 = (block_y * bs + page_in_block) as f64;
+                                    let mut vm = viewport_manager_clone.lock().unwrap();
+                                    let vp = vm.get_viewport().clone();
+                                    let scale = 2.0_f64.powi(vp.level);
+                                    let center_x = pixel_x_l0 / scale;
+                                    let center_y = pixel_y_l0 / scale;
+                                    vm.update_viewport(vp.level, center_x, center_y, vp.width_pixels, vp.height_pixels);
+                                    vm.update_task_priorities();
+                                }
+                            }
+                        }
+                    }
+
                     // Switch to the Hex tab
                     let _ = tabs_timer.set_value(&tab_hex_timer);
                     tabs_timer.redraw();
