@@ -15,7 +15,7 @@ use crate::data_provider::DumpDataProvider;
 use crate::search::SearchResult;
 use crate::types::FileMetadata;
 use egui::{
-    scroll_area::ScrollBarVisibility, vec2, Align, Color32, ColorImage, FontFamily, FontId, Key,
+    scroll_area::ScrollBarVisibility, vec2, Align, Align2, Color32, ColorImage, FontFamily, FontId, Key,
     Layout, Pos2, Rect, Rounding, ScrollArea, Sense, Stroke, TextureHandle, TextureOptions, Ui,
 };
 use parking_lot::Mutex;
@@ -178,6 +178,8 @@ pub enum HexDiffMode {
     RawOnly,
     /// Show active bytes with color-coded diff against raw bytes
     ColorDiff,
+    /// Dual overlay: decoded + raw at same position, one prominent, one ghosted
+    Overlay,
 }
 
 /// Placement of the miniature bit-level NAND viewer
@@ -214,6 +216,9 @@ pub struct HexTabState {
     pub diff_mode: HexDiffMode,
     /// Position of mini bit-level NAND viewer
     pub mini_nand_position: MiniNandPosition,
+    /// Overlay mode: when true, raw bytes are prominent and decoded bytes are ghosted.
+    /// When false (default), decoded bytes are prominent and raw bytes are ghosted.
+    pub overlay_raw_prominent: bool,
 
     /// Text input buffer for "Go to address / page"
     pub goto_address_input: String,
@@ -263,8 +268,9 @@ impl HexTabState {
 
             display_mode: HexDisplayMode::HexAndAscii,
             font_size: 12.0,
-            diff_mode: HexDiffMode::ColorDiff,
+            diff_mode: HexDiffMode::XorOnly,
             mini_nand_position: MiniNandPosition::Top,
+            overlay_raw_prominent: false,
 
             goto_address_input: "0x00000000".to_string(),
             goto_error: None,
@@ -610,6 +616,20 @@ impl HexTabState {
                 ui.selectable_value(&mut self.diff_mode, HexDiffMode::ColorDiff, "Diff (Raw vs XOR)");
                 ui.selectable_value(&mut self.diff_mode, HexDiffMode::XorOnly, "XOR Decoded");
                 ui.selectable_value(&mut self.diff_mode, HexDiffMode::RawOnly, "Raw Data");
+                ui.selectable_value(&mut self.diff_mode, HexDiffMode::Overlay, "Overlay (Raw+XOR)");
+                if self.diff_mode == HexDiffMode::Overlay {
+                    let toggle_label = if self.overlay_raw_prominent {
+                        "⇄ Raw prominent"
+                    } else {
+                        "⇄ Decoded prominent"
+                    };
+                    if ui.button(toggle_label)
+                        .on_hover_text("Toggle which layer is prominent (Space)")
+                        .clicked()
+                    {
+                        self.overlay_raw_prominent = !self.overlay_raw_prominent;
+                    }
+                }
                 ui.separator();
             }
 
@@ -765,6 +785,11 @@ impl HexTabState {
                     HexDiffMode::ColorDiff => "Diff Mode (Green: Changed, Gray: Same)",
                     HexDiffMode::XorOnly => "XOR Output",
                     HexDiffMode::RawOnly => "Raw Input",
+                    HexDiffMode::Overlay => if self.overlay_raw_prominent {
+                        "Overlay (Raw prominent, Decoded ghosted)"
+                    } else {
+                        "Overlay (Decoded prominent, Raw ghosted)"
+                    },
                 };
                 ui.colored_label(Color32::from_rgb(100, 230, 120), diff_mode_str);
             }
@@ -814,17 +839,29 @@ impl HexTabState {
                 for bit_pos in (0..8).rev() {
                     let bit_act = (act_byte >> bit_pos) & 1 == 1;
 
-                    let pixel_color = if let Some(rb) = raw_byte {
-                        let bit_raw = (rb >> bit_pos) & 1 == 1;
-                        // xorviewer.pl exact 4-color diff:
-                        // bit_act ? (bit_raw ? white : green) : (bit_raw ? red : black)
-                        if bit_act {
-                            if bit_raw { col_white } else { col_green }
+                    let pixel_color = if self.diff_mode == HexDiffMode::ColorDiff
+                        || self.diff_mode == HexDiffMode::Overlay
+                    {
+                        if let Some(rb) = raw_byte {
+                            let bit_raw = (rb >> bit_pos) & 1 == 1;
+                            // xorviewer.pl exact 4-color diff:
+                            // bit_act ? (bit_raw ? white : green) : (bit_raw ? red : black)
+                            if bit_act {
+                                if bit_raw { col_white } else { col_green }
+                            } else {
+                                if bit_raw { col_red } else { col_black }
+                            }
                         } else {
-                            if bit_raw { col_red } else { col_black }
+                            if bit_act { col_white } else { col_black }
                         }
                     } else {
-                        if bit_act { col_white } else { col_black }
+                        // XorOnly or RawOnly — show a single channel, no diff colouring
+                        let bit = if self.diff_mode == HexDiffMode::RawOnly {
+                            raw_byte.map(|rb| (rb >> bit_pos) & 1 == 1).unwrap_or(bit_act)
+                        } else {
+                            bit_act
+                        };
+                        if bit { col_white } else { col_black }
                     };
 
                     pixels.push(pixel_color);
@@ -1010,6 +1047,8 @@ impl HexTabState {
 
                         // 2. Hex Bytes (if HexAndAscii or HexOnly)
                         let mut ascii_chars: Vec<(char, bool)> = Vec::with_capacity(bytes_per_row);
+                        // For Overlay mode: track (prominent_char, ghost_char, is_search) per byte
+                        let mut ascii_overlay: Vec<(char, char, bool)> = Vec::with_capacity(bytes_per_row);
 
                         if self.display_mode != HexDisplayMode::AsciiOnly {
                             for col_idx in 0..bytes_per_row {
@@ -1018,6 +1057,79 @@ impl HexTabState {
 
                                 let act_b = active_bytes.get(col_idx).copied();
                                 let raw_b = raw_bytes.get(col_idx).copied();
+
+                                // Overlay mode: render dual-layer if raw data is available
+                                if self.diff_mode == HexDiffMode::Overlay && has_xor_diff {
+                                    let act = act_b.unwrap_or(0);
+                                    let raw = raw_b.unwrap_or(0);
+
+                                    let (prominent_b, ghost_b) = if self.overlay_raw_prominent {
+                                        (raw, act)  // raw prominent, decoded ghosted
+                                    } else {
+                                        (act, raw)  // decoded prominent, raw ghosted
+                                    };
+
+                                    // Colors: decoded = green, raw = red
+                                    let (prominent_color, ghost_color) = if self.overlay_raw_prominent {
+                                        (
+                                            Color32::from_rgba_premultiplied(255, 40, 40, 255),  // red, full opacity
+                                            Color32::from_rgba_premultiplied(0, 200, 80, 50),    // green, ~20% alpha
+                                        )
+                                    } else {
+                                        (
+                                            Color32::from_rgba_premultiplied(0, 200, 80, 255),   // green, full opacity
+                                            Color32::from_rgba_premultiplied(255, 40, 40, 50),   // red, ~20% alpha
+                                        )
+                                    };
+
+                                    let is_search = search_pattern_len > 0
+                                        && search_results.iter().any(|r| {
+                                            byte_linear_offset >= r.byte_offset
+                                                && byte_linear_offset < r.byte_offset + search_pattern_len as u64
+                                        });
+
+                                    let mut rich = egui::RichText::new(format!("{:02X} ", prominent_b))
+                                        .font(mono_font.clone())
+                                        .color(if is_search { Color32::WHITE } else { prominent_color });
+                                    if is_search {
+                                        rich = rich.background_color(col_search_bg);
+                                    }
+
+                                    let byte_label = ui.add(egui::Label::new(rich).sense(egui::Sense::click()));
+                                    if byte_label.clicked() {
+                                        self.pending_backtrack = Some((current_node_id, byte_linear_offset));
+                                    }
+
+                                    // Paint ghost byte over the same rect using the painter
+                                    let painter = ui.painter();
+                                    painter.text(
+                                        byte_label.rect.center(),
+                                        Align2::CENTER_CENTER,
+                                        format!("{:02X}", ghost_b),
+                                        mono_font.clone(),
+                                        ghost_color,
+                                    );
+
+                                    byte_label.on_hover_ui(|ui| {
+                                        ui.label(format!("Page: {}, Col: 0x{:04X} ({})", page_num, abs_col, abs_col));
+                                        ui.label(format!("Linear: 0x{:08X}", byte_linear_offset));
+                                        ui.label(format!("Raw:    0x{:02X} ({})", raw, raw));
+                                        ui.label(format!("Output: 0x{:02X} ({})", act, act));
+                                        ui.label(format!("XOR:    0x{:02X}", raw ^ act));
+                                        if let Some(s) = HexTabState::find_segment_at_column(abs_col, page_records) {
+                                            ui.label(format!("Segment: {} ({})", s.name, format!("{:?}", s.kind)));
+                                        }
+                                        let layer = if self.overlay_raw_prominent { "Raw" } else { "Decoded" };
+                                        ui.label(format!("Prominent layer: {}", layer));
+                                    });
+
+                                    // Track ASCII for overlay column
+                                    let prom_ch = if prominent_b >= 32 && prominent_b <= 126 { prominent_b as char } else { '.' };
+                                    let ghost_ch = if ghost_b >= 32 && ghost_b <= 126 { ghost_b as char } else { '.' };
+                                    ascii_overlay.push((prom_ch, ghost_ch, is_search));
+                                    ascii_chars.push((prom_ch, is_search)); // fallback (unused in overlay path)
+                                    continue;
+                                }
 
                                 let disp_b = match self.diff_mode {
                                     HexDiffMode::RawOnly => raw_b.unwrap_or(0),
@@ -1120,27 +1232,84 @@ impl HexTabState {
                                 ui.label(egui::RichText::new(" | ").font(mono_font.clone()).color(Color32::DARK_GRAY));
                             }
 
-                            // If any character in this row is a search match, render
-                            // per-character so matches get highlighted individually.
-                            // Otherwise use a single label for speed.
-                            let any_match = ascii_chars.iter().any(|(_, m)| *m);
-                            if any_match {
-                                for (ch, is_match) in &ascii_chars {
-                                    let mut rich = egui::RichText::new(ch.to_string())
-                                        .font(mono_font.clone())
-                                        .color(if *is_match { Color32::WHITE } else { col_normal });
-                                    if *is_match {
-                                        rich = rich.background_color(col_search_bg);
+                            // Overlay mode: render dual-layer ASCII
+                            if self.diff_mode == HexDiffMode::Overlay && has_xor_diff && !ascii_overlay.is_empty() {
+                                let (prominent_color, ghost_color) = if self.overlay_raw_prominent {
+                                    (
+                                        Color32::from_rgba_premultiplied(255, 40, 40, 255),
+                                        Color32::from_rgba_premultiplied(0, 200, 80, 50),
+                                    )
+                                } else {
+                                    (
+                                        Color32::from_rgba_premultiplied(0, 200, 80, 255),
+                                        Color32::from_rgba_premultiplied(255, 40, 40, 50),
+                                    )
+                                };
+
+                                // Build prominent and ghost strings
+                                let prominent_str: String = ascii_overlay.iter().map(|(p, _, _)| p).collect();
+                                let ghost_str: String = ascii_overlay.iter().map(|(_, g, _)| g).collect();
+
+                                let any_match = ascii_overlay.iter().any(|(_, _, m)| *m);
+                                if any_match {
+                                    // Per-character rendering for search highlights
+                                    for (prom_ch, ghost_ch, is_match) in &ascii_overlay {
+                                        let prom_label_color = if *is_match { Color32::WHITE } else { prominent_color };
+                                        let mut rich = egui::RichText::new(prom_ch.to_string())
+                                            .font(mono_font.clone())
+                                            .color(prom_label_color);
+                                        if *is_match {
+                                            rich = rich.background_color(col_search_bg);
+                                        }
+                                        let char_resp = ui.label(rich);
+                                        if !is_match {
+                                            ui.painter().text(
+                                                char_resp.rect.center(),
+                                                Align2::CENTER_CENTER,
+                                                ghost_ch.to_string(),
+                                                mono_font.clone(),
+                                                ghost_color,
+                                            );
+                                        }
                                     }
-                                    ui.label(rich);
+                                } else {
+                                    // Fast path: single label for the whole row
+                                    let prom_resp = ui.label(
+                                        egui::RichText::new(prominent_str)
+                                            .font(mono_font.clone())
+                                            .color(prominent_color),
+                                    );
+                                    ui.painter().text(
+                                        prom_resp.rect.center(),
+                                        Align2::CENTER_CENTER,
+                                        ghost_str,
+                                        mono_font.clone(),
+                                        ghost_color,
+                                    );
                                 }
                             } else {
-                                let ascii_str: String = ascii_chars.iter().map(|(c, _)| c).collect();
-                                ui.label(
-                                    egui::RichText::new(ascii_str)
-                                        .font(mono_font.clone())
-                                        .color(col_normal),
-                                );
+                                // If any character in this row is a search match, render
+                                // per-character so matches get highlighted individually.
+                                // Otherwise use a single label for speed.
+                                let any_match = ascii_chars.iter().any(|(_, m)| *m);
+                                if any_match {
+                                    for (ch, is_match) in &ascii_chars {
+                                        let mut rich = egui::RichText::new(ch.to_string())
+                                            .font(mono_font.clone())
+                                            .color(if *is_match { Color32::WHITE } else { col_normal });
+                                        if *is_match {
+                                            rich = rich.background_color(col_search_bg);
+                                        }
+                                        ui.label(rich);
+                                    }
+                                } else {
+                                    let ascii_str: String = ascii_chars.iter().map(|(c, _)| c).collect();
+                                    ui.label(
+                                        egui::RichText::new(ascii_str)
+                                            .font(mono_font.clone())
+                                            .color(col_normal),
+                                    );
+                                }
                             }
                         }
                     });
@@ -1663,6 +1832,11 @@ impl HexTabState {
                 } else if delta < 0 {
                     self.col_offset_in_page = self.col_offset_in_page.saturating_sub((-delta) as u64);
                 }
+            }
+
+            // Space key: toggle overlay layer prominence (Overlay mode only)
+            if self.diff_mode == HexDiffMode::Overlay && i.key_pressed(Key::Space) {
+                self.overlay_raw_prominent = !self.overlay_raw_prominent;
             }
         });
     }
