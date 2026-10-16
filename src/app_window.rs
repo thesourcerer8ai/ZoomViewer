@@ -1229,10 +1229,9 @@ impl AppWindow {
                         drop(viewport_img);
                         
                         if let Ok(fltk_img) = fltk::image::RgbImage::new(&raw_data, width, height, ColorDepth::Rgba8) {
-                            let mut frame = viewport_frame_for_events.lock().unwrap();
-                            frame.set_image(Some(fltk_img));
-                            frame.redraw();
-                            drop(frame);
+                            viewport_frame_for_events.lock().unwrap().set_image(Some(fltk_img));
+                            // lock dropped before redraw to avoid self-deadlock
+                            viewport_frame_for_events.lock().unwrap().redraw();
                             fltk::app::awake(); // Force event loop to process
                         }
                         
@@ -1512,35 +1511,38 @@ impl AppWindow {
             }
 
             // 2d. Check if Backtracking tab requested a jump to Hex
-            if let Ok(mut bt) = bt_tab_timer.try_lock() {
-                if let Some((target_node_id, target_offset)) = bt.jump_to_hex.take() {
-                    // Set displayed_node_id so gl_hex.draw() picks the right provider
+            // IMPORTANT: extract the jump request and DROP the bt lock immediately.
+            // Calling redraw() below can synchronously trigger the backtracking draw
+            // closure, which also locks bt_state_draw (same mutex). Holding bt_tab_timer
+            // while calling redraw() would deadlock.
+            let bt_jump = if let Ok(mut bt) = bt_tab_timer.try_lock() {
+                bt.jump_to_hex.take()
+            } else {
+                None
+            };
+            if let Some((target_node_id, target_offset)) = bt_jump {
                     if let Ok(mut ht) = hex_tab_timer.try_lock() {
                         ht.displayed_node_id = Some(target_node_id);
                         ht.pending_jump_offset = Some(target_offset);
                     }
 
-                    // Fix 1: Switch the bitmap viewport renderer to the Leaf node's provider
-                    // so the NAND Viewer bitmap shows the correct raw data.
                     if let Ok(wf) = workflow_state_timer.try_lock() {
                         if let Ok(provider) = wf.build_data_provider(target_node_id) {
-                            let new_ident = provider.lock().cache_identity();
+                            let new_ident = { provider.lock().cache_identity() };
                             if let Ok(new_cache) = CacheManager::new(".cache", new_ident.clone()) {
-                                let new_meta = provider.lock().get_metadata();
+                                let new_meta = { provider.lock().get_metadata() };
                                 viewport_renderer_clone.update_provider(
-                                    provider.clone(),
+                                    provider,
                                     Arc::new(new_cache),
                                     new_meta.clone(),
                                 );
                                 if let Ok(mut tc) = fltk_tile_cache_timer.try_lock() {
                                     tc.clear();
                                 }
-                                // Update current_identity_timer so section 3 on the next tick
-                                // does NOT detect a mismatch and overwrite the backtracking provider.
-                                *current_identity_timer.lock().unwrap() = new_ident.clone();
+                                if let Ok(mut ident) = current_identity_timer.try_lock() {
+                                    *ident = new_ident;
+                                }
 
-                                // Fix 2: Move the viewport center to the target offset so
-                                // the bitmap view is positioned at the jumped-to location.
                                 let pl = new_meta.page_length as u64;
                                 let bs = new_meta.block_size as u64;
                                 let gh = new_meta.grid_height as u64;
@@ -1553,24 +1555,23 @@ impl AppWindow {
                                     let block_y = block % gh;
                                     let pixel_x_l0 = (block_x * (pl * 8) + (byte_in_page * 8)) as f64;
                                     let pixel_y_l0 = (block_y * bs + page_in_block) as f64;
-                                    let mut vm = viewport_manager_clone.lock().unwrap();
-                                    let vp = vm.get_viewport().clone();
-                                    let scale = 2.0_f64.powi(vp.level);
-                                    let center_x = pixel_x_l0 / scale;
-                                    let center_y = pixel_y_l0 / scale;
-                                    vm.update_viewport(vp.level, center_x, center_y, vp.width_pixels, vp.height_pixels);
-                                    vm.update_task_priorities();
+                                    if let Ok(mut vm) = viewport_manager_clone.try_lock() {
+                                        let vp = vm.get_viewport().clone();
+                                        let scale = 2.0_f64.powi(vp.level);
+                                        let center_x = pixel_x_l0 / scale;
+                                        let center_y = pixel_y_l0 / scale;
+                                        vm.update_viewport(vp.level, center_x, center_y, vp.width_pixels, vp.height_pixels);
+                                        vm.update_task_priorities();
+                                    }
                                 }
                             }
                         }
                     }
 
-                    // Switch to the Hex tab
                     let _ = tabs_timer.set_value(&tab_hex_timer);
                     tabs_timer.redraw();
                     gl_hex_timer.redraw();
                     need_redraw = true;
-                }
             }
 
             // 3. Check if active OutputViewer in workflow changed (Variante A)
@@ -1598,22 +1599,28 @@ impl AppWindow {
                                 vm.update_viewport(0, center_x, center_y, initial_viewport_w as u32, initial_viewport_h as u32);
                                 vm.update_task_priorities();
                             }
-                            // Reset Hex Tab to the beginning when a new OutputViewer is shown
+                            // Reset Hex Tab to the beginning when a new OutputViewer is shown,
+                            // but NOT if a backtracking jump is in progress (displayed_node_id set) —
+                            // that would clear pending_jump_offset before the draw closure sees it.
                             if let Ok(mut ht) = hex_tab_timer.try_lock() {
-                                ht.current_page = 0;
-                                ht.col_offset_in_page = 0;
-                                ht.pending_jump_offset = None;
-                                ht.goto_address_input = "0x00000000".to_string();
-                                ht.displayed_node_id = None;
+                                if ht.displayed_node_id.is_none() {
+                                    ht.current_page = 0;
+                                    ht.col_offset_in_page = 0;
+                                    ht.pending_jump_offset = None;
+                                    ht.goto_address_input = "0x00000000".to_string();
+                                }
                             }
                             // Clear the cached identity so that the next iteration of section 3
                             // always detects a "change" and calls update_provider() with the
                             // correct OutputViewer provider, even if we were previously showing
                             // a backtracking Leaf node's provider.
-                            *current_identity_timer.lock().unwrap() = String::new();
+                            // NOTE: cur_ident is already held — reuse it instead of locking again.
+                            *cur_ident = String::new();
                             tab_viewer_timer.activate();
-                            gl_hex_timer.redraw();
-                            gl_pattern_writer_timer.redraw();
+                            // NOTE: do NOT call redraw() here — we still hold the workflow lock.
+                            // redraw() can synchronously invoke draw closures that also lock
+                            // the workflow mutex → self-deadlock. Set a flag instead and
+                            // redraw after the workflow lock is dropped (see below).
                             need_redraw = true;
                         }
                     }
@@ -1627,27 +1634,31 @@ impl AppWindow {
                     }
                 }
             }
+            // Redraw hex/pattern_writer AFTER the workflow lock has been dropped.
+            if need_redraw {
+                gl_hex_timer.redraw();
+                gl_pattern_writer_timer.redraw();
+            }
 
             if need_redraw {
                 let vp = viewport_manager_clone.lock().unwrap().get_viewport().clone();
-                let zoom = zoom_controller_clone.lock().unwrap();
-                let blend_level = zoom.get_next_level();
-                let blend_factor = zoom.get_blend_factor();
-                drop(zoom);
-
+                let (blend_level, blend_factor) = {
+                    let zoom = zoom_controller_clone.lock().unwrap();
+                    (zoom.get_next_level(), zoom.get_blend_factor())
+                };
                 let rendered_image = viewport_renderer_clone.render_viewport(&vp, blend_level, blend_factor);
-                let mut viewport_img = viewport_image_clone.lock().unwrap();
-                *viewport_img = rendered_image;
-
-                let width = viewport_img.width() as i32;
-                let height = viewport_img.height() as i32;
-                let raw_data = viewport_img.as_raw().clone();
-                drop(viewport_img);
-
+                let (width, height, raw_data) = {
+                    let mut viewport_img = viewport_image_clone.lock().unwrap();
+                    *viewport_img = rendered_image;
+                    (viewport_img.width() as i32, viewport_img.height() as i32, viewport_img.as_raw().clone())
+                };
+                // before redraw() is called so the draw closure can re-acquire it freely.
                 if let Ok(fltk_img) = fltk::image::RgbImage::new(&raw_data, width, height, ColorDepth::Rgba8) {
-                    let mut frame = viewport_frame_clone.lock().unwrap();
-                    frame.set_image(Some(fltk_img));
-                    frame.redraw();
+                    {
+                        let mut frame = viewport_frame_clone.lock().unwrap();
+                        frame.set_image(Some(fltk_img));
+                    } // lock dropped here
+                    viewport_frame_clone.lock().unwrap().redraw();
                 }
             }
 
@@ -1796,10 +1807,9 @@ impl AppWindow {
                         drop(viewport_img);
                         
                         if let Ok(fltk_img) = fltk::image::RgbImage::new(&raw_data, width, height, ColorDepth::Rgba8) {
-                            let mut frame = viewport_frame_resize.lock().unwrap();
-                            frame.set_image(Some(fltk_img));
-                            frame.redraw();
-                        }
+                            viewport_frame_resize.lock().unwrap().set_image(Some(fltk_img));
+                        } // lock dropped before redraw
+                        viewport_frame_resize.lock().unwrap().redraw();
                         
                         // Calculate render time and time since last render
                         let render_duration = render_start.elapsed().as_secs_f64() * 1000.0;
@@ -1906,10 +1916,9 @@ impl AppWindow {
                                 drop(viewport_img);
 
                                 if let Ok(fltk_img) = fltk::image::RgbImage::new(&raw_data, width, height, ColorDepth::Rgba8) {
-                                    let mut frame = viewport_frame_resize.lock().unwrap();
-                                    frame.set_image(Some(fltk_img));
-                                    frame.redraw();
-                                }
+                                    viewport_frame_resize.lock().unwrap().set_image(Some(fltk_img));
+                                } // lock dropped before redraw
+                                viewport_frame_resize.lock().unwrap().redraw();
 
                                 let render_duration = render_start.elapsed().as_secs_f64() * 1000.0;
                                 let time_since_last_render = {
@@ -2147,14 +2156,13 @@ impl AppWindow {
         let raw_data = viewport_img.as_raw().clone();
         
         if let Ok(fltk_img) = fltk::image::RgbImage::new(&raw_data, width, height, ColorDepth::Rgba8) {
-            let mut frame = self.viewport_frame.lock().unwrap();
-            frame.set_image(Some(fltk_img));
-            frame.redraw();
-            
+            self.viewport_frame.lock().unwrap().set_image(Some(fltk_img));
             log::debug!("Drew viewport image to frame: {}x{}", width, height);
         } else {
             log::error!("Failed to create FLTK image from viewport data");
         }
+        // lock dropped before redraw to avoid self-deadlock
+        self.viewport_frame.lock().unwrap().redraw();
     }
 
     /// Update viewport rendering

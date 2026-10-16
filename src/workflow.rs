@@ -1732,11 +1732,32 @@ impl WorkflowEditorState {
                 let upstream = self.build_data_provider_internal(incoming.from_node, ancestors)?;
 
                 // Get or create the shared entropy cache for this node.
+                // build_data_provider is always called while the workflow lock is held.
+                // Worker threads (EntropyDataProvider::read_bytes) hold the per-node cache
+                // lock and may also need the workflow lock → classic deadlock if we block here.
+                // Solution: use try_lock(); if unavailable return an unfiltered provider for
+                // this call — the next rebuild (50 ms later) will succeed.
                 let cache: Arc<Mutex<HashMap<u64, EntropyResult>>> = {
-                    let mut map = self.entropy_caches.lock();
-                    map.entry(target_node_id)
-                        .or_insert_with(|| Arc::new(Mutex::new(HashMap::new())))
-                        .clone()
+                    match self.entropy_caches.try_lock() {
+                        Some(mut map) => map
+                            .entry(target_node_id)
+                            .or_insert_with(|| Arc::new(Mutex::new(HashMap::new())))
+                            .clone(),
+                        None => {
+                            // Cache lock contended — return unfiltered provider this tick.
+                            let provider = EntropyDataProvider::new(
+                                upstream,
+                                Arc::new(Mutex::new(HashMap::new())),
+                                if log_path.trim().is_empty() {
+                                    entropy_csv_default_path(target_node_id)
+                                } else {
+                                    PathBuf::from(&log_path)
+                                },
+                                compute_32bit,
+                            );
+                            return Ok(Arc::new(Mutex::new(provider)) as Arc<Mutex<dyn DumpDataProvider>>);
+                        }
+                    }
                 };
 
                 // Resolve effective CSV path.
@@ -1746,12 +1767,16 @@ impl WorkflowEditorState {
                     PathBuf::from(&log_path)
                 };
 
-                // Pre-load any previously computed results from the CSV into the cache.
-                let existing = load_entropy_results_from_csv(&effective_path);
-                {
-                    let mut c = cache.lock();
-                    for r in existing {
-                        c.entry(r.page).or_insert(r);
+                // Pre-load previously computed results from the CSV into the cache,
+                // but ONLY if the cache is currently empty — avoid re-reading a 60MB
+                // file on every provider rebuild (which happens every 50ms and on every
+                // Jump, draw call, etc.).
+                if let Some(mut c) = cache.try_lock() {
+                    if c.is_empty() {
+                        let existing = load_entropy_results_from_csv(&effective_path);
+                        for r in existing {
+                            c.entry(r.page).or_insert(r);
+                        }
                     }
                 }
 
@@ -1762,25 +1787,24 @@ impl WorkflowEditorState {
                 }
 
                 // Build the filtered page list from the pre-loaded cache.
-                // If the cache is empty the analysis has not been run yet — return an
-                // empty filtered result so non-All filters show zero pages until
-                // analysis has been run.
-                let matching_pages: Vec<u64> = {
-                    let c = cache.lock();
-                    if c.is_empty() {
-                        // Analysis not yet run: no pages belong to any specific cluster.
+                // If the cache is empty or contended, return empty result for this tick.
+                let matching_pages: Vec<u64> = match cache.try_lock() {
+                    Some(c) if c.is_empty() => {
                         let entropy_arc = Arc::new(Mutex::new(provider)) as Arc<Mutex<dyn DumpDataProvider>>;
                         let label = format!("entropy_cluster_{}", cluster_filter.label());
                         let filtered = SearchFilteredDataProvider::new(entropy_arc, vec![], label);
                         return Ok(Arc::new(Mutex::new(filtered)) as Arc<Mutex<dyn DumpDataProvider>>);
                     }
-                    let mut pages: Vec<u64> = c
-                        .values()
-                        .filter(|r| cluster_filter.matches(r.entropy_8, r.entropy_32.unwrap_or(0.0)))
-                        .map(|r| r.page)
-                        .collect();
-                    pages.sort_unstable();
-                    pages
+                    Some(c) => {
+                        let mut pages: Vec<u64> = c
+                            .values()
+                            .filter(|r| cluster_filter.matches(r.entropy_8, r.entropy_32.unwrap_or(0.0)))
+                            .map(|r| r.page)
+                            .collect();
+                        pages.sort_unstable();
+                        pages
+                    }
+                    None => vec![],
                 };
 
                 let entropy_arc = Arc::new(Mutex::new(provider)) as Arc<Mutex<dyn DumpDataProvider>>;
@@ -2024,9 +2048,15 @@ impl WorkflowEditorState {
             let node = self.nodes.iter().find(|n| n.id == current_id)?;
             if let WorkflowNodeKind::Entropy { results, .. } = &node.kind {
                 // First check the live on-demand cache (populated by EntropyDataProvider).
-                if let Some(cache_map) = self.entropy_caches.lock().get(&current_id) {
-                    if let Some(r) = cache_map.lock().get(&page) {
-                        return Some(r.entropy_8);
+                // Use try_lock() — this method is called while the workflow lock is held,
+                // and worker threads may hold the cache lock concurrently.
+                if let Some(cache_map) = self.entropy_caches.try_lock() {
+                    if let Some(node_cache) = cache_map.get(&current_id) {
+                        if let Some(c) = node_cache.try_lock() {
+                            if let Some(r) = c.get(&page) {
+                                return Some(r.entropy_8);
+                            }
+                        }
                     }
                 }
                 // Fall back to full-run results stored on the node.
