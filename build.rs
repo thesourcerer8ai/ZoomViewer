@@ -1,4 +1,6 @@
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+
     // For Windows builds, ensure proper linking
     #[cfg(target_os = "windows")]
     {
