@@ -212,6 +212,19 @@ impl TaskQueue {
         log::debug!("High priority queue downgraded to normal to preserve dependencies");
     }
 
+    /// Clear all tasks, iterators, and waiting dependencies from all queues
+    ///
+    /// Discards all high, normal, and low priority tasks, resets the background
+    /// low-priority iterator, and clears all registered waiting parent dependencies.
+    pub fn clear(&self) {
+        self.high_queue.write().clear();
+        self.normal_queue.write().clear();
+        self.low_queue.write().clear();
+        *self.low_priority_iterator.write() = None;
+        self.waiting_parents.write().clear();
+        log::debug!("TaskQueue cleared: all priority queues, iterator, and waiting parents reset");
+    }
+
     /// Register that a parent tile is waiting for child tiles to complete
     ///
     /// When any of the child tiles complete, the parent will be automatically enqueued
@@ -453,6 +466,41 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 100);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn test_clear_removes_all_tasks_and_dependencies() {
+        let queue = TaskQueue::new();
+        let meta = FileMetadata::new("test.bin".to_string(), 10_000_000, 512, 64);
+        queue.init_low_priority_iterator(meta);
+
+        // Enqueue high, normal, low tasks
+        queue.enqueue(TileTask::new(TileCoord::new(1, 0, 0), Priority::High, false));
+        queue.enqueue(TileTask::new(TileCoord::new(1, 1, 0), Priority::Normal, false));
+        queue.enqueue(TileTask::new(TileCoord::new(1, 2, 0), Priority::Low, false));
+
+        // Register waiting parents
+        queue.register_waiting_parent(
+            TileCoord::new(2, 0, 0),
+            Priority::Normal,
+            &[TileCoord::new(1, 0, 0)],
+        );
+
+        assert!(!queue.is_empty());
+        assert_eq!(queue.size(), 3);
+
+        // Clear everything
+        queue.clear();
+
+        assert!(queue.is_empty());
+        assert_eq!(queue.size(), 0);
+        assert!(queue.dequeue().is_none());
+        assert!(queue.get_next_low_priority_tile().is_none());
+
+        // Completing the tile should not re-enqueue any parent since waiting parents were cleared
+        let parents = queue.notify_tile_complete(TileCoord::new(1, 0, 0));
+        assert!(parents.is_empty());
         assert!(queue.is_empty());
     }
 }

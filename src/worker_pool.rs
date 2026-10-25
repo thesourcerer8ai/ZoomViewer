@@ -10,7 +10,6 @@ use crate::cache_manager::CacheManager;
 use crate::data_provider::DumpDataProvider;
 use crate::pyramid_tile_generator::PyramidTileGenerator;
 use crate::task_queue::TaskQueue;
-use crate::tile_generator::TileGenerator;
 use crate::types::{FileMetadata, TileCoord};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -202,15 +201,12 @@ impl WorkerPool {
                     }
 
                     // Generate tile based on level
-                    let result = if task.coord.level < 0 {
-                        // Negative level tiles are generated on-the-fly in ViewportRenderer
-                        // They should never reach the worker pool
-                        log::warn!("Worker {} received negative level tile {:?}, skipping", worker_id, task.coord);
+                    let result = if task.coord.level <= 0 {
+                        // Level 0 and negative level tiles are rendered directly on-the-fly
+                        // in ViewportRenderer and never cached to disk. They should never be processed by workers.
+                        log::debug!("Worker {} skipping level <= 0 tile {:?}", worker_id, task.coord);
+                        task_queue.remove_from_all_queues(task.coord);
                         continue;
-                    } else if task.coord.level == 0 {
-                        // High-resolution tile from dump
-                        let mut loader = file_loader.lock();
-                        TileGenerator::generate_tile(task.coord, &metadata, &mut *loader)
                     } else {
                         // Pyramid tile from lower-level tiles or direct dump for level 1
                         let mut loader = file_loader.lock();
@@ -380,11 +376,8 @@ impl WorkerPool {
     /// Gracefully stop all workers
     ///
     /// Signals all workers to shut down and waits for them to complete.
-    ///
-    /// # Requirements
-    /// - Gracefully stops all workers (Requirement 10.1)
-    pub fn shutdown(mut self) {
-        log::debug!("Shutting down worker pool with {} workers", self.num_workers);
+    pub fn stop(&mut self) {
+        log::debug!("Stopping worker pool with {} workers", self.num_workers);
 
         // Signal shutdown
         self.shutdown.store(true, Ordering::Relaxed);
@@ -396,7 +389,17 @@ impl WorkerPool {
             }
         }
 
-        log::debug!("Worker pool shutdown complete");
+        log::debug!("Worker pool stop complete");
+    }
+
+    /// Gracefully stop all workers
+    ///
+    /// Signals all workers to shut down and waits for them to complete.
+    ///
+    /// # Requirements
+    /// - Gracefully stops all workers (Requirement 10.1)
+    pub fn shutdown(mut self) {
+        self.stop();
     }
 
     /// Check if the worker pool is running
@@ -407,6 +410,12 @@ impl WorkerPool {
     /// Get the number of workers in the pool
     pub fn num_workers(&self) -> usize {
         self.num_workers
+    }
+}
+
+impl Drop for WorkerPool {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -664,6 +673,77 @@ mod tests {
         assert_eq!(loaded, png_data);
 
         pool.shutdown();
+    }
+
+    #[test]
+    fn test_worker_skips_level_0_tasks() {
+        let task_queue = TaskQueue::new();
+        let temp_dir = TempDir::new().unwrap();
+        let cache = CacheManager::new(temp_dir.path(), "test.bin".to_string()).unwrap();
+        let (_temp_file, file_loader_arc, metadata) = create_test_file_loader();
+
+        // Enqueue a level 0 task
+        let coord0 = TileCoord::new(0, 0, 0);
+        let task0 = TileTask::new(coord0, Priority::High, true);
+        task_queue.enqueue(task0);
+
+        // Also enqueue a valid level 1 task after it
+        let coord1 = TileCoord::new(1, 0, 0);
+        let task1 = TileTask::new(coord1, Priority::Normal, false);
+        task_queue.enqueue(task1);
+
+        let mut pool = WorkerPool::new(
+            task_queue.clone(),
+            cache.clone(),
+            Arc::clone(&file_loader_arc),
+            metadata.clone(),
+        );
+
+        pool.start(
+            task_queue.clone(),
+            cache.clone(),
+            Arc::clone(&file_loader_arc),
+            metadata,
+        );
+
+        // Wait for workers to process tasks
+        thread::sleep(Duration::from_millis(500));
+
+        // Level 0 tile must not be cached (it is skipped)
+        assert!(!cache.tile_exists(&coord0));
+        // Level 1 tile should be generated and cached
+        assert!(cache.tile_exists(&coord1));
+
+        pool.shutdown();
+    }
+
+    #[test]
+    fn test_worker_pool_stop() {
+        let task_queue = TaskQueue::new();
+        let temp_dir = TempDir::new().unwrap();
+        let cache = CacheManager::new(temp_dir.path(), "test.bin".to_string()).unwrap();
+        let (_temp_file, file_loader_arc, metadata) = create_test_file_loader();
+
+        let mut pool = WorkerPool::new(
+            task_queue.clone(),
+            cache.clone(),
+            Arc::clone(&file_loader_arc),
+            metadata.clone(),
+        );
+
+        pool.start(
+            task_queue.clone(),
+            cache.clone(),
+            Arc::clone(&file_loader_arc),
+            metadata,
+        );
+
+        assert!(pool.is_running());
+
+        // Stop the pool
+        pool.stop();
+
+        assert!(!pool.is_running());
     }
 }
 

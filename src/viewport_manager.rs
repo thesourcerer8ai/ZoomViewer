@@ -90,31 +90,32 @@ impl ViewportManager {
         let mut enqueued_adjacent = 0;
         let mut enqueued_parent_level = 0;
         
-        // Enqueue visible tiles with high priority
-        // These tiles will be added to the high priority queue
-        // They may also exist in normal/low queues from previous viewport states
+        // Enqueue visible tiles with high priority (only level >= 1, level <= 0 is rendered on-the-fly)
         for tile in &self.viewport.visible_tiles {
-            self.task_queue.enqueue(crate::types::TileTask::new(
-                *tile,
-                Priority::High,
-                tile.level <= 0,
-            ));
-            enqueued_visible += 1;
+            if tile.level >= 1 {
+                self.task_queue.enqueue(crate::types::TileTask::new(
+                    *tile,
+                    Priority::High,
+                    false,
+                ));
+                enqueued_visible += 1;
+            }
         }
         
-        // Enqueue adjacent tiles with normal priority (skip if already in queue)
+        // Enqueue adjacent tiles with normal priority (skip if already in queue, only level >= 1)
         for tile in &self.viewport.adjacent_tiles {
-            if !self.task_queue.contains(*tile) {
+            if tile.level >= 1 && !self.task_queue.contains(*tile) {
                 self.task_queue.enqueue(crate::types::TileTask::new(
                     *tile,
                     Priority::Normal,
-                    tile.level <= 0,
+                    false,
                 ));
                 enqueued_adjacent += 1;
             }
         }
         
         // Enqueue parent level tiles (level + 1) with normal priority for smooth zoom-out
+        // When viewport is at level 0, this enqueues level 1 tiles for seamless zoom-out
         if self.viewport.level >= 0 && self.viewport.level < 10 { // Reasonable max level
             let parent_level = self.viewport.level + 1;
             let parent_tiles = self.calculate_parent_level_tiles(parent_level);
@@ -451,6 +452,34 @@ mod tests {
         
         // Visible tiles should be different
         assert_ne!(visible1, visible2);
+    }
+
+    #[test]
+    fn test_update_task_priorities_skips_level_0_and_enqueues_level_1() {
+        let metadata = create_test_metadata();
+        let task_queue = Arc::new(TaskQueue::new());
+        let mut manager = ViewportManager::new(metadata, task_queue.clone());
+
+        // Update viewport to Level 0
+        manager.update_viewport(0, 512.0, 384.0, 1024, 768);
+
+        // Dequeue all tasks from task_queue and verify:
+        // 1. None of them are level 0
+        // 2. We have level 1 parent tiles queued with Normal priority
+        let mut level_0_count = 0;
+        let mut level_1_count = 0;
+
+        while let Some(task) = task_queue.dequeue() {
+            if task.coord.level == 0 {
+                level_0_count += 1;
+            } else if task.coord.level == 1 {
+                level_1_count += 1;
+                assert_eq!(task.priority, Priority::Normal, "Parent level tiles must be Normal priority");
+            }
+        }
+
+        assert_eq!(level_0_count, 0, "No level 0 tasks should be enqueued");
+        assert!(level_1_count > 0, "Level 1 parent tiles should be enqueued for smooth zoom-out");
     }
 }
 

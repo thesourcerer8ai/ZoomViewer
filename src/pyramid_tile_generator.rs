@@ -392,8 +392,10 @@ impl PyramidTileGenerator {
             
             if should_enqueue {
                 for child_coord in &missing_tiles {
-                    let task = TileTask::new(*child_coord, priority, child_level == 0);
-                    task_queue.enqueue(task);
+                    if child_coord.level >= 1 {
+                        let task = TileTask::new(*child_coord, priority, false);
+                        task_queue.enqueue(task);
+                    }
                 }
             } else {
                 log::debug!(
