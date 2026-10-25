@@ -1432,27 +1432,44 @@ impl AppWindow {
             // 2c. Check if Hex tab has a pending backtrack request
             if let Ok(mut ht) = hex_tab_timer.try_lock() {
                 if let Some((clicked_node_id, clicked_offset)) = ht.pending_backtrack.take() {
-                    // Build provider for the clicked node and call trace_byte
-                    let addresses = if let Ok(wf) = workflow_state_timer.try_lock() {
+                    // Unified single-pass: build all addresses and read all byte values
+                    // inside one workflow lock, using a provider cache to avoid
+                    // rebuilding the same provider more than once.
+                    let final_addresses = if let Ok(wf) = workflow_state_timer.try_lock() {
                         match wf.build_data_provider(clicked_node_id) {
                             Ok(provider) => {
-                                let guard = provider.lock();
-                                let mut addrs = guard.trace_byte(clicked_offset);
+                                // --- Trace + origin metadata (provider lock held briefly) ---
+                                let (mut addrs, origin_byte, clicked_block,
+                                     clicked_page_in_block, clicked_offset_in_page,
+                                     clicked_node_name) = {
+                                    let mut guard = provider.lock();
+                                    let addrs: Vec<BacktrackAddress> = guard.trace_byte(clicked_offset);
 
-                                // Compute address components for the clicked node itself (origin entry)
-                                let meta = guard.get_metadata();
-                                let pl = (meta.page_length as u64).max(1);
-                                let bs = (meta.block_size as u64).max(1);
-                                let total_page = clicked_offset / pl;
-                                let clicked_block = total_page / bs;
-                                let clicked_page_in_block = total_page % bs;
-                                let clicked_offset_in_page = clicked_offset % pl;
-                                let clicked_node_name = wf.nodes.iter()
-                                    .find(|n| n.id == clicked_node_id)
-                                    .map(|n| n.name.clone())
-                                    .unwrap_or_else(|| format!("Node #{}", clicked_node_id));
+                                    let meta = guard.get_metadata();
+                                    let pl = (meta.page_length as u64).max(1);
+                                    let bs = (meta.block_size as u64).max(1);
+                                    let total_page = clicked_offset / pl;
+                                    let blk = total_page / bs;
+                                    let p_in_b = total_page % bs;
+                                    let off_in_p = clicked_offset % pl;
 
-                                // Add origin entry for the clicked node
+                                    let name = wf.nodes.iter()
+                                        .find(|n| n.id == clicked_node_id)
+                                        .map(|n| n.name.clone())
+                                        .unwrap_or_else(|| format!("Node #{}", clicked_node_id));
+
+                                    // Read origin byte while provider is already locked —
+                                    // no second lock needed for the origin entry.
+                                    let byte = guard.read_bytes(clicked_offset, 1)
+                                        .ok()
+                                        .and_then(|b: Vec<u8>| b.first().copied())
+                                        .unwrap_or(0u8);
+
+                                    (addrs, byte, blk, p_in_b, off_in_p, name)
+                                    // guard dropped here → provider lock released
+                                };
+
+                                // Push origin entry with the real byte value
                                 addrs.push(BacktrackAddress {
                                     node_id: clicked_node_id,
                                     node_name: clicked_node_name,
@@ -1461,13 +1478,12 @@ impl AppWindow {
                                     block: clicked_block,
                                     page_in_block: clicked_page_in_block,
                                     offset_in_page: clicked_offset_in_page,
-                                    byte_value: 0x00,
+                                    byte_value: origin_byte,
                                     is_leaf: false,
                                     is_origin: true,
                                 });
 
-                                // Fill node_id/node_name for leaf entries by matching file_path
-                                // against Input nodes in the workflow graph
+                                // Resolve leaf node_ids/names from file_path → Input-node mapping
                                 for addr in &mut addrs {
                                     if addr.is_leaf {
                                         if let Some(ref fp) = addr.file_path {
@@ -1484,6 +1500,32 @@ impl AppWindow {
                                         }
                                     }
                                 }
+
+                                // Read leaf byte values using a provider cache —
+                                // stays inside the single workflow lock and avoids
+                                // rebuilding the same provider for duplicate leaf nodes.
+                                let mut provider_cache: HashMap<usize, Arc<parking_lot::Mutex<dyn DumpDataProvider>>> = HashMap::new();
+                                for addr in &mut addrs {
+                                    if addr.is_leaf && addr.node_id != 0 {
+                                        if !provider_cache.contains_key(&addr.node_id) {
+                                            match wf.build_data_provider(addr.node_id) {
+                                                Ok(p) => { provider_cache.insert(addr.node_id, p); }
+                                                Err(e) => {
+                                                    log::warn!(
+                                                        "backtrack: cannot build provider for leaf node {} ({}): {}",
+                                                        addr.node_id, addr.node_name, e
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        if let Some(p) = provider_cache.get(&addr.node_id) {
+                                            if let Ok(bytes) = p.lock().read_bytes(addr.absolute_offset, 1) {
+                                                addr.byte_value = bytes.first().copied().unwrap_or(0u8);
+                                            }
+                                        }
+                                    }
+                                }
+
                                 addrs
                             }
                             Err(_) => vec![],
@@ -1491,21 +1533,6 @@ impl AppWindow {
                     } else {
                         vec![]
                     };
-
-                    // Fill byte_value for leaf entries by reading 1 byte from each leaf's provider
-                    // (done in a second pass after releasing the first workflow lock)
-                    let mut final_addresses = addresses;
-                    for addr in &mut final_addresses {
-                        if addr.is_leaf && addr.node_id != 0 {
-                            if let Ok(wf) = workflow_state_timer.try_lock() {
-                                if let Ok(p) = wf.build_data_provider(addr.node_id) {
-                                    if let Ok(bytes) = p.lock().read_bytes(addr.absolute_offset, 1) {
-                                        addr.byte_value = bytes.first().copied().unwrap_or(0u8);
-                                    }
-                                }
-                            }
-                        }
-                    }
 
                     // Populate BacktrackingTabState and switch to that tab
                     if let Ok(mut bt) = bt_tab_timer.try_lock() {
