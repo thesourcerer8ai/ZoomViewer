@@ -545,12 +545,25 @@ impl WorkflowNode {
                 page_length,
                 block_size,
             } => {
-                let exists = Path::new(file_path).exists();
-                self.status = NodeExecutionStatus::Completed;
-                self.output_log = format!(
-                    "Input loaded!\nFile: {}\nExists: {}\nPage length: {} B, Block size: {} pages",
-                    file_path, exists, page_length, block_size
-                );
+                match FileLoader::new(file_path, *page_length, *block_size) {
+                    Ok(loader) => {
+                        let meta = loader.get_metadata();
+                        self.status = NodeExecutionStatus::Completed;
+                        let warn_str = if *page_length < 500 {
+                            format!("\n⚠ Warning: Page size ({} B) is unusually small (< 500 B).", page_length)
+                        } else {
+                            String::new()
+                        };
+                        self.output_log = format!(
+                            "Input verified!\nFile: {}\nSize: {} bytes\nPage length: {} B, Block size: {} pages\nTotal pages: {}, Total blocks: {}{}",
+                            file_path, meta.size, page_length, block_size, meta.total_pages, meta.total_blocks, warn_str
+                        );
+                    }
+                    Err(e) => {
+                        self.status = NodeExecutionStatus::Error(format!("Failed to open input: {}", e));
+                        self.output_log = format!("Failed to open input: {}", e);
+                    }
+                }
             }
             WorkflowNodeKind::XorTransform { pattern_hex } => {
                 self.status = NodeExecutionStatus::Completed;
@@ -1393,12 +1406,31 @@ impl WorkflowEditorState {
         self.status_message = format!("Added node #{}", id);
     }
 
-    /// Find the currently selected OutputViewer node ID, or the first OutputViewer in the graph
+    /// Find the currently selected OutputViewer node ID, or downstream OutputViewer from selected node,
+    /// or fallback to the first OutputViewer in the graph.
     pub fn get_active_output_node_id(&self) -> Option<usize> {
         if let Some(sel) = self.selected_node {
             if let Some(node) = self.nodes.iter().find(|n| n.id == sel) {
                 if matches!(node.kind, WorkflowNodeKind::OutputViewer { .. }) {
                     return Some(sel);
+                }
+            }
+            // Walk downstream from selected node to find a connected OutputViewer
+            let mut queue = vec![sel];
+            let mut visited = HashSet::new();
+            while let Some(curr) = queue.pop() {
+                if !visited.insert(curr) {
+                    continue;
+                }
+                for conn in &self.connections {
+                    if conn.from_node == curr {
+                        if let Some(target) = self.nodes.iter().find(|n| n.id == conn.to_node) {
+                            if matches!(target.kind, WorkflowNodeKind::OutputViewer { .. }) {
+                                return Some(target.id);
+                            }
+                            queue.push(conn.to_node);
+                        }
+                    }
                 }
             }
         }
@@ -3450,6 +3482,12 @@ impl WorkflowEditorState {
                                         );
                                     }
                                 });
+                                if *page_length < 500 {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(255, 180, 0),
+                                        format!("⚠ Small page size: {} B (< 500 B)", *page_length),
+                                    );
+                                }
 
                                 // Auto-check cached metadata on display
                                 /*
@@ -5268,5 +5306,42 @@ mod tests {
         let provider4 = state.build_data_provider(3).expect("should build with All filter");
         assert_eq!(provider4.lock().get_metadata().size, 4 * 512,
             "All filter must return unfiltered provider");
+    }
+
+    #[test]
+    fn test_downstream_active_output_node_selection() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dump_path = temp_dir.path().join("pipeline_test.dump");
+        fs::write(&dump_path, vec![0xAA; 1024 * 64]).unwrap();
+        let path = dump_path.to_str().unwrap().to_string();
+        let mut state = WorkflowEditorState::new(None);
+        // Setup two parallel pipelines:
+        // Pipeline A: Input 1 -> OutputViewer 2
+        // Pipeline B: Input 3 -> OutputViewer 4
+        let n1 = WorkflowNode::new_input(1, [0.0, 0.0], &path, 512, 64);
+        let n2 = WorkflowNode::new_output(2, [100.0, 0.0], "Viewer A");
+        let n3 = WorkflowNode::new_input(3, [0.0, 100.0], &path, 4, 64);
+        let n4 = WorkflowNode::new_output(4, [100.0, 100.0], "Viewer B");
+        state.nodes = vec![n1, n2, n3, n4];
+        state.connections = vec![
+            NodeConnection { from_node: 1, to_node: 2 },
+            NodeConnection { from_node: 3, to_node: 4 },
+        ];
+
+        // When node 3 (Input in pipeline B) is selected, active output should be 4
+        state.selected_node = Some(3);
+        assert_eq!(state.get_active_output_node_id(), Some(4));
+
+        // Building hex providers for active output (pipeline B with page_length 4) should succeed
+        let (main_p, _raw_p) = state.build_hex_providers().expect("Should build hex provider for pipeline B");
+        assert_eq!(main_p.lock().get_metadata().page_length, 4);
+
+        // When node 1 (Input in pipeline A) is selected, active output should be 2
+        state.selected_node = Some(1);
+        assert_eq!(state.get_active_output_node_id(), Some(2));
+
+        // When node 4 is directly selected, active output should be 4
+        state.selected_node = Some(4);
+        assert_eq!(state.get_active_output_node_id(), Some(4));
     }
 }

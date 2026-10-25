@@ -492,7 +492,7 @@ impl AppWindow {
                 let raw_input = state.take_input();
                 let ppp = state.pixels_per_point();
 
-                let (main_prov_opt, raw_prov_opt, current_node_id) = {
+                let (main_prov_opt, raw_prov_opt, current_node_id, provider_err) = {
                     let wf = workflow_for_hex.lock().unwrap_or_else(|e| e.into_inner());
                     let displayed = if let Ok(ht) = hex_tab_draw.try_lock() {
                         ht.displayed_node_id
@@ -502,17 +502,23 @@ impl AppWindow {
                     match displayed {
                         Some(node_id) => {
                             match wf.build_data_provider(node_id) {
-                                Ok(p) => (Some(p), None, node_id),
-                                Err(_) => (None, None, node_id),
+                                Ok(p) => (Some(p), None, node_id, None),
+                                Err(e) => {
+                                    log::error!("Hex viewer: failed to build provider for node #{}: {}", node_id, e);
+                                    (None, None, node_id, Some(e))
+                                }
                             }
                         }
                         None => {
                             match wf.build_hex_providers() {
                                 Ok((main_p, raw_p)) => {
                                     let nid = wf.get_active_output_node_id().unwrap_or(0);
-                                    (Some(main_p), raw_p, nid)
+                                    (Some(main_p), raw_p, nid, None)
                                 }
-                                Err(_) => (None, None, 0),
+                                Err(e) => {
+                                    log::error!("Hex viewer: failed to build hex providers: {}", e);
+                                    (None, None, 0, Some(e))
+                                }
                             }
                         }
                     }
@@ -567,6 +573,7 @@ impl AppWindow {
                         &page_records_clone,
                         &entropy_vec,
                         current_node_id,
+                        provider_err.as_deref(),
                     );
                 });
 

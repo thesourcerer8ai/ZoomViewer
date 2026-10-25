@@ -19,7 +19,7 @@ impl FileLoader {
     ///
     /// # Arguments
     /// * `path` - Path to the dump file
-    /// * `page_length` - Bytes per page (500-100000)
+    /// * `page_length` - Bytes per page (1-100000)
     /// * `block_size` - Pages per block (64, 128, 256, 512, or 1024)
     ///
     /// # Returns
@@ -47,11 +47,17 @@ impl FileLoader {
             .map_err(|e| Error::IoError(e))?
             .len();
         
-        // Validate page length (500-100000 bytes)
-        if page_length < 500 || page_length > 100000 {
+        // Validate page length (1-100000 bytes)
+        if page_length < 1 || page_length > 100000 {
             return Err(Error::InvalidMetadata(
-                format!("Page length {} is outside valid range (500-100000)", page_length)
+                format!("Page length {} is outside valid range (1-100000)", page_length)
             ));
+        }
+        if page_length < 500 {
+            log::warn!(
+                "Page length {} is unusually small (< 500 bytes). This may be intentional for sub-page/column viewing.",
+                page_length
+            );
         }
         
         // Validate block size (64, 128, 256, 384, 512, 768, or 1024 pages per block)
@@ -268,7 +274,7 @@ mod tests {
     #[test]
     fn test_file_loader_new_invalid_page_length() {
         let file = create_test_file(1024 * 1024);
-        let loader = FileLoader::new(file.path(), 100, 64); // Too small
+        let loader = FileLoader::new(file.path(), 0, 64); // Zero is invalid
         assert!(loader.is_err());
     }
 
@@ -817,5 +823,24 @@ mod tests {
         ];
         let bytes = loader.read_fragments(fragments).unwrap();
         assert_eq!(bytes.len(), 400);
+    }
+
+    /// Test that small page lengths down to 1 byte are allowed, while 0 is rejected
+    #[test]
+    fn test_small_page_length_allowed() {
+        let file = create_test_file(1024 * 1024);
+        // Page length 4 and block size 64 should succeed
+        let loader = FileLoader::new(file.path(), 4, 64);
+        assert!(loader.is_ok());
+        let meta = loader.unwrap().get_metadata();
+        assert_eq!(meta.page_length, 4);
+
+        // Page length 1 should also succeed
+        let loader1 = FileLoader::new(file.path(), 1, 64);
+        assert!(loader1.is_ok());
+
+        // Page length 0 must fail
+        let loader0 = FileLoader::new(file.path(), 0, 64);
+        assert!(loader0.is_err());
     }
 }

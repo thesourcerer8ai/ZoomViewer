@@ -17,7 +17,7 @@ const VALID_BLOCK_SIZES: &[u32] = &[64, 128, 256, 384, 512, 768, 1024];
 
 /// Minimum page length in bytes
 /// Requirement 1.2, 15.1, 15.5
-const MIN_PAGE_LENGTH: u32 = 500;
+const MIN_PAGE_LENGTH: u32 = 1;
 
 /// Maximum page length in bytes
 /// Requirement 1.2, 15.1, 15.5
@@ -163,6 +163,12 @@ impl FileDialog {
             match input.parse::<u32>() {
                 Ok(page_length) => {
                     if self.validate_page_length(page_length) {
+                        if page_length < 500 {
+                            eprintln!(
+                                "Warning: Page length {} is unusually small (< 500 bytes).",
+                                page_length
+                            );
+                        }
                         return Ok(page_length);
                     } else {
                         // Task 18.3: Display error message for invalid input
@@ -292,7 +298,6 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let dialog = FileDialog::new(temp_dir.path());
 
-        assert!(!dialog.validate_page_length(499));
         assert!(!dialog.validate_page_length(100001));
         assert!(!dialog.validate_page_length(0));
     }
@@ -382,7 +387,7 @@ mod tests {
     #[test]
     fn test_page_length_bounds() {
         // Verify page length bounds match requirements
-        assert_eq!(MIN_PAGE_LENGTH, 500);
+        assert_eq!(MIN_PAGE_LENGTH, 1);
         assert_eq!(MAX_PAGE_LENGTH, 100000);
     }
 
@@ -422,12 +427,13 @@ mod tests {
         let dialog = FileDialog::new(temp_dir.path());
 
         // Test valid page lengths
+        assert!(dialog.validate_page_length(1));
+        assert!(dialog.validate_page_length(4));
         assert!(dialog.validate_page_length(500));
         assert!(dialog.validate_page_length(2048));
         assert!(dialog.validate_page_length(20000));
 
         // Test invalid page lengths
-        assert!(!dialog.validate_page_length(499));
         assert!(!dialog.validate_page_length(100001));
         assert!(!dialog.validate_page_length(0));
     }
@@ -663,7 +669,8 @@ mod tests {
         assert!(dialog.validate_block_size(128));
 
         // Verify invalid parameters are rejected
-        assert!(!dialog.validate_page_length(100));
+        assert!(!dialog.validate_page_length(0));
+        assert!(!dialog.validate_page_length(100001));
         assert!(!dialog.validate_block_size(100));
     }
 }

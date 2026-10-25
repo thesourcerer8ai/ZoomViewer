@@ -327,14 +327,23 @@ impl HexTabState {
         page_records: &[PageStructureRecord],
         entropy_per_page: &[Option<f32>],
         current_node_id: usize,
+        error_message: Option<&str>,
     ) {
         let Some(main_prov_arc) = main_provider_opt else {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(80.0);
-                    ui.heading("No Active Data Source Available");
-                    ui.add_space(10.0);
-                    ui.label("Configure an Input node connected to an OutputViewer in the Workflow Editor.");
+                    if let Some(err) = error_message {
+                        ui.heading("Data Provider Error");
+                        ui.add_space(10.0);
+                        ui.colored_label(egui::Color32::from_rgb(255, 100, 100), err);
+                        ui.add_space(10.0);
+                        ui.label("Check the node configuration in the Workflow Editor.");
+                    } else {
+                        ui.heading("No Active Data Source Available");
+                        ui.add_space(10.0);
+                        ui.label("Configure an Input node connected to an OutputViewer in the Workflow Editor.");
+                    }
                 });
             });
             return;
