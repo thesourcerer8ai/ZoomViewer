@@ -177,6 +177,8 @@ fn main() {
         (None, None)
     };
 
+    let worker_pool_arc = Arc::new(std::sync::Mutex::new(worker_pool));
+
     // Create main application window
     let _app_window = AppWindow::new(
         metadata.clone(),
@@ -185,6 +187,7 @@ fn main() {
         tile_rx,
         provider_opt.clone(),
         Some(workflow),
+        worker_pool_arc.clone(),
     );
 
     log::info!("NAND Flash Viewer initialized and ready");
@@ -193,7 +196,9 @@ fn main() {
     app.run().unwrap();
 
     // Cleanup
-    if let Some(wp) = worker_pool {
-        wp.shutdown();
-    }
+    if let Ok(mut wp_guard) = worker_pool_arc.lock() {
+        if let Some(mut wp) = wp_guard.take() {
+            wp.stop();
+        }
+    };
 }

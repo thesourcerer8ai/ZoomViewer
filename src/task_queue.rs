@@ -308,6 +308,7 @@ impl Default for TaskQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FileMetadata;
 
     #[test]
     fn test_enqueue_and_dequeue() {

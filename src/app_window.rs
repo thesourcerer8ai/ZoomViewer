@@ -5,7 +5,7 @@ use crate::{
     window_state::{WindowState as WindowGeometry, WindowStateManager},
     AddressDisplay, BacktrackingTabState, CacheManager, DumpDataProvider, FileMetadata, HexTabState, NandReaderTabState,
     PanController, PageStructureTabState, PatternWriterTabState, SearchTabState, TaskQueue,
-    TileCoord, Viewport, ViewportManager, ViewportRenderer, ZoomController,
+    TileCoord, Viewport, ViewportManager, ViewportRenderer, WorkerPool, ZoomController,
 };
 use crate::data_provider::BacktrackAddress;
 use fltk::{
@@ -64,6 +64,8 @@ pub struct AppWindow {
     task_queue: Arc<TaskQueue>,
     /// Cache manager
     cache: Arc<CacheManager>,
+    /// Background worker pool for tile generation
+    pub worker_pool: Arc<Mutex<Option<WorkerPool>>>,
     /// Viewport renderer for compositing tiles
     viewport_renderer: Arc<ViewportRenderer>,
     /// Current viewport image
@@ -114,6 +116,7 @@ impl AppWindow {
         tile_rx: Option<Receiver<TileCoord>>,
         file_loader: Option<Arc<parking_lot::Mutex<dyn DumpDataProvider>>>,
         initial_workflow: Option<WorkflowEditorState>,
+        worker_pool: Arc<Mutex<Option<WorkerPool>>>,
     ) -> Self {
         // Extract filename from path for window title
         let filename = std::path::Path::new(&metadata.path)
@@ -1070,6 +1073,7 @@ impl AppWindow {
             metadata: metadata.clone(),
             task_queue,
             cache: cache.clone(),
+            worker_pool: worker_pool.clone(),
             viewport_renderer: viewport_renderer.clone(),
             viewport_image: viewport_image.clone(),
             fltk_tile_cache: fltk_tile_cache.clone(),
@@ -1335,13 +1339,17 @@ impl AppWindow {
         let initial_identity = file_loader.as_ref().map(|fl| fl.lock().cache_identity()).unwrap_or_default();
         let current_identity_timer = Arc::new(Mutex::new(initial_identity));
         let metadata_timer = Arc::new(Mutex::new(metadata.clone()));
+        let task_queue_timer = app_window.task_queue.clone();
+        let worker_pool_timer = app_window.worker_pool.clone();
 
         // Channel for tile receiver bridge
         let (s, r) = fltk::app::channel::<TileCoord>();
+        let tile_sender_timer = s.clone();
         if let Some(rx) = tile_rx {
+            let s_bridge = s.clone();
             std::thread::spawn(move || {
                 while let Ok(coord) = rx.recv() {
-                    let _ = s.send(coord);
+                    let _ = s_bridge.send(coord);
                 }
             });
         }
@@ -1540,7 +1548,7 @@ impl AppWindow {
                                     tc.clear();
                                 }
                                 if let Ok(mut ident) = current_identity_timer.try_lock() {
-                                    *ident = new_ident;
+                                    *ident = format!("bt_{}_{}", target_node_id, new_ident);
                                 }
 
                                 let pl = new_meta.page_length as u64;
@@ -1586,6 +1594,43 @@ impl AppWindow {
                             let new_meta = provider.lock().get_metadata();
                             *metadata_timer.lock().unwrap() = new_meta.clone();
 
+                            // 1. Clear previous tasks from task queue
+                            task_queue_timer.clear();
+
+                            // 2. Stop old worker pool and start a new one for the new provider
+                            if let Ok(mut wp_guard) = worker_pool_timer.lock() {
+                                if let Some(mut wp) = wp_guard.take() {
+                                    wp.stop();
+                                }
+                                if let Ok(new_cache) = CacheManager::new(".cache", new_ident.clone()) {
+                                    let mut new_wp = WorkerPool::new(
+                                        (*task_queue_timer).clone(),
+                                        new_cache.clone(),
+                                        provider.clone(),
+                                        new_meta.clone(),
+                                    );
+                                    let new_rx = new_wp.take_tile_receiver();
+                                    new_wp.start(
+                                        (*task_queue_timer).clone(),
+                                        new_cache,
+                                        provider.clone(),
+                                        new_meta.clone(),
+                                    );
+                                    if let Some(rx) = new_rx {
+                                        let s_clone = tile_sender_timer.clone();
+                                        std::thread::spawn(move || {
+                                            while let Ok(coord) = rx.recv() {
+                                                let _ = s_clone.send(coord);
+                                            }
+                                        });
+                                    }
+                                    *wp_guard = Some(new_wp);
+                                }
+                            }
+
+                            // 3. Initialize low priority iterator for the new metadata
+                            task_queue_timer.init_low_priority_iterator(new_meta.clone());
+
                             if let Ok(new_cache) = CacheManager::new(".cache", new_ident) {
                                 viewport_renderer_clone.update_provider(provider, Arc::new(new_cache), new_meta.clone());
                             }
@@ -1610,25 +1655,21 @@ impl AppWindow {
                                     ht.goto_address_input = "0x00000000".to_string();
                                 }
                             }
-                            // Clear the cached identity so that the next iteration of section 3
-                            // always detects a "change" and calls update_provider() with the
-                            // correct OutputViewer provider, even if we were previously showing
-                            // a backtracking Leaf node's provider.
-                            // NOTE: cur_ident is already held — reuse it instead of locking again.
-                            *cur_ident = String::new();
                             tab_viewer_timer.activate();
-                            // NOTE: do NOT call redraw() here — we still hold the workflow lock.
-                            // redraw() can synchronously invoke draw closures that also lock
-                            // the workflow mutex → self-deadlock. Set a flag instead and
-                            // redraw after the workflow lock is dropped (see below).
                             need_redraw = true;
                         }
                     }
                     Err(_) => {
                         let mut cur_ident = current_identity_timer.lock().unwrap();
                         if !cur_ident.is_empty() {
-                            log::info!("No active workflow output provider available: disabling ZoomViewer tab");
+                            log::info!("No active workflow output provider available: stopping workers, clearing tasks and disabling ZoomViewer tab");
                             *cur_ident = String::new();
+                            task_queue_timer.clear();
+                            if let Ok(mut wp_guard) = worker_pool_timer.lock() {
+                                if let Some(mut wp) = wp_guard.take() {
+                                    wp.stop();
+                                }
+                            }
                             tab_viewer_timer.deactivate();
                         }
                     }
@@ -2318,7 +2359,7 @@ mod tests {
             CacheManager::new(temp_dir.path(), "test.bin".to_string()).unwrap(),
         );
 
-        let window = AppWindow::new(metadata, task_queue, cache, None, None, None);
+        let window = AppWindow::new(metadata, task_queue, cache, None, None, None, Arc::new(Mutex::new(None)));
         assert_eq!(window.metadata.page_length, 512);
         assert_eq!(window.metadata.block_size, 64);
     }
@@ -2334,7 +2375,7 @@ mod tests {
             CacheManager::new(temp_dir.path(), "test.bin".to_string()).unwrap(),
         );
 
-        let mut window = AppWindow::new(metadata, task_queue, cache, None, None, None);
+        let mut window = AppWindow::new(metadata, task_queue, cache, None, None, None, Arc::new(Mutex::new(None)));
         window.handle_mouse_move(100, 100);
         assert_eq!(window.mouse_x, 100);
         assert_eq!(window.mouse_y, 100);
@@ -2351,7 +2392,7 @@ mod tests {
             CacheManager::new(temp_dir.path(), "test.bin".to_string()).unwrap(),
         );
 
-        let window = AppWindow::new(metadata, task_queue, cache, None, None, None);
+        let window = AppWindow::new(metadata, task_queue, cache, None, None, None, Arc::new(Mutex::new(None)));
         let viewport = window.get_viewport();
 
         // Should start at level 0 (highest resolution)
