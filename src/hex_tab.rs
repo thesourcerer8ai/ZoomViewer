@@ -973,7 +973,7 @@ impl HexTabState {
                 // Column Header Bar
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("Block  Page  Offset   | ")
+                        egui::RichText::new("Block  Page  Offset| ")
                             .font(mono_font.clone())
                             .color(Color32::from_rgb(160, 160, 170)),
                     );
