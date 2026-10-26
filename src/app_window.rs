@@ -392,6 +392,11 @@ impl AppWindow {
         let search_egui_state_draw = search_egui_state.clone();
         let search_egui_ctx_draw = search_egui_ctx.clone();
         let workflow_for_search = workflow_state.clone();
+        // Cached last-good search provider so transient lock failures don't flash
+        // "No valid provider" for a single frame.
+        type CachedSearchProvider = Option<Arc<parking_lot::Mutex<dyn DumpDataProvider>>>;
+        let last_search_provider: Arc<parking_lot::Mutex<(String, CachedSearchProvider)>> =
+            Arc::new(parking_lot::Mutex::new((String::new(), None)));
 
         gl_search.draw(move |w| {
             if !w.shown() {
@@ -407,10 +412,30 @@ impl AppWindow {
                 let ppp = state.pixels_per_point();
 
                 let (target_name, provider_opt) = {
-                    let wf = workflow_for_search.lock().unwrap();
-                    match wf.build_search_provider() {
-                        Ok((_id, name, prov)) => (name, Some(prov)),
-                        Err(e) => (format!("None ({})", e), None),
+                    // Use try_lock to avoid blocking the draw thread when the timer
+                    // holds the workflow lock. Fall back to the last known-good provider
+                    // so the tab never flashes "No valid provider" mid-frame.
+                    match workflow_for_search.try_lock() {
+                        Ok(wf) => match wf.build_search_provider() {
+                            Ok((_id, name, prov)) => {
+                                let mut cached = last_search_provider.lock();
+                                *cached = (name.clone(), Some(prov.clone()));
+                                (name, Some(prov))
+                            }
+                            Err(e) => {
+                                let cached = last_search_provider.lock();
+                                if cached.1.is_some() {
+                                    (cached.0.clone(), cached.1.clone())
+                                } else {
+                                    (format!("None ({})", e), None)
+                                }
+                            }
+                        },
+                        Err(_) => {
+                            // Lock held by timer — return last good provider without blocking
+                            let cached = last_search_provider.lock();
+                            (cached.0.clone(), cached.1.clone())
+                        }
                     }
                 };
 
@@ -689,6 +714,10 @@ impl AppWindow {
         let ps_egui_ctx_draw = ps_egui_ctx.clone();
         let workflow_for_ps = workflow_state.clone();
 
+        // Cache last known page_length so Page Structure tab doesn't reset to None during
+        // transient workflow lock contention.
+        let last_ps_page_length: Arc<parking_lot::Mutex<Option<u32>>> = Arc::new(parking_lot::Mutex::new(None));
+
         gl_page_structure.draw(move |w| {
             if !w.shown() {
                 return;
@@ -703,8 +732,16 @@ impl AppWindow {
                 let ppp = state.pixels_per_point();
 
                 let active_page_length = {
-                    let wf = workflow_for_ps.lock().unwrap();
-                    wf.active_page_length()
+                    match workflow_for_ps.try_lock() {
+                        Ok(wf) => {
+                            let pl = wf.active_page_length();
+                            if pl.is_some() {
+                                *last_ps_page_length.lock() = pl;
+                            }
+                            pl
+                        }
+                        Err(_) => *last_ps_page_length.lock(),
+                    }
                 };
 
                 let full_output = ps_egui_ctx_draw.run(raw_input, |ctx| {

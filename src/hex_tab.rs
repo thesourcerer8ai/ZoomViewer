@@ -890,17 +890,43 @@ impl HexTabState {
         });
         texture.set(color_image, TextureOptions::NEAREST);
 
-        // Display with integer pixel scaling to avoid blurry sub-pixel rendering.
-        // Choose the largest integer scale factor that fits the available width.
-        let avail_w = ui.available_width() - 10.0;
-        let pixel_scale = if bit_w as f32 * 2.0 <= avail_w { 2.0_f32 } else { 1.0_f32 };
-        let display_width = (bit_w as f32 * pixel_scale).min(avail_w);
-        let display_height = match self.mini_nand_position {
-            MiniNandPosition::Top => (bit_h as f32 * 2.0).clamp(32.0, 70.0),
-            _ => (bit_h as f32 * pixel_scale).clamp(60.0, 160.0),
+        // In Top mode: shift bitmap to the right so it aligns with the start of the hex columns.
+        // The hex columns begin immediately after the row prefix "Block  Page  Offset| ".
+        // We measure the exact text width using the active monospace font.
+        let prefix_width = if self.mini_nand_position == MiniNandPosition::Top {
+            let mono_font = FontId::new(self.font_size, FontFamily::Monospace);
+            ui.painter()
+                .layout_no_wrap("Block  Page  Offset| ".to_string(), mono_font, Color32::WHITE)
+                .size()
+                .x
+        } else {
+            0.0
         };
 
-        let (rect, response) = ui.allocate_exact_size(vec2(display_width, display_height), Sense::click());
+        // Available dimensions for the bitmap
+        let avail_w = (ui.available_width() - prefix_width - 10.0).max(10.0);
+        let max_bitmap_h = match self.mini_nand_position {
+            MiniNandPosition::Top => (ui.available_height() * 0.30).clamp(70.0, 160.0),
+            _ => (ui.available_height() * 0.85).clamp(80.0, 400.0),
+        };
+
+        // Select the largest integer scale factor (4x, 3x, 2x, 1x) that fits both width and height,
+        // guaranteeing perfectly square (isotropic) pixels with 0 distortion.
+        let pixel_scale = Self::calc_mini_nand_scale(bit_w, bit_h, avail_w, max_bitmap_h);
+
+        let display_width = bit_w as f32 * pixel_scale;
+        let display_height = bit_h as f32 * pixel_scale;
+
+        let (rect, response) = if prefix_width > 0.0 {
+            ui.horizontal(|ui| {
+                ui.style_mut().spacing.item_spacing.x = 0.0;
+                ui.add_space(prefix_width);
+                ui.allocate_exact_size(vec2(display_width, display_height), Sense::click())
+            })
+            .inner
+        } else {
+            ui.allocate_exact_size(vec2(display_width, display_height), Sense::click())
+        };
 
         // Draw border and image
         ui.painter().rect_filled(rect, Rounding::ZERO, Color32::from_rgb(20, 20, 25));
@@ -1990,6 +2016,19 @@ impl HexTabState {
         let block_stride = pl * bs;
         block * block_stride + page * pl + offset_in_page
     }
+
+    /// Calculate the largest integer scale factor (4x, 3x, 2x, 1x) that fits both available
+    /// width and maximum height, guaranteeing isotropic (square) pixels without distortion.
+    pub fn calc_mini_nand_scale(bit_w: usize, bit_h: usize, avail_w: f32, max_h: f32) -> f32 {
+        [4.0_f32, 3.0, 2.0, 1.0]
+            .into_iter()
+            .find(|&scale| {
+                let w = bit_w as f32 * scale;
+                let h = bit_h as f32 * scale;
+                w <= avail_w && h <= max_h
+            })
+            .unwrap_or(1.0)
+    }
 }
 
 #[cfg(test)]
@@ -2144,4 +2183,44 @@ mod tests {
         assert!(total_rows_h <= available_height);
         assert!(visible_pages >= 2);
     }
+
+    #[test]
+    fn test_mini_nand_isotropic_pixel_scale() {
+        // bit_w = 32 bytes * 8 = 256 bits, bit_h = 35 pages
+        let bit_w = 256;
+        let bit_h = 35;
+
+        // Large screen (avail_w = 1200, max_h = 150): 4x fits (1024x140)
+        let scale_large = HexTabState::calc_mini_nand_scale(bit_w, bit_h, 1200.0, 150.0);
+        assert_eq!(scale_large, 4.0);
+        assert_eq!(bit_w as f32 * scale_large, 1024.0);
+        assert_eq!(bit_h as f32 * scale_large, 140.0);
+
+        // Medium width (avail_w = 850, max_h = 150): 4x doesn't fit width (1024 > 850), 3x fits (768x105)
+        let scale_med = HexTabState::calc_mini_nand_scale(bit_w, bit_h, 850.0, 150.0);
+        assert_eq!(scale_med, 3.0);
+        assert_eq!(bit_w as f32 * scale_med, 768.0);
+        assert_eq!(bit_h as f32 * scale_med, 105.0);
+
+        // Medium height constraint (avail_w = 1200, max_h = 80): 4x and 3x exceed max_h, 2x fits (512x70)
+        let scale_h_constrained = HexTabState::calc_mini_nand_scale(bit_w, bit_h, 1200.0, 80.0);
+        assert_eq!(scale_h_constrained, 2.0);
+        assert_eq!(bit_w as f32 * scale_h_constrained, 512.0);
+        assert_eq!(bit_h as f32 * scale_h_constrained, 70.0);
+
+        // Small screen (avail_w = 300, max_h = 50): 1x fits (256x35)
+        let scale_small = HexTabState::calc_mini_nand_scale(bit_w, bit_h, 300.0, 50.0);
+        assert_eq!(scale_small, 1.0);
+        assert_eq!(bit_w as f32 * scale_small, 256.0);
+        assert_eq!(bit_h as f32 * scale_small, 35.0);
+
+        // Aspect ratio is always strictly 1:1 (square pixels)
+        for s in [scale_large, scale_med, scale_h_constrained, scale_small] {
+            let dw = bit_w as f32 * s;
+            let dh = bit_h as f32 * s;
+            let ratio = (dw / bit_w as f32) / (dh / bit_h as f32);
+            assert!((ratio - 1.0).abs() < 1e-6);
+        }
+    }
 }
+
