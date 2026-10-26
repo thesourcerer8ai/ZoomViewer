@@ -1240,9 +1240,11 @@ impl AppWindow {
                         drop(viewport_img);
                         
                         if let Ok(fltk_img) = fltk::image::RgbImage::new(&raw_data, width, height, ColorDepth::Rgba8) {
-                            viewport_frame_for_events.lock().unwrap().set_image(Some(fltk_img));
-                            // lock dropped before redraw to avoid self-deadlock
-                            viewport_frame_for_events.lock().unwrap().redraw();
+                            {
+                                let mut frame = viewport_frame_for_events.lock().unwrap();
+                                frame.set_image(Some(fltk_img));
+                                frame.redraw(); // redraw() inside same lock scope — no re-acquire
+                            }
                             fltk::app::awake(); // Force event loop to process
                         }
                         
@@ -1693,18 +1695,26 @@ impl AppWindow {
                             need_redraw = true;
                         }
                     }
-                    Err(_) => {
-                        let mut cur_ident = current_identity_timer.lock().unwrap();
-                        if !cur_ident.is_empty() {
-                            log::info!("No active workflow output provider available: stopping workers, clearing tasks and disabling ZoomViewer tab");
-                            *cur_ident = String::new();
-                            task_queue_timer.clear();
-                            if let Ok(mut wp_guard) = worker_pool_timer.lock() {
-                                if let Some(mut wp) = wp_guard.take() {
-                                    wp.stop();
+                    Err(e) => {
+                        // Transient errors (lock contention, cache still loading) contain
+                        // "retrying next tick" — silently skip this tick, keep the previous
+                        // provider stable.  Only stop workers and disable the tab when there
+                        // is genuinely no OutputViewer node or connection.
+                        if e.contains("retrying next tick") {
+                            log::debug!("build_active_output_provider transient: {}", e);
+                        } else {
+                            let mut cur_ident = current_identity_timer.lock().unwrap();
+                            if !cur_ident.is_empty() {
+                                log::info!("No active workflow output provider available: stopping workers, clearing tasks and disabling ZoomViewer tab");
+                                *cur_ident = String::new();
+                                task_queue_timer.clear();
+                                if let Ok(mut wp_guard) = worker_pool_timer.lock() {
+                                    if let Some(mut wp) = wp_guard.take() {
+                                        wp.stop();
+                                    }
                                 }
+                                tab_viewer_timer.deactivate();
                             }
-                            tab_viewer_timer.deactivate();
                         }
                     }
                 }
@@ -1732,8 +1742,8 @@ impl AppWindow {
                     {
                         let mut frame = viewport_frame_clone.lock().unwrap();
                         frame.set_image(Some(fltk_img));
+                        frame.redraw(); // redraw() inside same lock scope — no re-acquire
                     } // lock dropped here
-                    viewport_frame_clone.lock().unwrap().redraw();
                 }
             }
 

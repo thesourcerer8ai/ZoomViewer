@@ -276,7 +276,8 @@ pub enum WorkflowNodeKind {
         /// Also compute 32-bit differential entropy (XOR of consecutive 32-bit words).
         compute_32bit: bool,
         /// Per-page entropy results accumulated during analysis.
-        #[serde(default)]
+        /// Skipped during serialization so workflow.json remains small (CSV is single source of truth).
+        #[serde(default, skip_serializing)]
         results: Vec<EntropyResult>,
         /// Cluster filter applied when building the data provider.
         /// `All` (the default) passes every page through unchanged.
@@ -863,8 +864,10 @@ pub fn load_entropy_results_from_csv(path: &Path) -> Vec<EntropyResult> {
         Ok(f) => f,
         Err(_) => return Vec::new(),
     };
-    let mut reader = BufReader::new(file);
-    let mut results = Vec::new();
+    let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let cap = (file_len / ENTROPY_CSV_ROW_BYTES as u64) as usize;
+    let mut reader = BufReader::with_capacity(1024 * 1024, file);
+    let mut results = Vec::with_capacity(cap);
     let mut buf = [0u8; ENTROPY_CSV_ROW_BYTES];
     loop {
         match reader.read_exact(&mut buf) {
@@ -1754,10 +1757,12 @@ impl WorkflowEditorState {
                 );
                 Ok(Arc::new(Mutex::new(filtered)) as Arc<Mutex<dyn DumpDataProvider>>)
             }
-            WorkflowNodeKind::Entropy { log_path, compute_32bit, cluster_filter, .. } => {
+            WorkflowNodeKind::Entropy { log_path, compute_32bit, cluster_filter, results: node_results, .. } => {
                 let log_path = log_path.clone();
                 let compute_32bit = *compute_32bit;
                 let cluster_filter = *cluster_filter;
+                // Snapshot node results before any lock (they are already in-memory from JSON/analysis).
+                let node_results_snapshot: Vec<EntropyResult> = node_results.clone();
                 let incoming = self.connections.iter()
                     .find(|c| c.to_node == target_node_id)
                     .ok_or_else(|| format!("Entropy node #{} has no input connected", target_node_id))?;
@@ -1766,9 +1771,9 @@ impl WorkflowEditorState {
                 // Get or create the shared entropy cache for this node.
                 // build_data_provider is always called while the workflow lock is held.
                 // Worker threads (EntropyDataProvider::read_bytes) hold the per-node cache
-                // lock and may also need the workflow lock → classic deadlock if we block here.
-                // Solution: use try_lock(); if unavailable return an unfiltered provider for
-                // this call — the next rebuild (50 ms later) will succeed.
+                // lock. On contention, return Err so the caller keeps the previous stable
+                // provider — do NOT return an unfiltered provider, which would change the
+                // cache_identity() and trigger a spurious worker-pool restart.
                 let cache: Arc<Mutex<HashMap<u64, EntropyResult>>> = {
                     match self.entropy_caches.try_lock() {
                         Some(mut map) => map
@@ -1776,18 +1781,12 @@ impl WorkflowEditorState {
                             .or_insert_with(|| Arc::new(Mutex::new(HashMap::new())))
                             .clone(),
                         None => {
-                            // Cache lock contended — return unfiltered provider this tick.
-                            let provider = EntropyDataProvider::new(
-                                upstream,
-                                Arc::new(Mutex::new(HashMap::new())),
-                                if log_path.trim().is_empty() {
-                                    entropy_csv_default_path(target_node_id)
-                                } else {
-                                    PathBuf::from(&log_path)
-                                },
-                                compute_32bit,
-                            );
-                            return Ok(Arc::new(Mutex::new(provider)) as Arc<Mutex<dyn DumpDataProvider>>);
+                            // Cache map temporarily locked by a worker — signal the caller
+                            // to keep the previous provider unchanged this tick.
+                            return Err(format!(
+                                "Entropy cache for node #{} temporarily locked; retrying next tick",
+                                target_node_id
+                            ));
                         }
                     }
                 };
@@ -1799,15 +1798,32 @@ impl WorkflowEditorState {
                     PathBuf::from(&log_path)
                 };
 
-                // Pre-load previously computed results from the CSV into the cache,
-                // but ONLY if the cache is currently empty — avoid re-reading a 60MB
-                // file on every provider rebuild (which happens every 50ms and on every
-                // Jump, draw call, etc.).
+                // Seed the shared cache if it is empty.
+                // Check if disk CSV has more entries (e.g. complete entropy0.csv) than the
+                // in-memory snapshot (which may be truncated in workflow.json).
                 if let Some(mut c) = cache.try_lock() {
                     if c.is_empty() {
-                        let existing = load_entropy_results_from_csv(&effective_path);
-                        for r in existing {
-                            c.entry(r.page).or_insert(r);
+                        let csv_rows = fs::metadata(&effective_path)
+                            .map(|m| m.len() / ENTROPY_CSV_ROW_BYTES as u64)
+                            .unwrap_or(0);
+                        if csv_rows > node_results_snapshot.len() as u64 {
+                            // Disk CSV has more complete data than the in-memory snapshot.
+                            let existing = load_entropy_results_from_csv(&effective_path);
+                            c.reserve(existing.len());
+                            for r in existing {
+                                c.entry(r.page).or_insert(r);
+                            }
+                        } else if !node_results_snapshot.is_empty() {
+                            c.reserve(node_results_snapshot.len());
+                            for r in &node_results_snapshot {
+                                c.entry(r.page).or_insert_with(|| r.clone());
+                            }
+                        } else if csv_rows > 0 {
+                            let existing = load_entropy_results_from_csv(&effective_path);
+                            c.reserve(existing.len());
+                            for r in existing {
+                                c.entry(r.page).or_insert(r);
+                            }
                         }
                     }
                 }
@@ -1818,15 +1834,10 @@ impl WorkflowEditorState {
                     return Ok(Arc::new(Mutex::new(provider)) as Arc<Mutex<dyn DumpDataProvider>>);
                 }
 
-                // Build the filtered page list from the pre-loaded cache.
-                // If the cache is empty or contended, return empty result for this tick.
+                // Build the filtered page list from the cache.
+                // If the cache is temporarily locked by a worker thread, return Err so the caller
+                // keeps the previous stable provider rather than flipping identity.
                 let matching_pages: Vec<u64> = match cache.try_lock() {
-                    Some(c) if c.is_empty() => {
-                        let entropy_arc = Arc::new(Mutex::new(provider)) as Arc<Mutex<dyn DumpDataProvider>>;
-                        let label = format!("entropy_cluster_{}", cluster_filter.label());
-                        let filtered = SearchFilteredDataProvider::new(entropy_arc, vec![], label);
-                        return Ok(Arc::new(Mutex::new(filtered)) as Arc<Mutex<dyn DumpDataProvider>>);
-                    }
                     Some(c) => {
                         let mut pages: Vec<u64> = c
                             .values()
@@ -1836,7 +1847,13 @@ impl WorkflowEditorState {
                         pages.sort_unstable();
                         pages
                     }
-                    None => vec![],
+                    None => {
+                        // Per-page cache temporarily locked — keep previous provider.
+                        return Err(format!(
+                            "Entropy page cache for node #{} temporarily locked; retrying next tick",
+                            target_node_id
+                        ));
+                    }
                 };
 
                 let entropy_arc = Arc::new(Mutex::new(provider)) as Arc<Mutex<dyn DumpDataProvider>>;
@@ -2847,20 +2864,39 @@ impl WorkflowEditorState {
                 }
             }
             // Write entropy CSV log now that the mutable node borrow is released.
-            let entropy_log_info: Option<(String, Vec<EntropyResult>)> =
+            let entropy_log_info: Option<(PathBuf, Vec<EntropyResult>)> =
                 self.nodes.iter().find(|n| n.id == node_id).and_then(|n| {
                     if let WorkflowNodeKind::Entropy { log_path, results, .. } = &n.kind {
-                        if !log_path.trim().is_empty() {
-                            return Some((log_path.clone(), results.clone()));
-                        }
+                        let path = if log_path.trim().is_empty() {
+                            entropy_csv_default_path(node_id)
+                        } else {
+                            PathBuf::from(log_path)
+                        };
+                        return Some((path, results.clone()));
                     }
                     None
                 });
             if let Some((lp, snap)) = entropy_log_info {
-                if let Err(e) = write_entropy_csv(&lp, &snap) {
-                    log::warn!("Failed to write entropy CSV '{}': {}", lp, e);
+                if let Err(e) = write_entropy_csv(lp.to_str().unwrap_or(""), &snap) {
+                    log::warn!("Failed to write entropy CSV '{}': {}", lp.display(), e);
                 } else {
-                    log::info!("Entropy CSV written to '{}'", lp);
+                    log::info!("Entropy CSV written to '{}'", lp.display());
+                }
+                // Also immediately seed/update the in-memory cache for this node
+                let node_cache = if let Some(mut map) = self.entropy_caches.try_lock() {
+                    Some(map.entry(node_id)
+                        .or_insert_with(|| Arc::new(Mutex::new(HashMap::new())))
+                        .clone())
+                } else {
+                    None
+                };
+                if let Some(node_cache) = node_cache {
+                    if let Some(mut c) = node_cache.try_lock() {
+                        c.reserve(snap.len());
+                        for r in snap {
+                            c.insert(r.page, r);
+                        }
+                    }
                 }
             }
         }
@@ -4121,12 +4157,16 @@ impl WorkflowEditorState {
                                         action_cancel_search = Some(node_id);
                                     }
                                 } else {
-                                    if results.is_empty() {
-                                        ui.colored_label(
-                                            egui::Color32::from_rgb(180, 180, 180),
-                                            "No results yet — click 🔬 Start Analysis",
-                                        );
+                                    let effective_path = if log_path.trim().is_empty() {
+                                        entropy_csv_default_path(node_id)
                                     } else {
+                                        PathBuf::from(&log_path)
+                                    };
+                                    let csv_rows = fs::metadata(&effective_path)
+                                        .map(|m| m.len() / ENTROPY_CSV_ROW_BYTES as u64)
+                                        .unwrap_or(0);
+
+                                    if !results.is_empty() {
                                         let min_e = results.iter().map(|r| r.entropy_8).fold(f32::INFINITY, f32::min);
                                         let max_e = results.iter().map(|r| r.entropy_8).fold(f32::NEG_INFINITY, f32::max);
                                         let avg_e = results.iter().map(|r| r.entropy_8).sum::<f32>() / results.len() as f32;
@@ -4150,6 +4190,16 @@ impl WorkflowEditorState {
                                                 ui.label(format!("  Page {}: {:.4}{}", r.page, r.entropy_8, e32_str));
                                             }
                                         });
+                                    } else if csv_rows > 0 {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(100, 230, 140),
+                                            format!("✔ CSV has {} pages ({})", csv_rows, effective_path.display()),
+                                        );
+                                    } else {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(180, 180, 180),
+                                            "No results yet — click 🔬 Start Analysis",
+                                        );
                                     }
                                     ui.add_space(2.0);
                                     if ui.button("🔬 Start Analysis")
@@ -5344,4 +5394,121 @@ mod tests {
         state.selected_node = Some(4);
         assert_eq!(state.get_active_output_node_id(), Some(4));
     }
+
+    #[test]
+    fn test_entropy_provider_seeds_from_larger_csv_and_filters_e32low() {
+        let dir = tempfile::tempdir().unwrap();
+        let input_path = dir.path().join("test.bin");
+        let csv_path = dir.path().join("test_entropy.csv");
+        fs::write(&input_path, vec![0xAA; 512 * 5]).unwrap();
+
+        // Write 5 rows to CSV: pages 0, 1, 4 match E32Low (e8 in (0.9, 1.0) and e32 < 0.1)
+        {
+            let mut file = fs::File::create(&csv_path).unwrap();
+            write_entropy_csv_row(&mut file, 0, 0.95, Some(0.02)).unwrap();
+            write_entropy_csv_row(&mut file, 1, 0.92, Some(0.01)).unwrap();
+            write_entropy_csv_row(&mut file, 2, 0.50, Some(0.50)).unwrap();
+            write_entropy_csv_row(&mut file, 3, 7.95, Some(7.95)).unwrap();
+            write_entropy_csv_row(&mut file, 4, 0.98, Some(0.03)).unwrap();
+        }
+
+        // Simulate truncated results in workflow.json (only page 0)
+        let partial_node_results = vec![
+            EntropyResult { page: 0, entropy_8: 0.95, entropy_32: Some(0.02) }
+        ];
+
+        let entropy_node = WorkflowNode {
+            id: 2,
+            name: "Entropy".to_string(),
+            pos: [100.0, 0.0],
+            kind: WorkflowNodeKind::Entropy {
+                log_path: csv_path.to_str().unwrap().to_string(),
+                compute_32bit: true,
+                results: partial_node_results,
+                cluster_filter: EntropyCluster::E32Low,
+            },
+            status: NodeExecutionStatus::Idle,
+            output_log: String::new(),
+            collapsed: false,
+        };
+
+        let state = WorkflowEditorState {
+            next_node_id: 4,
+            nodes: vec![
+                WorkflowNode::new_input(1, [0.0, 0.0], input_path.to_str().unwrap(), 512, 64),
+                entropy_node,
+                WorkflowNode::new_output(3, [200.0, 0.0], "Viewer"),
+            ],
+            connections: vec![
+                NodeConnection { from_node: 1, to_node: 2 },
+                NodeConnection { from_node: 2, to_node: 3 },
+            ],
+            selected_node: Some(3),
+            connecting_from: None,
+            status_message: String::new(),
+            file_browser_open: HashMap::new(),
+            file_browser_path: HashMap::new(),
+            file_browser_show_all: HashMap::new(),
+            pending_xor_offer: None,
+            active_searches: Arc::new(Mutex::new(HashMap::new())),
+            active_fuse_mounts: Arc::new(Mutex::new(HashMap::new())),
+            node_rects: HashMap::new(),
+            page_structure: None,
+            healing_stats_cache: HashMap::new(),
+            healing_stats: Arc::new(Mutex::new(HashMap::new())),
+            entropy_caches: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        let provider = state.build_data_provider(3).expect("Should build provider for output node");
+        let meta = provider.lock().get_metadata();
+        // Since CSV had 5 entries (> 1 in node.results), it must have loaded CSV
+        // and matched pages 0, 1, 4 -> exactly 3 pages.
+        assert_eq!(meta.total_pages, 3, "Expected 3 matching pages for E32Low from full CSV");
+
+        // Verify reading from the filtered provider works
+        let data = provider.lock().read_bytes(0, 512).expect("Read first filtered page");
+        assert_eq!(data.len(), 512);
+        assert_eq!(data[0], 0xAA);
+    }
+
+    #[test]
+    fn test_entropy_node_serialization_skips_results() {
+        // Create an Entropy node with many in-memory results
+        let dummy_results: Vec<EntropyResult> = (0..5000)
+            .map(|i| EntropyResult { page: i, entropy_8: 5.5, entropy_32: Some(5.0) })
+            .collect();
+
+        let node = WorkflowNode {
+            id: 1,
+            name: "Entropy Analysis".to_string(),
+            pos: [100.0, 100.0],
+            kind: WorkflowNodeKind::Entropy {
+                log_path: "entropy0.csv".to_string(),
+                compute_32bit: true,
+                results: dummy_results,
+                cluster_filter: EntropyCluster::E32Low,
+            },
+            status: NodeExecutionStatus::Completed,
+            output_log: "Summary".to_string(),
+            collapsed: false,
+        };
+
+        let json = serde_json::to_string_pretty(&node).expect("Serialize node");
+        // Verify results array is NOT serialized in the JSON
+        assert!(!json.contains("\"results\""), "Serialized JSON must not contain 'results' field");
+        assert!(json.contains("\"log_path\": \"entropy0.csv\""));
+        assert!(json.contains("\"cluster_filter\": \"E32Low\""));
+        assert!(json.len() < 1000, "Serialized node JSON should be tiny (< 1KB), got {} bytes", json.len());
+
+        // Verify deserializing back produces an empty results vector
+        let deserialized: WorkflowNode = serde_json::from_str(&json).expect("Deserialize node");
+        if let WorkflowNodeKind::Entropy { results, log_path, cluster_filter, .. } = deserialized.kind {
+            assert!(results.is_empty(), "Deserialized results should default to empty Vec");
+            assert_eq!(log_path, "entropy0.csv");
+            assert_eq!(cluster_filter, EntropyCluster::E32Low);
+        } else {
+            panic!("Expected WorkflowNodeKind::Entropy");
+        }
+    }
 }
+
