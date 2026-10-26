@@ -485,7 +485,9 @@ impl AppWindow {
         );
         let last_hex_cached_providers: Arc<parking_lot::Mutex<CachedHexProviders>> =
             Arc::new(parking_lot::Mutex::new((None, None, 0)));
-        let last_entropy_vec: Arc<parking_lot::Mutex<Vec<Option<f32>>>> = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        // (base_page, entropy_values) — page tracked so stale data from a different scroll
+        // position is not applied as a tint to the wrong rows.
+        let last_entropy_vec: Arc<parking_lot::Mutex<(u64, Vec<Option<f32>>)>> = Arc::new(parking_lot::Mutex::new((0, Vec::new())));
 
         gl_hex.draw(move |w| {
             if !w.shown() {
@@ -521,11 +523,17 @@ impl AppWindow {
                                     (Some(p), None, node_id, None)
                                 }
                                 Err(e) => {
-                                    if e.contains("retrying next tick") {
-                                        let cached = last_hex_cached_providers.lock();
+                                    // Any error (transient lock contention OR genuine failure):
+                                    // fall back to the last successfully built provider so the UI
+                                    // never flickers to "Data Provider Error" mid-frame.
+                                    // Only log non-transient failures.
+                                    if !e.contains("retrying next tick") {
+                                        log::error!("Hex viewer: failed to build provider for node #{}: {}", node_id, e);
+                                    }
+                                    let cached = last_hex_cached_providers.lock();
+                                    if cached.0.is_some() {
                                         (cached.0.clone(), cached.1.clone(), cached.2, None)
                                     } else {
-                                        log::error!("Hex viewer: failed to build provider for node #{}: {}", node_id, e);
                                         (None, None, node_id, Some(e))
                                     }
                                 }
@@ -540,11 +548,15 @@ impl AppWindow {
                                     (Some(main_p), raw_p, nid, None)
                                 }
                                 Err(e) => {
-                                    if e.contains("retrying next tick") {
-                                        let cached = last_hex_cached_providers.lock();
+                                    // Any error: fall back to last good provider to avoid
+                                    // flickering to the error/empty screen mid-frame.
+                                    if !e.contains("retrying next tick") {
+                                        log::error!("Hex viewer: failed to build hex providers: {}", e);
+                                    }
+                                    let cached = last_hex_cached_providers.lock();
+                                    if cached.0.is_some() {
                                         (cached.0.clone(), cached.1.clone(), cached.2, None)
                                     } else {
-                                        log::error!("Hex viewer: failed to build hex providers: {}", e);
                                         (None, None, 0, Some(e))
                                     }
                                 }
@@ -597,12 +609,15 @@ impl AppWindow {
                     let wf = workflow_for_hex.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(batch) = wf.get_page_entropy_batch(&source_pages) {
                         let mut last = last_entropy_vec.lock();
-                        *last = batch.clone();
+                        *last = (base_page, batch.clone());
                         batch
                     } else {
                         let last = last_entropy_vec.lock();
-                        if last.len() == 128 {
-                            last.clone()
+                        // Only reuse cached entropy if it was computed for the same base_page.
+                        // Using stale entropy from a different scroll position causes flickering
+                        // because different pages have different entropy values.
+                        if last.0 == base_page && last.1.len() == 128 {
+                            last.1.clone()
                         } else {
                             vec![None; 128]
                         }

@@ -890,12 +890,15 @@ impl HexTabState {
         });
         texture.set(color_image, TextureOptions::NEAREST);
 
-        // Display with scaling
+        // Display with integer pixel scaling to avoid blurry sub-pixel rendering.
+        // Choose the largest integer scale factor that fits the available width.
+        let avail_w = ui.available_width() - 10.0;
+        let pixel_scale = if bit_w as f32 * 2.0 <= avail_w { 2.0_f32 } else { 1.0_f32 };
+        let display_width = (bit_w as f32 * pixel_scale).min(avail_w);
         let display_height = match self.mini_nand_position {
             MiniNandPosition::Top => (bit_h as f32 * 2.0).clamp(32.0, 70.0),
-            _ => (bit_h as f32 * 3.0).clamp(60.0, 160.0),
+            _ => (bit_h as f32 * pixel_scale).clamp(60.0, 160.0),
         };
-        let display_width = (bit_w as f32 * 1.5).min(ui.available_width() - 10.0);
 
         let (rect, response) = ui.allocate_exact_size(vec2(display_width, display_height), Sense::click());
 
