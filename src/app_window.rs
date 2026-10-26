@@ -478,6 +478,14 @@ impl AppWindow {
         let workflow_for_hex = workflow_state.clone();
         let search_tab_for_hex = search_tab_state.clone();
         let page_structure_for_hex = page_structure_state.clone();
+        type CachedHexProviders = (
+            Option<Arc<parking_lot::Mutex<dyn DumpDataProvider>>>,
+            Option<Arc<parking_lot::Mutex<dyn DumpDataProvider>>>,
+            usize,
+        );
+        let last_hex_cached_providers: Arc<parking_lot::Mutex<CachedHexProviders>> =
+            Arc::new(parking_lot::Mutex::new((None, None, 0)));
+        let last_entropy_vec: Arc<parking_lot::Mutex<Vec<Option<f32>>>> = Arc::new(parking_lot::Mutex::new(Vec::new()));
 
         gl_hex.draw(move |w| {
             if !w.shown() {
@@ -492,7 +500,12 @@ impl AppWindow {
                 let raw_input = state.take_input();
                 let ppp = state.pixels_per_point();
 
-                let (main_prov_opt, raw_prov_opt, current_node_id, provider_err) = {
+                let (main_prov_opt, raw_prov_opt, current_node_id, provider_err): (
+                    Option<Arc<parking_lot::Mutex<dyn DumpDataProvider>>>,
+                    Option<Arc<parking_lot::Mutex<dyn DumpDataProvider>>>,
+                    usize,
+                    Option<String>,
+                ) = {
                     let wf = workflow_for_hex.lock().unwrap_or_else(|e| e.into_inner());
                     let displayed = if let Ok(ht) = hex_tab_draw.try_lock() {
                         ht.displayed_node_id
@@ -502,10 +515,19 @@ impl AppWindow {
                     match displayed {
                         Some(node_id) => {
                             match wf.build_data_provider(node_id) {
-                                Ok(p) => (Some(p), None, node_id, None),
+                                Ok(p) => {
+                                    let mut cached = last_hex_cached_providers.lock();
+                                    *cached = (Some(p.clone()), None, node_id);
+                                    (Some(p), None, node_id, None)
+                                }
                                 Err(e) => {
-                                    log::error!("Hex viewer: failed to build provider for node #{}: {}", node_id, e);
-                                    (None, None, node_id, Some(e))
+                                    if e.contains("retrying next tick") {
+                                        let cached = last_hex_cached_providers.lock();
+                                        (cached.0.clone(), cached.1.clone(), cached.2, None)
+                                    } else {
+                                        log::error!("Hex viewer: failed to build provider for node #{}: {}", node_id, e);
+                                        (None, None, node_id, Some(e))
+                                    }
                                 }
                             }
                         }
@@ -513,11 +535,18 @@ impl AppWindow {
                             match wf.build_hex_providers() {
                                 Ok((main_p, raw_p)) => {
                                     let nid = wf.get_active_output_node_id().unwrap_or(0);
+                                    let mut cached = last_hex_cached_providers.lock();
+                                    *cached = (Some(main_p.clone()), raw_p.clone(), nid);
                                     (Some(main_p), raw_p, nid, None)
                                 }
                                 Err(e) => {
-                                    log::error!("Hex viewer: failed to build hex providers: {}", e);
-                                    (None, None, 0, Some(e))
+                                    if e.contains("retrying next tick") {
+                                        let cached = last_hex_cached_providers.lock();
+                                        (cached.0.clone(), cached.1.clone(), cached.2, None)
+                                    } else {
+                                        log::error!("Hex viewer: failed to build hex providers: {}", e);
+                                        (None, None, 0, Some(e))
+                                    }
                                 }
                             }
                         }
@@ -558,8 +587,26 @@ impl AppWindow {
                     } else {
                         0
                     };
+                    let source_pages: Vec<Option<u64>> = if let Some(prov) = &main_prov_opt {
+                        let guard = prov.lock();
+                        (0..128u64).map(|i| guard.source_page(base_page + i)).collect()
+                    } else {
+                        (0..128u64).map(|i| Some(base_page + i)).collect()
+                    };
+
                     let wf = workflow_for_hex.lock().unwrap_or_else(|e| e.into_inner());
-                    (0..128u64).map(|i| wf.get_page_entropy(base_page + i)).collect()
+                    if let Some(batch) = wf.get_page_entropy_batch(&source_pages) {
+                        let mut last = last_entropy_vec.lock();
+                        *last = batch.clone();
+                        batch
+                    } else {
+                        let last = last_entropy_vec.lock();
+                        if last.len() == 128 {
+                            last.clone()
+                        } else {
+                            vec![None; 128]
+                        }
+                    }
                 };
 
                 let full_output = hex_egui_ctx_draw.run(raw_input, |ctx| {

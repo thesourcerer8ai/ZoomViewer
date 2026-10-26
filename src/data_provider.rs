@@ -47,6 +47,12 @@ pub trait DumpDataProvider: Send + Sync {
     fn trace_byte(&self, _offset: u64) -> Vec<BacktrackAddress> {
         vec![]
     }
+
+    /// Translate a virtual page index to its source/original page index if filtered/mapped.
+    /// By default, returns `Some(page)` (1-to-1 mapping).
+    fn source_page(&self, page: u64) -> Option<u64> {
+        Some(page)
+    }
 }
 
 /// A provenance record: where a specific byte came from.
@@ -345,6 +351,10 @@ impl DumpDataProvider for XorDataProvider {
 
     fn cache_identity(&self) -> String {
         self.identity.clone()
+    }
+
+    fn source_page(&self, page: u64) -> Option<u64> {
+        self.primary.lock().source_page(page)
     }
 
     fn trace_byte(&self, offset: u64) -> Vec<BacktrackAddress> {
@@ -807,6 +817,10 @@ impl DumpDataProvider for SearchFilteredDataProvider {
         };
         let source_offset = src_page * pl + in_page_offset;
         self.source.lock().trace_byte(source_offset)
+    }
+
+    fn source_page(&self, page: u64) -> Option<u64> {
+        self.original_page(page).and_then(|p| self.source.lock().source_page(p))
     }
 }
 

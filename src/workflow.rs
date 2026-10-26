@@ -1018,6 +1018,10 @@ impl DumpDataProvider for EntropyDataProvider {
     fn trace_byte(&self, offset: u64) -> Vec<crate::data_provider::BacktrackAddress> {
         self.upstream.lock().trace_byte(offset)
     }
+
+    fn source_page(&self, page: u64) -> Option<u64> {
+        self.upstream.lock().source_page(page)
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2117,6 +2121,33 @@ impl WorkflowEditorState {
         }
     }
 
+    /// Look up 8-bit entropy values for a slice of original/source page indices in a single lock acquisition.
+    /// Returns None if the cache is temporarily locked or no upstream Entropy node is in the active pipeline.
+    pub fn get_page_entropy_batch(&self, pages: &[Option<u64>]) -> Option<Vec<Option<f32>>> {
+        let output_id = self.get_active_output_node_id()?;
+        let mut current_id = output_id;
+        let mut visited = std::collections::HashSet::new();
+        let entropy_node_id = loop {
+            if !visited.insert(current_id) {
+                return None; // cycle guard
+            }
+            let node = self.nodes.iter().find(|n| n.id == current_id)?;
+            if matches!(node.kind, WorkflowNodeKind::Entropy { .. }) {
+                break current_id;
+            }
+            let incoming = self.connections.iter().find(|c| c.to_node == current_id)?;
+            current_id = incoming.from_node;
+        };
+
+        let cache_map = self.entropy_caches.try_lock()?;
+        let node_cache = cache_map.get(&entropy_node_id)?;
+        let c = node_cache.try_lock()?;
+
+        Some(pages.iter().map(|opt_p| {
+            opt_p.and_then(|p| c.get(&p).map(|r| r.entropy_8))
+        }).collect())
+    }
+
     /// Returns (active_output_provider, Option<raw_primary_input_provider>).
     /// When an XorTransform node is present in the active output pipeline,
     /// the raw primary input provider is also returned to allow raw vs XOR diff visualization.
@@ -3155,14 +3186,6 @@ impl WorkflowEditorState {
                             bytes_after: 0,
                             results: Vec::new(),
                             resume_from_offset: None,
-                        });
-                        ui.close_menu();
-                    }
-                    if ui.button("Block Arranger").clicked() {
-                        self.add_node(WorkflowNodeKind::BlockArranger {
-                            grid_width: 16,
-                            grid_height: 16,
-                            stripe_width: 512,
                         });
                         ui.close_menu();
                     }
