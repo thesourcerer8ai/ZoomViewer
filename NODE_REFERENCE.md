@@ -375,3 +375,42 @@ upstream` is traversed automatically because every layer implements
 > `SearchFilteredDataProvider → EntropyDataProvider → upstream`.
 > Both layers implement `trace_byte`, so the full provenance chain is
 > recovered without any special-casing in the timer loop.
+
+---
+
+## Page Cutter
+
+**What it does**: Extracts specific byte ranges or segments from every input page
+and concatenates them in the user-specified order. The output stream contains the
+same number of pages, but each output page has a new length equal to the sum of
+the extracted slice lengths.
+
+**Inputs**: One upstream node.
+
+**Output provider**: `PageCutterDataProvider` — each page has length
+`output_page_length = sum(slice_lengths)`.
+
+**Configuration**:
+- `expression` — comma-separated list of slice expressions:
+  - `10-` — the whole page starting at byte offset 10 (`10..=page_length - 1`).
+  - `-100` — from the start of the page up to byte 100 (`0..=100`).
+  - `10-100` — inclusive byte range from 10 to 100 (91 bytes).
+  - `10` — single byte at offset 10 (1 byte).
+  - Hex offsets: e.g. `0x10-0x100`, `0x200-`.
+  - Page Structure keywords: `DATA`, `SA` (or `SPARE`, `OOB`), `ECC`, `SA-ECC`,
+    `UNKNOWN` (extracts all matching segments from the Page Structure Editor table).
+  - Multiple tokens can be combined: e.g. `10-100, 110-200` or `DATA, SA`.
+
+**Coordinate-space behaviour for `trace_byte`**:
+Determines which slice within the page contains the requested output in-page
+offset, maps it back to the exact source byte in the input page, and delegates
+to the upstream provider:
+
+```
+out_page        = offset / output_page_length
+in_page_offset  = offset % output_page_length
+// locate slice containing in_page_offset:
+source_in_page  = slice.src_start + (in_page_offset - slice_accumulated_start)
+source_offset   = out_page × src_page_length + source_in_page
+```
+

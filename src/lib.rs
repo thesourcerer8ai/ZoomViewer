@@ -72,7 +72,7 @@ pub mod backtracking_tab;
 pub mod pattern_healing;
 pub mod sector_pattern_search;
 
-pub use data_provider::{DumpDataProvider, FileDataProvider, SearchFilteredDataProvider, XorDataProvider};
+pub use data_provider::{DumpDataProvider, FileDataProvider, PageCutSlice, PageCutterDataProvider, SearchFilteredDataProvider, XorDataProvider, parse_page_cutter_expression};
 pub use search::{SearchResult, SearchOptions, SearchMode, search_provider, search_provider_with_sender, export_results_to_file};
 pub use search_tab::SearchTabState;
 pub use hex_tab::{HexTabState, HexDiffMode};

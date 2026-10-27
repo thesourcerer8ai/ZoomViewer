@@ -7,6 +7,7 @@
 
 use crate::error::Result;
 use crate::file_loader::FileLoader;
+use crate::page_structure_tab::{PageSegment, SegmentKind};
 use crate::types::{FileMetadata, Fragment};
 use parking_lot::Mutex;
 use std::collections::hash_map::DefaultHasher;
@@ -1546,6 +1547,497 @@ impl DumpDataProvider for BlockPermutationDataProvider {
         let src_block = self.source_block_for(out_block);
         let source_offset = src_block * bb + in_block_off;
         self.source.lock().trace_byte(source_offset)
+    }
+}
+
+// ── PageCutterDataProvider ──────────────────────────────────────────────────
+
+/// A byte slice to be extracted from each NAND page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageCutSlice {
+    /// Start byte offset within the source page (0-indexed).
+    pub src_start: u32,
+    /// Number of bytes extracted in this slice.
+    pub length: u32,
+}
+
+/// Parse a string that is either a decimal integer or hex (with 0x/0X prefix).
+pub fn parse_dec_or_hex_u32(s: &str) -> Option<u32> {
+    let trimmed = s.trim();
+    if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+        u32::from_str_radix(hex, 16).ok()
+    } else {
+        trimmed.parse::<u32>().ok()
+    }
+}
+
+/// Parse and validate a Page Cutter expression.
+///
+/// Supported tokens (comma-separated, concatenated in the specified order):
+/// - `10-`: open-ended range from byte 10 to page end (`10..=page_length-1`)
+/// - `-100`: range from page start to byte 100 (`0..=100`)
+/// - `10-100`: inclusive range from byte 10 to byte 100 (`10..=100`, length 91)
+/// - `10`: single byte at offset 10 (`10..=10`, length 1)
+/// - Hex notation is supported for all numbers (e.g. `0x10-0x100`, `0x200-`)
+/// - Keywords from Page Structure (case-insensitive):
+///   - `DATA`: all `Data` segments
+///   - `SA` / `SPARE` / `OOB`: all `Sa` segments
+///   - `ECC`: all `Ecc` segments
+///   - `SA-ECC` / `SAECC`: all `SaEcc` segments
+///   - `UNKNOWN`: all `Unknown` segments
+///
+/// Returns an error if any range is invalid, out of bounds, or references undefined Page Structure segments.
+pub fn parse_page_cutter_expression(
+    expression: &str,
+    page_length: u32,
+    segments: Option<&[PageSegment]>,
+) -> std::result::Result<Vec<PageCutSlice>, String> {
+    let trimmed = expression.trim();
+    if trimmed.is_empty() {
+        return Err("Page cutter expression is empty".to_string());
+    }
+
+    if page_length == 0 {
+        return Err("Source page length is 0".to_string());
+    }
+
+    let mut slices = Vec::new();
+
+    for raw_token in trimmed.split(',') {
+        let token = raw_token.trim();
+        if token.is_empty() {
+            continue;
+        }
+
+        let token_upper = token.to_ascii_uppercase();
+
+        // 1. Check for Page Structure keywords
+        let is_keyword = matches!(
+            token_upper.as_str(),
+            "DATA" | "SA" | "SPARE" | "OOB" | "ECC" | "SA-ECC" | "SAECC" | "UNKNOWN"
+        );
+
+        if is_keyword {
+            let mut offset = 0u32;
+            let mut found = 0;
+            if let Some(segs) = segments {
+                for seg in segs {
+                    let matches_kind = match token_upper.as_str() {
+                        "DATA" => seg.kind == SegmentKind::Data,
+                        "SA" | "SPARE" | "OOB" => seg.kind == SegmentKind::Sa,
+                        "ECC" => seg.kind == SegmentKind::Ecc,
+                        "SA-ECC" | "SAECC" => seg.kind == SegmentKind::SaEcc,
+                        "UNKNOWN" => seg.kind == SegmentKind::Unknown,
+                        _ => false,
+                    };
+
+                    if matches_kind {
+                        if seg.size > 0 {
+                            let seg_end = offset.saturating_add(seg.size).saturating_sub(1);
+                            if seg_end >= page_length {
+                                return Err(format!(
+                                    "Page Structure {} segment ({}..={}) exceeds page length ({})",
+                                    token_upper, offset, seg_end, page_length
+                                ));
+                            }
+                            slices.push(PageCutSlice {
+                                src_start: offset,
+                                length: seg.size,
+                            });
+                            found += 1;
+                        }
+                    }
+                    offset = offset.saturating_add(seg.size);
+                }
+            }
+
+            if found == 0 {
+                return Err(format!(
+                    "No '{}' segments found in Page Structure (configure them in Page Structure tab)",
+                    token_upper
+                ));
+            }
+            continue;
+        }
+
+        // 2. Open-start range: e.g. "-100"
+        if token.starts_with('-') {
+            let remainder = token[1..].trim();
+            if remainder.is_empty() {
+                return Err("Invalid range '-'".to_string());
+            }
+            let end = parse_dec_or_hex_u32(remainder)
+                .ok_or_else(|| format!("Invalid number in range '{}'", token))?;
+            if end >= page_length {
+                return Err(format!(
+                    "Range '{}': end offset ({}) exceeds page length ({})",
+                    token, end, page_length
+                ));
+            }
+            slices.push(PageCutSlice {
+                src_start: 0,
+                length: end + 1,
+            });
+            continue;
+        }
+
+        // 3. Open-end range: e.g. "10-"
+        if token.ends_with('-') {
+            let prefix = token[..token.len() - 1].trim();
+            if prefix.is_empty() {
+                return Err("Invalid range '-'".to_string());
+            }
+            let start = parse_dec_or_hex_u32(prefix)
+                .ok_or_else(|| format!("Invalid number in range '{}'", token))?;
+            if start >= page_length {
+                return Err(format!(
+                    "Range '{}': start offset ({}) exceeds page length ({})",
+                    token, start, page_length
+                ));
+            }
+            let length = page_length - start;
+            slices.push(PageCutSlice {
+                src_start: start,
+                length,
+            });
+            continue;
+        }
+
+        // 4. Closed range: e.g. "10-100"
+        if let Some(dash_idx) = token.find('-') {
+            let start_str = token[..dash_idx].trim();
+            let end_str = token[dash_idx + 1..].trim();
+            let start = parse_dec_or_hex_u32(start_str)
+                .ok_or_else(|| format!("Invalid start offset '{}' in range '{}'", start_str, token))?;
+            let end = parse_dec_or_hex_u32(end_str)
+                .ok_or_else(|| format!("Invalid end offset '{}' in range '{}'", end_str, token))?;
+            if start > end {
+                return Err(format!(
+                    "Invalid range '{}': start ({}) > end ({})",
+                    token, start, end
+                ));
+            }
+            if end >= page_length {
+                return Err(format!(
+                    "Range '{}': end offset ({}) exceeds page length ({})",
+                    token, end, page_length
+                ));
+            }
+            slices.push(PageCutSlice {
+                src_start: start,
+                length: end - start + 1,
+            });
+            continue;
+        }
+
+        // 5. Single byte: e.g. "10" or "0x10"
+        if let Some(val) = parse_dec_or_hex_u32(token) {
+            if val >= page_length {
+                return Err(format!(
+                    "Byte offset '{}' ({}) exceeds page length ({})",
+                    token, val, page_length
+                ));
+            }
+            slices.push(PageCutSlice {
+                src_start: val,
+                length: 1,
+            });
+            continue;
+        }
+
+        return Err(format!(
+            "Unrecognized token '{}' (expected range like '10-100', '10-', or keyword like 'DATA')",
+            token
+        ));
+    }
+
+    if slices.is_empty() {
+        return Err("No bytes selected by expression".to_string());
+    }
+
+    Ok(slices)
+}
+
+/// Data provider that extracts specific byte ranges from every page of an upstream provider.
+pub struct PageCutterDataProvider {
+    source: Arc<Mutex<dyn DumpDataProvider>>,
+    slices: Vec<PageCutSlice>,
+    expression: String,
+    src_page_length: u32,
+    output_page_length: u32,
+    metadata: FileMetadata,
+    identity: String,
+}
+
+impl PageCutterDataProvider {
+    pub fn new(
+        source: Arc<Mutex<dyn DumpDataProvider>>,
+        slices: Vec<PageCutSlice>,
+        expression: String,
+    ) -> Self {
+        let (src_page_length, block_size, total_pages, src_identity) = {
+            let g = source.lock();
+            let m = g.get_metadata();
+            (m.page_length, m.block_size, m.total_pages, g.cache_identity())
+        };
+
+        let output_page_length: u32 = slices.iter().map(|s| s.length).sum();
+        let total_size = (total_pages as u64) * (output_page_length as u64);
+
+        let mut hasher = DefaultHasher::new();
+        "PAGE_CUTTER".hash(&mut hasher);
+        src_identity.hash(&mut hasher);
+        expression.hash(&mut hasher);
+        src_page_length.hash(&mut hasher);
+        output_page_length.hash(&mut hasher);
+        for s in &slices {
+            s.src_start.hash(&mut hasher);
+            s.length.hash(&mut hasher);
+        }
+        let identity = format!("pagecut_{:016x}", hasher.finish());
+
+        let metadata = FileMetadata::new(
+            format!("pagecut://{}", identity),
+            total_size,
+            output_page_length,
+            block_size,
+        );
+
+        Self {
+            source,
+            slices,
+            expression,
+            src_page_length,
+            output_page_length,
+            metadata,
+            identity,
+        }
+    }
+
+    pub fn output_page_length(&self) -> u32 {
+        self.output_page_length
+    }
+
+    pub fn slices(&self) -> &[PageCutSlice] {
+        &self.slices
+    }
+
+    pub fn expression(&self) -> &str {
+        &self.expression
+    }
+}
+
+impl DumpDataProvider for PageCutterDataProvider {
+    fn read_bytes(&mut self, offset: u64, length: u32) -> Result<Vec<u8>> {
+        if length == 0 || self.output_page_length == 0 || offset >= self.metadata.size {
+            return Ok(vec![0u8; length as usize]);
+        }
+
+        let total_size = self.metadata.size;
+        let out_pl = self.output_page_length as u64;
+        let src_pl = self.src_page_length as u64;
+        let readable_end = (offset + length as u64).min(total_size);
+        let mut buffer = vec![0u8; length as usize];
+
+        let first_page = offset / out_pl;
+        let last_page = (readable_end.saturating_sub(1)) / out_pl;
+
+        let mut src_guard = self.source.lock();
+
+        for page_idx in first_page..=last_page {
+            let page_out_start = page_idx * out_pl;
+            let mut slice_in_page_start = 0u64;
+
+            for slice in &self.slices {
+                let slice_len = slice.length as u64;
+                let slice_out_start = page_out_start + slice_in_page_start;
+                let slice_out_end = slice_out_start + slice_len;
+
+                slice_in_page_start += slice_len;
+
+                let seg_start = offset.max(slice_out_start);
+                let seg_end = readable_end.min(slice_out_end);
+                if seg_end <= seg_start {
+                    continue;
+                }
+
+                let in_slice_off = seg_start - slice_out_start;
+                let seg_len = (seg_end - seg_start) as u32;
+                let src_offset = page_idx * src_pl + (slice.src_start as u64) + in_slice_off;
+
+                let bytes = src_guard.read_bytes(src_offset, seg_len)?;
+                let dest_start = (seg_start - offset) as usize;
+                let copy_len = bytes.len().min(seg_len as usize);
+                buffer[dest_start..dest_start + copy_len].copy_from_slice(&bytes[..copy_len]);
+            }
+        }
+
+        Ok(buffer)
+    }
+
+    fn get_metadata(&self) -> FileMetadata {
+        self.metadata.clone()
+    }
+
+    fn cache_identity(&self) -> String {
+        self.identity.clone()
+    }
+
+    fn trace_byte(&self, offset: u64) -> Vec<BacktrackAddress> {
+        if self.output_page_length == 0 || self.src_page_length == 0 {
+            return vec![];
+        }
+        let out_pl = self.output_page_length as u64;
+        let page_idx = offset / out_pl;
+        let mut in_page_off = offset % out_pl;
+
+        for slice in &self.slices {
+            let slice_len = slice.length as u64;
+            if in_page_off < slice_len {
+                let src_in_page = (slice.src_start as u64) + in_page_off;
+                let src_offset = page_idx * (self.src_page_length as u64) + src_in_page;
+                return self.source.lock().trace_byte(src_offset);
+            }
+            in_page_off -= slice_len;
+        }
+
+        vec![]
+    }
+
+    fn source_page(&self, page: u64) -> Option<u64> {
+        self.source.lock().source_page(page)
+    }
+}
+
+#[cfg(test)]
+mod page_cutter_tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    fn create_test_file(data: &[u8], page_length: u32, block_size: u32) -> (NamedTempFile, FileLoader) {
+        let mut temp = NamedTempFile::new().unwrap();
+        temp.write_all(data).unwrap();
+        temp.flush().unwrap();
+        let loader = FileLoader::new(temp.path(), page_length, block_size).unwrap();
+        (temp, loader)
+    }
+
+    #[test]
+    fn test_parse_ranges_and_keywords() {
+        let segments = vec![
+            PageSegment::new(SegmentKind::Data, 512),
+            PageSegment::new(SegmentKind::Sa, 16),
+            PageSegment::new(SegmentKind::Ecc, 32),
+            PageSegment::new(SegmentKind::Data, 512),
+        ];
+
+        // 10- on page of 1072 bytes -> 10..=1071 (length 1062)
+        let slices = parse_page_cutter_expression("10-", 1072, None).unwrap();
+        assert_eq!(slices, vec![PageCutSlice { src_start: 10, length: 1062 }]);
+
+        // 10-100 -> inclusive 10..=100 (length 91)
+        let slices = parse_page_cutter_expression("10-100", 1072, None).unwrap();
+        assert_eq!(slices, vec![PageCutSlice { src_start: 10, length: 91 }]);
+
+        // 10-100, 110-200 -> concatenated in order
+        let slices = parse_page_cutter_expression("10-100, 110-200", 1072, None).unwrap();
+        assert_eq!(slices, vec![
+            PageCutSlice { src_start: 10, length: 91 },
+            PageCutSlice { src_start: 110, length: 91 },
+        ]);
+
+        // Hex support: 0x10-0x20
+        let slices = parse_page_cutter_expression("0x10-0x20", 1072, None).unwrap();
+        assert_eq!(slices, vec![PageCutSlice { src_start: 16, length: 17 }]);
+
+        // Single byte and open-start: -50, 100
+        let slices = parse_page_cutter_expression("-50, 100", 1072, None).unwrap();
+        assert_eq!(slices, vec![
+            PageCutSlice { src_start: 0, length: 51 },
+            PageCutSlice { src_start: 100, length: 1 },
+        ]);
+
+        // Keywords: DATA extracts both Data segments (0..512 and 560..1072)
+        let slices = parse_page_cutter_expression("DATA", 1072, Some(&segments)).unwrap();
+        assert_eq!(slices, vec![
+            PageCutSlice { src_start: 0, length: 512 },
+            PageCutSlice { src_start: 560, length: 512 },
+        ]);
+
+        // Keywords: SA extracts Sa segment (512..528)
+        let slices = parse_page_cutter_expression("SA", 1072, Some(&segments)).unwrap();
+        assert_eq!(slices, vec![
+            PageCutSlice { src_start: 512, length: 16 },
+        ]);
+
+        // Combined keyword and range: DATA, SA
+        let slices = parse_page_cutter_expression("DATA, SA", 1072, Some(&segments)).unwrap();
+        assert_eq!(slices.len(), 3);
+        assert_eq!(slices[0], PageCutSlice { src_start: 0, length: 512 });
+        assert_eq!(slices[1], PageCutSlice { src_start: 560, length: 512 });
+        assert_eq!(slices[2], PageCutSlice { src_start: 512, length: 16 });
+
+        // Error cases (Variante C - strict validation)
+        assert!(parse_page_cutter_expression("", 1072, None).is_err());
+        assert!(parse_page_cutter_expression("100-50", 1072, None).is_err()); // start > end
+        assert!(parse_page_cutter_expression("1000-2000", 1072, None).is_err()); // end >= page_length
+        assert!(parse_page_cutter_expression("2000-", 1072, None).is_err()); // start >= page_length
+        assert!(parse_page_cutter_expression("UNKNOWN_KEYWORD", 1072, None).is_err());
+        assert!(parse_page_cutter_expression("SA", 1072, None).is_err()); // no segments
+    }
+
+    #[test]
+    fn test_page_cutter_data_provider() {
+        let mut test_bytes = vec![0u8; 512 * 64];
+        // Populate page 0
+        test_bytes[2..6].copy_from_slice(&[2, 3, 4, 5]);
+        test_bytes[10..12].copy_from_slice(&[10, 11]);
+        // Populate page 1 (starts at offset 512)
+        test_bytes[512 + 2..512 + 6].copy_from_slice(&[20, 21, 22, 23]);
+        test_bytes[512 + 10..512 + 12].copy_from_slice(&[30, 31]);
+
+        let (_tmp, loader) = create_test_file(&test_bytes, 512, 64);
+        let src = Arc::new(Mutex::new(FileDataProvider::new(loader)));
+
+        // Extract: 2-5 (4 bytes: 2,3,4,5) and 10-11 (2 bytes: 10,11) -> 6 bytes per page
+        let slices = vec![
+            PageCutSlice { src_start: 2, length: 4 },
+            PageCutSlice { src_start: 10, length: 2 },
+        ];
+        let mut cutter = PageCutterDataProvider::new(src.clone(), slices, "2-5, 10-11".to_string());
+
+        assert_eq!(cutter.get_metadata().page_length, 6);
+        assert_eq!(cutter.get_metadata().size, 64 * 6); // 64 pages * 6 bytes
+
+        // Read first 12 bytes (pages 0 and 1)
+        let out = cutter.read_bytes(0, 12).unwrap();
+        assert_eq!(out, vec![
+            // Page 0
+            2, 3, 4, 5, 10, 11,
+            // Page 1
+            20, 21, 22, 23, 30, 31,
+        ]);
+
+        // Partial read across page boundary: offset 4, length 4 -> [10, 11, 20, 21]
+        let partial = cutter.read_bytes(4, 4).unwrap();
+        assert_eq!(partial, vec![10, 11, 20, 21]);
+
+        // Backtrack test
+        // Output byte 0 (page 0, slice 0, in-slice 0) -> source byte 2
+        let bt = cutter.trace_byte(0);
+        assert_eq!(bt.len(), 1);
+        assert_eq!(bt[0].absolute_offset, 2);
+
+        // Output byte 4 (page 0, slice 1, in-slice 0) -> source byte 10
+        let bt = cutter.trace_byte(4);
+        assert_eq!(bt.len(), 1);
+        assert_eq!(bt[0].absolute_offset, 10);
+
+        // Output byte 6 (page 1, slice 0, in-slice 0) -> source byte 512 + 2 = 514
+        let bt = cutter.trace_byte(6);
+        assert_eq!(bt.len(), 1);
+        assert_eq!(bt[0].absolute_offset, 514);
     }
 }
 

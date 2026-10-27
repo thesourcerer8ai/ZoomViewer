@@ -284,6 +284,11 @@ pub enum WorkflowNodeKind {
         #[serde(default)]
         cluster_filter: EntropyCluster,
     },
+    /// Page Cutter node — extracts specific byte ranges from every input page
+    /// and concatenates them in the specified order.
+    PageCutter {
+        expression: String,
+    },
 }
 
 /// Data structure for a node in the workflow graph
@@ -536,6 +541,20 @@ impl WorkflowNode {
         }
     }
 
+    pub fn new_page_cutter(id: usize, pos: [f32; 2]) -> Self {
+        Self {
+            id,
+            name: "Page Cutter".to_string(),
+            pos,
+            kind: WorkflowNodeKind::PageCutter {
+                expression: String::new(),
+            },
+            status: NodeExecutionStatus::Idle,
+            output_log: "Page Cutter ready. Connect an upstream node and enter an expression.".to_string(),
+            collapsed: false,
+        }
+    }
+
     pub fn execute(&mut self) {
         self.status = NodeExecutionStatus::Running;
         let start_time = std::time::Instant::now();
@@ -669,6 +688,13 @@ impl WorkflowNode {
                 self.output_log = format!(
                     "Entropy Analysis ready. 32-bit: {}. Connect upstream and click Start Analysis.",
                     compute_32bit
+                );
+            }
+            WorkflowNodeKind::PageCutter { expression } => {
+                self.status = NodeExecutionStatus::Completed;
+                self.output_log = format!(
+                    "Page Cutter ready.\nExpression: {}\nConnect upstream to extract specified byte ranges.",
+                    if expression.trim().is_empty() { "(empty)" } else { expression }
                 );
             }
         }
@@ -1406,6 +1432,7 @@ impl WorkflowEditorState {
             WorkflowNodeKind::BlockPermutation { .. } => WorkflowNode::new_block_permutation(id, pos),
             WorkflowNodeKind::SectorPatternSearch { .. } => WorkflowNode::new_sector_pattern_search(id, pos),
             WorkflowNodeKind::Entropy { .. } => WorkflowNode::new_entropy(id, pos),
+            WorkflowNodeKind::PageCutter { .. } => WorkflowNode::new_page_cutter(id, pos),
         };
 
         self.nodes.push(node);
@@ -1864,6 +1891,29 @@ impl WorkflowEditorState {
                 let label = format!("entropy_cluster_{}", cluster_filter.label());
                 let filtered = SearchFilteredDataProvider::new(entropy_arc, matching_pages, label);
                 Ok(Arc::new(Mutex::new(filtered)) as Arc<Mutex<dyn DumpDataProvider>>)
+            }
+            WorkflowNodeKind::PageCutter { expression } => {
+                let incoming = self.connections.iter()
+                    .find(|c| c.to_node == target_node_id)
+                    .ok_or_else(|| format!("Page Cutter node #{} has no input connected", target_node_id))?;
+                let upstream = self.build_data_provider_internal(incoming.from_node, ancestors)?;
+                let src_page_length = upstream.lock().get_metadata().page_length;
+
+                let ps_guard = self.page_structure.as_ref().and_then(|arc| arc.try_lock().ok());
+                let segments_ref = ps_guard.as_ref().map(|g| &g.segments[..]);
+
+                let slices = crate::data_provider::parse_page_cutter_expression(
+                    expression,
+                    src_page_length,
+                    segments_ref,
+                ).map_err(|e| format!("Page Cutter node #{}: {}", target_node_id, e))?;
+
+                let provider = crate::data_provider::PageCutterDataProvider::new(
+                    upstream,
+                    slices,
+                    expression.clone(),
+                );
+                Ok(Arc::new(Mutex::new(provider)) as Arc<Mutex<dyn DumpDataProvider>>)
             }
         };
 
@@ -3265,6 +3315,12 @@ impl WorkflowEditorState {
                         });
                         ui.close_menu();
                     }
+                    if ui.button("Page Cutter").clicked() {
+                        self.add_node(WorkflowNodeKind::PageCutter {
+                            expression: String::new(),
+                        });
+                        ui.close_menu();
+                    }
                 });
             });
 
@@ -3432,6 +3488,27 @@ impl WorkflowEditorState {
                     }
                 })
                 .collect();
+
+            // Pre-compute upstream page length for PageCutter nodes
+            let page_cutter_page_lens: HashMap<usize, u32> = self.nodes.iter()
+                .filter_map(|n| {
+                    if let WorkflowNodeKind::PageCutter { .. } = n.kind {
+                        let upstream_pl = self.connections.iter()
+                            .find(|c| c.to_node == n.id)
+                            .and_then(|c| self.build_data_provider(c.from_node).ok())
+                            .map(|p| p.lock().get_metadata().page_length)
+                            .unwrap_or(0);
+                        Some((n.id, upstream_pl))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let ps_segments_snapshot: Option<Vec<crate::page_structure_tab::PageSegment>> = self.page_structure
+                .as_ref()
+                .and_then(|arc| arc.try_lock().ok())
+                .map(|g| g.segments.clone());
 
             for node in &mut self.nodes {
                 let node_id = node.id;
@@ -4233,6 +4310,78 @@ impl WorkflowEditorState {
                                         action_run_entropy = Some(node_id);
                                     }
                                 }
+                            }
+                            WorkflowNodeKind::PageCutter { expression } => {
+                                ui.label("Expression:");
+                                ui.text_edit_singleline(expression);
+
+                                // Live validation
+                                let trimmed = expression.trim();
+                                if trimmed.is_empty() {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(255, 200, 80),
+                                        "⚠ Empty — enter ranges (e.g. \"10-100\", \"10-\", or \"DATA\")",
+                                    );
+                                } else {
+                                    let upstream_pl = page_cutter_page_lens.get(&node_id).copied().unwrap_or(0);
+                                    let ps_ref = ps_segments_snapshot.as_deref();
+
+                                    if upstream_pl > 0 {
+                                        match crate::data_provider::parse_page_cutter_expression(trimmed, upstream_pl, ps_ref) {
+                                            Ok(slices) => {
+                                                let out_len: u32 = slices.iter().map(|s| s.length).sum();
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(100, 230, 140),
+                                                    format!(
+                                                        "✔ Input: {} B → Output: {} B ({} slice{})",
+                                                        upstream_pl,
+                                                        out_len,
+                                                        slices.len(),
+                                                        if slices.len() == 1 { "" } else { "s" }
+                                                    ),
+                                                );
+                                            }
+                                            Err(err) => {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(220, 80, 80),
+                                                    format!("✘ {}", err),
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        // When not connected, validate with loose upper bound
+                                        match crate::data_provider::parse_page_cutter_expression(trimmed, u32::MAX, ps_ref) {
+                                            Ok(slices) => {
+                                                let out_len: u32 = slices.iter().map(|s| s.length).sum();
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(100, 230, 140),
+                                                    format!(
+                                                        "✔ Valid syntax (connect upstream to validate page bounds, currently {} B)",
+                                                        out_len
+                                                    ),
+                                                );
+                                            }
+                                            Err(err) => {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(220, 80, 80),
+                                                    format!("✘ {}", err),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+
+                                ui.add_space(2.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Extracts specified byte ranges from each page.\n\
+                                         Ranges: 10-, 10-100, -100, 10, 0x10-0x100\n\
+                                         Keywords: DATA, SA, ECC, SA-ECC, UNKNOWN\n\
+                                         Comma-separated, concatenated in order.\n\
+                                         Example: \"10-100, 110-200\" or \"DATA, SA\"",
+                                    )
+                                    .italics().weak().size(11.0),
+                                );
                             }
                         }
 
@@ -5532,6 +5681,132 @@ mod tests {
         } else {
             panic!("Expected WorkflowNodeKind::Entropy");
         }
+    }
+
+    #[test]
+    fn test_workflow_page_cutter() {
+        use crate::page_structure_tab::{PageSegment, PageStructureTabState, SegmentKind};
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Create a test dump of 64 pages, 512 bytes each
+        let mut test_bytes = vec![0u8; 512 * 64];
+        for i in 0..test_bytes.len() {
+            test_bytes[i] = (i % 256) as u8;
+        }
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(&test_bytes).unwrap();
+        temp_file.flush().unwrap();
+        let dump_path = temp_file.path().to_str().unwrap().to_string();
+
+        let mut ps_state = PageStructureTabState::new();
+        ps_state.segments = vec![
+            PageSegment::new(SegmentKind::Data, 256),
+            PageSegment::new(SegmentKind::Sa, 64),
+            PageSegment::new(SegmentKind::Data, 192),
+        ];
+
+        let state = WorkflowEditorState {
+            next_node_id: 4,
+            nodes: vec![
+                WorkflowNode {
+                    id: 1,
+                    name: "Input".to_string(),
+                    pos: [0.0, 0.0],
+                    kind: WorkflowNodeKind::Input {
+                        file_path: dump_path,
+                        page_length: 512,
+                        block_size: 64,
+                    },
+                    status: NodeExecutionStatus::Completed,
+                    output_log: String::new(),
+                    collapsed: false,
+                },
+                WorkflowNode {
+                    id: 2,
+                    name: "Page Cutter".to_string(),
+                    pos: [200.0, 0.0],
+                    kind: WorkflowNodeKind::PageCutter {
+                        expression: "10-100, 110-200".to_string(),
+                    },
+                    status: NodeExecutionStatus::Idle,
+                    output_log: String::new(),
+                    collapsed: false,
+                },
+                WorkflowNode {
+                    id: 3,
+                    name: "Viewer".to_string(),
+                    pos: [400.0, 0.0],
+                    kind: WorkflowNodeKind::OutputViewer {
+                        name: "Viewer".to_string(),
+                    },
+                    status: NodeExecutionStatus::Idle,
+                    output_log: String::new(),
+                    collapsed: false,
+                },
+            ],
+            connections: vec![
+                NodeConnection { from_node: 1, to_node: 2 },
+                NodeConnection { from_node: 2, to_node: 3 },
+            ],
+            selected_node: None,
+            connecting_from: None,
+            status_message: String::new(),
+            file_browser_open: HashMap::new(),
+            file_browser_path: HashMap::new(),
+            file_browser_show_all: HashMap::new(),
+            pending_xor_offer: None,
+            active_searches: Arc::new(Mutex::new(HashMap::new())),
+            active_fuse_mounts: Arc::new(Mutex::new(HashMap::new())),
+            node_rects: HashMap::new(),
+            page_structure: Some(Arc::new(std::sync::Mutex::new(ps_state))),
+            healing_stats_cache: HashMap::new(),
+            healing_stats: Arc::new(Mutex::new(HashMap::new())),
+            entropy_caches: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        // 1. Build provider through PageCutter and OutputViewer
+        let provider = state.build_data_provider(3).expect("Should build data provider");
+        let meta = provider.lock().get_metadata();
+        // 10-100 is 91 bytes, 110-200 is 91 bytes -> 182 bytes/page
+        assert_eq!(meta.page_length, 182);
+        assert_eq!(meta.total_pages, 64);
+        assert_eq!(meta.size, 64 * 182);
+
+        // 2. Read bytes and verify content
+        let page0 = provider.lock().read_bytes(0, 182).expect("Read page 0");
+        assert_eq!(page0.len(), 182);
+        // First 91 bytes correspond to input 10..=100
+        for i in 0..91 {
+            assert_eq!(page0[i], ((10 + i) % 256) as u8);
+        }
+        // Next 91 bytes correspond to input 110..=200
+        for i in 0..91 {
+            assert_eq!(page0[91 + i], ((110 + i) % 256) as u8);
+        }
+
+        // 3. Serialization round-trip
+        let cutter_node = &state.nodes[1];
+        let json = serde_json::to_string(cutter_node).expect("Serialize PageCutter node");
+        assert!(json.contains("\"PageCutter\""));
+        assert!(json.contains("10-100, 110-200"));
+        let deserialized: WorkflowNode = serde_json::from_str(&json).expect("Deserialize PageCutter node");
+        if let WorkflowNodeKind::PageCutter { expression } = deserialized.kind {
+            assert_eq!(expression, "10-100, 110-200");
+        } else {
+            panic!("Expected PageCutter kind");
+        }
+
+        // 4. Test with DATA keyword
+        let mut state_data = state.clone();
+        if let WorkflowNodeKind::PageCutter { ref mut expression } = state_data.nodes[1].kind {
+            *expression = "DATA".to_string();
+        }
+        let data_provider = state_data.build_data_provider(3).expect("Should build DATA provider");
+        let data_meta = data_provider.lock().get_metadata();
+        // DATA has 256 + 192 = 448 bytes per page
+        assert_eq!(data_meta.page_length, 448);
+        assert_eq!(data_meta.size, 64 * 448);
     }
 }
 
