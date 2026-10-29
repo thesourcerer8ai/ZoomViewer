@@ -1205,6 +1205,10 @@ pub struct ActiveSearchState {
     pub live_match_count: usize,
     /// Number of results already stored on the node before this run started.
     pub prior_result_count: usize,
+    /// Running count of 0-bits seen across all pages (entropy nodes only; 0 for others).
+    pub zero_bits: Arc<AtomicU64>,
+    /// Running count of 1-bits seen across all pages (entropy nodes only; 0 for others).
+    pub one_bits: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for ActiveSearchState {
@@ -2436,6 +2440,8 @@ impl WorkflowEditorState {
                 match_rx,
                 live_match_count: 0,
                 prior_result_count: prior_count,
+                zero_bits: Arc::new(AtomicU64::new(0)),
+                one_bits: Arc::new(AtomicU64::new(0)),
             },
         );
 
@@ -2580,6 +2586,8 @@ impl WorkflowEditorState {
                 match_rx,
                 live_match_count: 0,
                 prior_result_count: prior_count,
+                zero_bits: Arc::new(AtomicU64::new(0)),
+                one_bits: Arc::new(AtomicU64::new(0)),
             },
         );
 
@@ -2626,14 +2634,18 @@ impl WorkflowEditorState {
 
         let cancel_flag    = Arc::new(AtomicBool::new(false));
         let progress_bytes = Arc::new(AtomicU64::new(0));
+        let zero_bits_ctr  = Arc::new(AtomicU64::new(0));
+        let one_bits_ctr   = Arc::new(AtomicU64::new(0));
         let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<crate::search::SearchResult>, String>>();
         let (match_tx, match_rx) = std::sync::mpsc::channel::<crate::search::SearchResult>();
 
-        let cancel_t    = cancel_flag.clone();
-        let prog_t      = progress_bytes.clone();
-        let prov_t      = upstream.clone();
-        let do_32bit_t  = compute_32bit;
-        let match_tx_t  = match_tx;
+        let cancel_t      = cancel_flag.clone();
+        let prog_t        = progress_bytes.clone();
+        let zero_bits_t   = zero_bits_ctr.clone();
+        let one_bits_t    = one_bits_ctr.clone();
+        let prov_t        = upstream.clone();
+        let do_32bit_t    = compute_32bit;
+        let match_tx_t    = match_tx;
         let total_bytes_t = total_bytes;
 
         std::thread::spawn(move || {
@@ -2659,6 +2671,13 @@ impl WorkflowEditorState {
                 };
                 let e8  = compute_entropy_8(&data);
                 let e32 = if do_32bit_t { Some(compute_entropy_32(&data)) } else { None };
+
+                // Count individual 0-bits and 1-bits across every byte in this page.
+                let ones: u64 = data.iter().map(|b| b.count_ones() as u64).sum();
+                let zeros: u64 = (data.len() as u64) * 8 - ones;
+                zero_bits_t.fetch_add(zeros, Ordering::Relaxed);
+                one_bits_t.fetch_add(ones, Ordering::Relaxed);
+
                 prog_t.store(offset + page_len, Ordering::Relaxed);
 
                 let sr = crate::search::SearchResult {
@@ -2686,6 +2705,8 @@ impl WorkflowEditorState {
                 match_rx,
                 live_match_count: 0,
                 prior_result_count: 0,
+                zero_bits: zero_bits_ctr,
+                one_bits: one_bits_ctr,
             },
         );
 
@@ -2735,7 +2756,9 @@ impl WorkflowEditorState {
                     // thread finished, so we can set resume_from_offset correctly.
                     let scan_offset = search.progress_bytes.load(Ordering::Relaxed);
                     let was_cancelled = search.cancel_flag.load(Ordering::Relaxed);
-                    completed.push((node_id, res, search.prior_result_count, scan_offset, was_cancelled, search.total_bytes));
+                    let zero_bits = search.zero_bits.load(Ordering::Relaxed);
+                    let one_bits  = search.one_bits.load(Ordering::Relaxed);
+                    completed.push((node_id, res, search.prior_result_count, scan_offset, was_cancelled, search.total_bytes, zero_bits, one_bits));
                 }
             }
         }
@@ -2744,7 +2767,7 @@ impl WorkflowEditorState {
             ctx.request_repaint();
         }
 
-        for (node_id, res, _prior_count, scan_offset, was_cancelled, total_bytes) in completed {
+        for (node_id, res, _prior_count, scan_offset, was_cancelled, total_bytes, zero_bits, one_bits) in completed {
             self.active_searches.lock().remove(&node_id);
             let page_len = match self.connections.iter().find(|c| c.to_node == node_id) {
                 Some(c) => self.build_data_provider(c.from_node)
@@ -2845,9 +2868,24 @@ impl WorkflowEditorState {
                                 let min_e = node_res.iter().map(|r| r.entropy_8).fold(f32::INFINITY, f32::min);
                                 let max_e = node_res.iter().map(|r| r.entropy_8).fold(f32::NEG_INFINITY, f32::max);
                                 let avg_e = node_res.iter().map(|r| r.entropy_8).sum::<f32>() / node_res.len() as f32;
+                                let total_bits = zero_bits + one_bits;
+                                let balance_pct = if total_bits > 0 {
+                                    one_bits as f64 / total_bits as f64 * 100.0
+                                } else {
+                                    50.0
+                                };
+                                // 50% = perfectly balanced; show signed deviation from 50%
+                                let deviation = balance_pct - 50.0;
+                                let balance_str = format!(
+                                    "{:.2}% ones / {:.2}% zeros ({:+.2}% from balanced)",
+                                    balance_pct,
+                                    100.0 - balance_pct,
+                                    deviation
+                                );
                                 format!(
-                                    "Entropy Analysis Complete!\nAnalyzed {} pages.\nMin: {:.4}  Max: {:.4}  Avg: {:.4}",
-                                    match_count, min_e, max_e, avg_e
+                                    "Entropy Analysis Complete!\nAnalyzed {} pages.\nMin: {:.4}  Max: {:.4}  Avg: {:.4}\n0-bits: {}  1-bits: {}  Balance: {}",
+                                    match_count, min_e, max_e, avg_e,
+                                    zero_bits, one_bits, balance_str
                                 )
                             } else {
                                 "Entropy Analysis Complete! No pages analyzed.".to_string()
