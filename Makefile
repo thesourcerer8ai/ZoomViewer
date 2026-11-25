@@ -28,3 +28,8 @@ coverage-all:
 	cargo llvm-cov --all-features --include-ignored --html
 	@echo ""
 	@echo "HTML report: target/llvm-cov/html/index.html"
+
+# Generate/update the CycloneDX 1.5 JSON SBOM (sbom.cdx.json).
+.PHONY: sbom
+sbom:
+	python3 scripts/generate_sbom.py -o sbom.cdx.json
