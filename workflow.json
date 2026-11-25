@@ -1,0 +1,320 @@
+{
+  "next_node_id": 55,
+  "nodes": [
+    {
+      "id": 1,
+      "name": "sdcard0.dump",
+      "pos": [
+        0.0,
+        55.0
+      ],
+      "kind": {
+        "Input": {
+          "file_path": "sdcard0.dump",
+          "page_length": 55296,
+          "block_size": 384
+        }
+      },
+      "status": "Idle",
+      "output_log": "No execution history",
+      "collapsed": false
+    },
+    {
+      "id": 2,
+      "name": "sdcard1.dump",
+      "pos": [
+        0.0,
+        230.0
+      ],
+      "kind": {
+        "Input": {
+          "file_path": "sdcard1.dump",
+          "page_length": 55296,
+          "block_size": 384
+        }
+      },
+      "status": "Idle",
+      "output_log": "No execution history",
+      "collapsed": false
+    },
+    {
+      "id": 3,
+      "name": "sdcard2.dump",
+      "pos": [
+        0.0,
+        410.0
+      ],
+      "kind": {
+        "Input": {
+          "file_path": "sdcard2.dump",
+          "page_length": 55296,
+          "block_size": 256
+        }
+      },
+      "status": "Idle",
+      "output_log": "No execution history",
+      "collapsed": false
+    },
+    {
+      "id": 4,
+      "name": "sdcard3.dump",
+      "pos": [
+        0.0,
+        616.0
+      ],
+      "kind": {
+        "Input": {
+          "file_path": "sdcard3.dump",
+          "page_length": 55296,
+          "block_size": 256
+        }
+      },
+      "status": "Idle",
+      "output_log": "No execution history",
+      "collapsed": false
+    },
+    {
+      "id": 43,
+      "name": "Entropy Analysis",
+      "pos": [
+        836.0,
+        55.0
+      ],
+      "kind": {
+        "Entropy": {
+          "log_path": "entropy0.csv",
+          "compute_32bit": true,
+          "cluster_filter": "MediumEntropyArc"
+        }
+      },
+      "status": "Completed",
+      "output_log": "Entropy Analysis Complete!\nAnalyzed 103815 pages.\nMin: 0.0000  Max: 7.9927  Avg: 6.8286",
+      "collapsed": false
+    },
+    {
+      "id": 44,
+      "name": "Output: Viewer",
+      "pos": [
+        1205.0,
+        76.0
+      ],
+      "kind": {
+        "OutputViewer": {
+          "name": "Viewer"
+        }
+      },
+      "status": "Idle",
+      "output_log": "Connected to ZoomViewer",
+      "collapsed": false
+    },
+    {
+      "id": 46,
+      "name": "Page Cutter",
+      "pos": [
+        508.0,
+        211.0
+      ],
+      "kind": {
+        "PageCutter": {
+          "expression": "0-18303"
+        }
+      },
+      "status": "Idle",
+      "output_log": "Page Cutter ready. Connect an upstream node and enter an expression.",
+      "collapsed": false
+    },
+    {
+      "id": 47,
+      "name": "Entropy Analysis",
+      "pos": [
+        888.0,
+        288.0
+      ],
+      "kind": {
+        "Entropy": {
+          "log_path": "entropy0-0.csv",
+          "compute_32bit": true,
+          "cluster_filter": "All"
+        }
+      },
+      "status": "Completed",
+      "output_log": "Entropy Analysis Complete!\nAnalyzed 1572864 pages.\nMin: 0.0000  Max: 7.9938  Avg: 6.9418",
+      "collapsed": false
+    },
+    {
+      "id": 48,
+      "name": "Page Cutter",
+      "pos": [
+        504.0,
+        514.0
+      ],
+      "kind": {
+        "PageCutter": {
+          "expression": "18432-36735"
+        }
+      },
+      "status": "Idle",
+      "output_log": "Page Cutter ready. Connect an upstream node and enter an expression.",
+      "collapsed": false
+    },
+    {
+      "id": 49,
+      "name": "Entropy Analysis",
+      "pos": [
+        863.0,
+        540.0
+      ],
+      "kind": {
+        "Entropy": {
+          "log_path": "entropy0-1.csv",
+          "compute_32bit": true,
+          "cluster_filter": "All"
+        }
+      },
+      "status": "Completed",
+      "output_log": "Entropy Analysis Complete!\nAnalyzed 1572864 pages.\nMin: 0.0000  Max: 7.9938  Avg: 6.9702",
+      "collapsed": false
+    },
+    {
+      "id": 50,
+      "name": "Page Cutter",
+      "pos": [
+        482.0,
+        694.0
+      ],
+      "kind": {
+        "PageCutter": {
+          "expression": "36864-55167"
+        }
+      },
+      "status": "Idle",
+      "output_log": "Page Cutter ready. Connect an upstream node and enter an expression.",
+      "collapsed": false
+    },
+    {
+      "id": 51,
+      "name": "Entropy Analysis",
+      "pos": [
+        1286.0,
+        709.0
+      ],
+      "kind": {
+        "Entropy": {
+          "log_path": "entropy0-2.csv",
+          "compute_32bit": true,
+          "cluster_filter": "All"
+        }
+      },
+      "status": "Completed",
+      "output_log": "Entropy Analysis Complete!\nAnalyzed 1572864 pages.\nMin: 0.0000  Max: 7.9939  Avg: 7.4608",
+      "collapsed": false
+    },
+    {
+      "id": 52,
+      "name": "Concatenate",
+      "pos": [
+        1277.0,
+        456.0
+      ],
+      "kind": "Concatenate",
+      "status": "Idle",
+      "output_log": "No execution history",
+      "collapsed": false
+    },
+    {
+      "id": 53,
+      "name": "Entropy Analysis",
+      "pos": [
+        1475.0,
+        277.0
+      ],
+      "kind": {
+        "Entropy": {
+          "log_path": "entropy0-123.csv",
+          "compute_32bit": true,
+          "cluster_filter": "All"
+        }
+      },
+      "status": "Completed",
+      "output_log": "Entropy Analysis Complete!\nAnalyzed 4718592 pages.\nMin: 0.0000  Max: 7.9939  Avg: 7.1244",
+      "collapsed": false
+    },
+    {
+      "id": 54,
+      "name": "Output: Viewer",
+      "pos": [
+        1498.0,
+        670.0
+      ],
+      "kind": {
+        "OutputViewer": {
+          "name": "Viewer"
+        }
+      },
+      "status": "Idle",
+      "output_log": "Connected to ZoomViewer",
+      "collapsed": false
+    }
+  ],
+  "connections": [
+    {
+      "from_node": 33,
+      "to_node": 1
+    },
+    {
+      "from_node": 1,
+      "to_node": 43
+    },
+    {
+      "from_node": 43,
+      "to_node": 44
+    },
+    {
+      "from_node": 1,
+      "to_node": 46
+    },
+    {
+      "from_node": 46,
+      "to_node": 47
+    },
+    {
+      "from_node": 1,
+      "to_node": 48
+    },
+    {
+      "from_node": 48,
+      "to_node": 49
+    },
+    {
+      "from_node": 1,
+      "to_node": 50
+    },
+    {
+      "from_node": 50,
+      "to_node": 51
+    },
+    {
+      "from_node": 46,
+      "to_node": 52
+    },
+    {
+      "from_node": 48,
+      "to_node": 52
+    },
+    {
+      "from_node": 50,
+      "to_node": 52
+    },
+    {
+      "from_node": 52,
+      "to_node": 53
+    },
+    {
+      "from_node": 51,
+      "to_node": 54
+    }
+  ],
+  "selected_node": 54,
+  "connecting_from": null,
+  "status_message": "Connecting from Node #51... Click 'In' on target node."
+}
