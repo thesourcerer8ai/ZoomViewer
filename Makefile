@@ -1,5 +1,5 @@
 all:
-	cargo run -r
+	cargo run -r --bin nand-flash-viewer
 
 test:
 	cargo test

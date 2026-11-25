@@ -28,5 +28,25 @@ tempfile = "3.8"
 fuser = { version = "0.14", default-features = false }
 libc = "0.2"
 
+# Windows: WinFsp is the Windows counterpart of the FUSE kernel module.
+# The `winfsp-sys` crate is vendored under `vendor/` (patched to use its
+# pre-generated bindings, so no libclang/LLVM is needed to build).
+[target.'cfg(windows)'.dependencies]
+winfsp = { version = "0.13", features = ["system"] }
+winfsp-sys = "0.12.1"
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_LibraryLoader",
+] }
+
+[target.'cfg(windows)'.build-dependencies]
+winfsp = { version = "0.13", features = ["system"] }
+
+[patch.crates-io]
+winfsp-sys = { path = "vendor/winfsp-sys" }
+
 [profile.dev]
 opt-level = 3

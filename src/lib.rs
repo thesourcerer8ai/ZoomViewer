@@ -65,6 +65,8 @@ pub mod search;
 pub mod search_tab;
 pub mod hex_tab;
 pub mod fuse_node;
+#[cfg(windows)]
+pub mod fuse_node_windows;
 pub mod page_structure_tab;
 pub mod pattern_writer_tab;
 pub mod nand_reader_tab;

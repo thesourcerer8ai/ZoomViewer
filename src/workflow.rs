@@ -3194,8 +3194,11 @@ impl WorkflowEditorState {
         let provider = self.build_data_provider(node_id)?;
 
         let active_mount = crate::fuse_node::ActiveFuseMount::mount(provider, &mount_path)?;
+        // On Windows the volume may end up on a drive letter instead of the
+        // requested path, so report where it actually is.
+        let actual_path = active_mount.mount_path.clone();
         self.active_fuse_mounts.lock().insert(node_id, active_mount);
-        Ok(mount_path)
+        Ok(actual_path)
     }
 
     /// Unmounts the virtual FUSE filesystem for a FuseMount node

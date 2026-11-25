@@ -6,11 +6,13 @@
 //! directly without requiring full intermediate file exports to disk.
 
 use crate::data_provider::DumpDataProvider;
+#[cfg(any(unix, test))]
 use crate::types::FileMetadata;
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+#[cfg(unix)]
 use std::time::SystemTime;
 
 #[cfg(unix)]
@@ -725,6 +727,9 @@ pub struct ActiveFuseMount {
     pub error: Option<String>,
     #[cfg(unix)]
     session: Option<BackgroundSession>,
+    /// The WinFsp volume backing the mount (Windows).
+    #[cfg(windows)]
+    session: Option<crate::fuse_node_windows::WinFspVolume>,
 }
 
 impl std::fmt::Debug for ActiveFuseMount {
@@ -847,7 +852,28 @@ impl ActiveFuseMount {
         }
     }
 
-    #[cfg(not(unix))]
+    /// Mount the virtual filesystem on Windows using the WinFsp driver.
+    ///
+    /// WinFsp is the Windows counterpart of the FUSE kernel module. The volume
+    /// is exposed as a drive letter (or, if that is not possible, at the
+    /// requested directory) and stays read-only.
+    #[cfg(windows)]
+    pub fn mount(
+        provider: Arc<Mutex<dyn DumpDataProvider>>,
+        mount_path: &Path,
+    ) -> Result<Self, String> {
+        let (volume, actual_path) = crate::fuse_node_windows::mount_virtual_fs(provider, mount_path)?;
+        log::info!("Mounted FUSE filesystem at '{}'", actual_path.display());
+        Ok(Self {
+            mount_path: actual_path,
+            is_mounted: Arc::new(AtomicBool::new(true)),
+            status: "Mounted and ready".to_string(),
+            error: None,
+            session: Some(volume),
+        })
+    }
+
+    #[cfg(not(any(unix, windows)))]
     pub fn mount(
         _provider: Arc<Mutex<dyn DumpDataProvider>>,
         mount_path: &Path,
@@ -869,6 +895,15 @@ impl ActiveFuseMount {
                 .output();
         }
 
+        #[cfg(windows)]
+        {
+            if let Some(mut volume) = self.session.take() {
+                // Stops the WinFsp dispatcher and removes the mount point.
+                volume.unmount();
+                drop(volume);
+            }
+        }
+
         self.is_mounted.store(false, Ordering::SeqCst);
         self.status = "Unmounted".to_string();
         log::info!("Unmounted FUSE filesystem at '{}'", self.mount_path.display());
@@ -877,20 +912,46 @@ impl ActiveFuseMount {
 
 /// Helper to generate a default mount directory for a node
 pub fn default_mount_dir_for_node(node_id: usize) -> PathBuf {
-    if let Some(mut base) = dirs_home_cache_mount() {
-        base.push(format!("node_{}", node_id));
-        base
-    } else {
-        PathBuf::from(format!(".cache/zoomviewer/mount/node_{}", node_id))
+    #[cfg(windows)]
+    {
+        // On Windows the WinFsp volume is most naturally exposed as a drive
+        // letter. Fall back to a directory if no drive letter is free.
+        let _ = node_id;
+        if let Some(letter) = crate::fuse_node_windows::next_free_drive() {
+            return PathBuf::from(format!("{letter}:"));
+        }
+        if let Some(mut base) = dirs_home_cache_mount() {
+            base.push(format!("node_{}", node_id));
+            return base;
+        }
+        return PathBuf::from(format!(".cache/zoomviewer/mount/node_{}", node_id));
+    }
+
+    #[cfg(not(windows))]
+    {
+        if let Some(mut base) = dirs_home_cache_mount() {
+            base.push(format!("node_{}", node_id));
+            base
+        } else {
+            PathBuf::from(format!(".cache/zoomviewer/mount/node_{}", node_id))
+        }
     }
 }
 
 fn dirs_home_cache_mount() -> Option<PathBuf> {
-    if let Ok(home) = std::env::var("HOME") {
-        Some(PathBuf::from(home).join(".cache").join("zoomviewer").join("mount"))
-    } else {
-        None
-    }
+    #[cfg(windows)]
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok();
+    #[cfg(not(windows))]
+    let home = std::env::var("HOME").ok();
+
+    home.map(|home| {
+        PathBuf::from(home)
+            .join(".cache")
+            .join("zoomviewer")
+            .join("mount")
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
